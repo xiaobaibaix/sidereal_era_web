@@ -49,38 +49,203 @@ export function createOcean() {
   return mesh;
 }
 
-// 大气辉光: 略大的球, 背面 + 加法混合, 边缘(临边)亮 → 环绕行星的光晕。
-export function createAtmosphere() {
+// 大气(瑞利 + 米氏单次散射, 实时 raymarch) —— 深度感知的全屏后处理 pass。
+//
+// 做法(见 docs/星球大气散射设计方案.md M3):
+//   先把场景(行星+海洋)渲染到一张带深度纹理的 RenderTarget, 再用全屏 quad 跑这个 shader:
+//   - 用逆 view-proj 从每像素重建世界视线方向 rd;
+//   - 从深度纹理重建"该像素被实体(地形)挡住的距离 sceneDist" → 视线积分止于真实地表,
+//     不再穿过山体, 且远处地表按视线透射率被"大气洗淡"(aerial perspective);
+//   - 每个采样点向太阳再 march 一段外散射; 行星本体挡住太阳 → 晨昏线/夜侧变暗;
+//   - 合成: finalColor = sceneColor * T_view + inscatter。
+//   对主/旁观/角色三相机通用(每个视口各跑一次, 传各自的相机矩阵)。
+//
+// 返回 { uniforms, material, render(renderer) }。半径/散射强度由 main.js 注入。
+export function createAtmospherePass() {
   const uniforms = {
-    uColor: { value: new THREE.Color(0x5a99ff) },
-    uPower: { value: 3.2 },
-    uIntensity: { value: 1.3 },
+    tDiffuse: { value: null },        // 场景颜色
+    tDepth: { value: null },          // 场景深度
+    uInvViewProj: { value: new THREE.Matrix4() },
+    uCamPos: { value: new THREE.Vector3() },
+    uEnabled: { value: 1.0 },         // 0=直通场景(大气关)
+
+    uSunDir: { value: new THREE.Vector3(1, 0.6, 0.8).normalize() },
+    uPlanetCenter: { value: new THREE.Vector3(0, 0, 0) },
+    uRground: { value: 100.0 },       // 地面球半径(海平面)
+    uRatmo: { value: 120.0 },         // 大气顶半径
+    uDensityFalloff: { value: 6.0 },  // 瑞利密度衰减(越大大气越贴地)
+    uMieFalloff: { value: 16.0 },     // 米氏密度衰减
+    uScatterR: { value: new THREE.Vector3(0.0085, 0.026, 0.055) }, // 瑞利系数(蓝>绿>红)
+    uScatterM: { value: 0.03 },       // 米氏散射系数(灰)
+    uMieG: { value: 0.76 },           // 米氏前向峰
+    uSunIntensity: { value: 22.0 },
+    uExposure: { value: 1.0 },
+    uSteps: { value: 16 },            // 视线积分步数
+    uLightSteps: { value: 8 },        // 太阳方向外散射步数
   };
+
   const material = new THREE.ShaderMaterial({
     uniforms,
-    side: THREE.BackSide,
-    blending: THREE.AdditiveBlending,
-    transparent: true,
+    depthTest: false,
     depthWrite: false,
     vertexShader: /* glsl */`
-      varying vec3 vNormalView;
+      varying vec2 vUv;
       void main() {
-        vNormalView = normalize(normalMatrix * normal);
-        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        vUv = uv;
+        gl_Position = vec4(position.xy, 0.0, 1.0);
       }
     `,
     fragmentShader: /* glsl */`
-      uniform vec3 uColor;
-      uniform float uPower;
-      uniform float uIntensity;
-      varying vec3 vNormalView;
+      precision highp float;
+      varying vec2 vUv;
+
+      uniform sampler2D tDiffuse;
+      uniform sampler2D tDepth;
+      uniform mat4  uInvViewProj;
+      uniform vec3  uCamPos;
+      uniform float uEnabled;
+
+      uniform vec3  uSunDir;
+      uniform vec3  uPlanetCenter;
+      uniform float uRground;
+      uniform float uRatmo;
+      uniform float uDensityFalloff;
+      uniform float uMieFalloff;
+      uniform vec3  uScatterR;
+      uniform float uScatterM;
+      uniform float uMieG;
+      uniform float uSunIntensity;
+      uniform float uExposure;
+      uniform int   uSteps;
+      uniform int   uLightSteps;
+
+      const float PI = 3.14159265359;
+
+      // 射线与球求交, 返回 (near, far); 未命中返回 near>far。rd 需归一化(a=1)。
+      vec2 raySphere(vec3 ro, vec3 rd, vec3 ce, float r) {
+        vec3 oc = ro - ce;
+        float b = dot(oc, rd);
+        float c = dot(oc, oc) - r * r;
+        float d = b * b - c;
+        if (d < 0.0) return vec2(1e20, -1e20);
+        float s = sqrt(d);
+        return vec2(-b - s, -b + s);
+      }
+
+      // 归一化高度 [0,1] (0=地面, 1=大气顶)
+      float heightFrac(vec3 p) {
+        float h = length(p - uPlanetCenter) - uRground;
+        return clamp(h / max(uRatmo - uRground, 1e-4), 0.0, 1.0);
+      }
+
+      // 某点的相对密度 (x=瑞利, y=米氏), 边缘平滑归零
+      vec2 densityAt(vec3 p) {
+        float t = heightFrac(p);
+        float edge = 1.0 - t;
+        return vec2(exp(-t * uDensityFalloff) * edge,
+                    exp(-t * uMieFalloff)     * edge);
+      }
+
+      // 从点 p 沿 dir 到大气顶的光学深度 (瑞利, 米氏)。若中途撞地面, 视为完全遮挡。
+      vec2 opticalDepthToSun(vec3 p, vec3 dir) {
+        vec2 g = raySphere(p, dir, uPlanetCenter, uRground);
+        if (g.x > 0.0 && g.y > g.x) return vec2(1e9);
+        vec2 a = raySphere(p, dir, uPlanetCenter, uRatmo);
+        float far = max(a.y, 0.0);
+        int N = uLightSteps;
+        float step = far / float(N);
+        vec2 od = vec2(0.0);
+        vec3 q = p + dir * (step * 0.5);
+        for (int i = 0; i < 64; i++) {
+          if (i >= N) break;
+          od += densityAt(q) * step;
+          q += dir * step;
+        }
+        return od;
+      }
+
       void main() {
-        float rim = pow(max(0.0, 0.72 - dot(vNormalView, vec3(0.0, 0.0, 1.0))), uPower);
-        gl_FragColor = vec4(uColor * rim * uIntensity, 1.0);
+        vec3 sceneColor = texture2D(tDiffuse, vUv).rgb;
+        if (uEnabled < 0.5) { gl_FragColor = vec4(sceneColor, 1.0); return; }
+
+        // 从深度重建视线方向与场景距离
+        vec2 ndc = vUv * 2.0 - 1.0;
+        vec4 farP = uInvViewProj * vec4(ndc, 1.0, 1.0);
+        vec3 rd = normalize(farP.xyz / farP.w - uCamPos);
+        vec3 ro = uCamPos;
+
+        float depth = texture2D(tDepth, vUv).x;
+        float sceneDist = 1e20;
+        if (depth < 1.0) {
+          vec4 hp = uInvViewProj * vec4(ndc, depth * 2.0 - 1.0, 1.0);
+          sceneDist = distance(hp.xyz / hp.w, uCamPos);
+        }
+
+        // 视线在大气壳内的区间
+        vec2 atmo = raySphere(ro, rd, uPlanetCenter, uRatmo);
+        float tNear = max(atmo.x, 0.0);
+        float tFar  = atmo.y;
+        if (tFar <= tNear) { gl_FragColor = vec4(sceneColor, 1.0); return; }
+
+        // 止于真实地表(深度)或海平面球(海洋不写深度, 用解析球兜底)
+        tFar = min(tFar, sceneDist);
+        vec2 gnd = raySphere(ro, rd, uPlanetCenter, uRground);
+        if (gnd.x > 0.0 && gnd.y > gnd.x) tFar = min(tFar, gnd.x);
+        if (tFar <= tNear) { gl_FragColor = vec4(sceneColor, 1.0); return; }
+
+        int N = uSteps;
+        float step = (tFar - tNear) / float(N);
+        vec2 odView = vec2(0.0);
+        vec3 sumR = vec3(0.0);
+        vec3 sumM = vec3(0.0);
+
+        vec3 p = ro + rd * (tNear + step * 0.5);
+        for (int i = 0; i < 64; i++) {
+          if (i >= N) break;
+          vec2 dens = densityAt(p) * step;
+          odView += dens;
+
+          vec2 odSun = opticalDepthToSun(p, uSunDir);
+          if (odSun.x < 1e8) {
+            vec3 tau = uScatterR * (odView.x + odSun.x)
+                     + uScatterM * 1.1 * (odView.y + odSun.y);
+            vec3 T = exp(-tau);
+            sumR += dens.x * T;
+            sumM += dens.y * T;
+          }
+          p += rd * step;
+        }
+
+        // 相位函数
+        float mu = dot(rd, uSunDir);
+        float phaseR = 3.0 / (16.0 * PI) * (1.0 + mu * mu);
+        float g = uMieG, g2 = g * g;
+        float phaseM = 3.0 / (8.0 * PI)
+                     * ((1.0 - g2) * (1.0 + mu * mu))
+                     / ((2.0 + g2) * pow(1.0 + g2 - 2.0 * g * mu, 1.5));
+
+        vec3 inscatter = uSunIntensity *
+            (sumR * uScatterR * phaseR + sumM * uScatterM * phaseM);
+        inscatter = vec3(1.0) - exp(-inscatter * uExposure);   // 曝光 tonemap
+
+        // aerial perspective: 地表颜色被视线透射率衰减, 再叠加内散射
+        vec3 Tview = exp(-(uScatterR * odView.x + uScatterM * 1.1 * odView.y));
+        vec3 color = sceneColor * Tview + inscatter;
+
+        gl_FragColor = vec4(color, 1.0);
       }
     `,
   });
-  const mesh = new THREE.Mesh(new THREE.SphereGeometry(1, 128, 64), material);
-  mesh.renderOrder = 2;
-  return mesh;
+
+  const quadScene = new THREE.Scene();
+  const quadCam = new THREE.Camera();
+  const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), material);
+  quad.frustumCulled = false;
+  quadScene.add(quad);
+
+  return {
+    uniforms,
+    material,
+    render(renderer) { renderer.render(quadScene, quadCam); },
+  };
 }
