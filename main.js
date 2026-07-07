@@ -9,6 +9,7 @@ import { PointerLockControls } from 'three/addons/controls/PointerLockControls.j
 import GUI from 'lil-gui';
 import { Planet } from './planet.js';
 import { createOcean, createAtmosphere } from './effects.js';
+import { PlanetWalker } from './character.js';
 
 // ----------------------------------------------------------------------------
 // 参数
@@ -22,6 +23,11 @@ const params = {
   // 旁观相机(WASD 自由飞行, 不影响 LOD 细分; 画中画小窗一直显示)
   showInset: true,
   spectatorSpeed: 80,
+
+  // 角色模式(登陆行星, 第三人称)
+  characterMode: false,
+  walkSpeed: 25,
+  invertY: true,
 
   // 外观
   showOcean: true,
@@ -207,6 +213,30 @@ function layoutEffects() {
 }
 layoutEffects();
 
+// 角色(登陆行星, 第三人称)
+const walker = new PlanetWalker(planet, renderer.domElement);
+scene.add(walker.mesh);
+let characterMode = false;
+
+function setCharacterMode(on) {
+  characterMode = on;
+  if (on) {
+    controls.enabled = false;
+    if (plControls.disconnect) plControls.disconnect();   // 让出鼠标锁给角色控制器
+    mainIsSpectator = false;
+    camHelper.visible = false;
+    camMarker.visible = false;
+    insetEl.style.display = 'none';
+    walker.speed = params.walkSpeed;
+    walker.enable(camera.position.clone().normalize());   // 在轨道相机对着的地表处出生
+  } else {
+    walker.disable();
+    if (plControls.connect) plControls.connect();
+    controls.enabled = true;
+    layoutInset();
+  }
+}
+
 function rebuild() {
   planet.rebuild();
   controls.minDistance = params.radius + params.maxHeight * 2.5;
@@ -226,6 +256,11 @@ const fSpec = gui.addFolder('旁观相机');
 fSpec.add(params, 'showInset').name('小窗预览').onChange(layoutInset);
 fSpec.add({ swap: swapView }, 'swap').name('切换主/小窗');
 fSpec.add(params, 'spectatorSpeed', 5, 400).name('飞行速度');
+
+const fChar = gui.addFolder('角色 (登陆行星)');
+fChar.add(params, 'characterMode').name('进入角色模式').onChange((v) => setCharacterMode(v));
+fChar.add(params, 'walkSpeed', 5, 120).name('移动速度').onChange((v) => { walker.speed = v; });
+fChar.add(params, 'invertY').name('反转上下视角').onChange((v) => { walker.invertY = v; });
 
 const fApp = gui.addFolder('外观');
 fApp.add(params, 'showOcean').name('海洋').onChange((v) => { ocean.visible = v; });
@@ -272,6 +307,8 @@ addEventListener('resize', () => {
   camera.updateProjectionMatrix();
   spectatorCamera.aspect = aspect;
   spectatorCamera.updateProjectionMatrix();
+  walker.camera.aspect = aspect;
+  walker.camera.updateProjectionMatrix();
   renderer.setSize(innerWidth, innerHeight);
   layoutInset();
 });
@@ -314,7 +351,22 @@ function renderViews() {
 
 function animate() {
   requestAnimationFrame(animate);
-  const dt = clock.getDelta();
+  const dt = Math.min(clock.getDelta(), 0.05);   // 限制步长, 防止掉帧时穿地
+  const s = planet.stats;
+
+  // 角色模式: 相机跟随角色, LOD 跟随角色
+  if (characterMode) {
+    walker.update(dt);
+    planet.update(walker.camera);
+    renderer.setScissorTest(false);
+    renderer.setViewport(0, 0, innerWidth, innerHeight);
+    renderer.render(scene, walker.camera);
+    const alt = (walker.position.length() - params.radius).toFixed(1);
+    info.innerHTML =
+      `角色模式 · 点击锁定视角 · WASD 移动 · 空格跳跃 · ESC 释放 · (GUI 取消勾选退出)<br />` +
+      `patch: ${s.patches} · 三角形: ${s.triangles} · 高度: ${alt} · ${walker.grounded ? '地面' : '空中'}`;
+    return;
+  }
 
   if (mainIsSpectator) updateSpectator(dt);
   else controls.update();
@@ -322,7 +374,6 @@ function animate() {
   planet.update(camera);   // LOD 始终由轨道相机驱动(旁观相机不影响细分)
   renderViews();
 
-  const s = planet.stats;
   const base = `patch: ${s.patches} · 三角形: ${s.triangles} · 队列: ${s.queued} · 生成中: ${s.inflight}`;
   if (mainIsSpectator) {
     info.innerHTML =
