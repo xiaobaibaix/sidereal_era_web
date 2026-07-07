@@ -27,7 +27,7 @@ const params = {
   // LOD
   maxLevel: 8,             // 四叉树最大细分层数
   splitFactor: 2.5,        // 相机距离 < 边长*splitFactor 时细分(越大越激进)
-  patchResolution: 10,     // 每个 patch 的网格分辨率(越大越精细也越重)
+  patchResolution: 16,     // 每个 patch 的网格分辨率(必须是 2 的幂, 缝合依赖 dyadic 嵌套)
 
   // 大陆噪声 (fBm)
   continentSeed: 1337,
@@ -134,7 +134,7 @@ fApp.addColor(params, 'atmoColor').name('大气颜色').onChange((v) => {
 const fLod = gui.addFolder('LOD');
 fLod.add(params, 'maxLevel', 0, 12, 1).name('最大层数');
 fLod.add(params, 'splitFactor', 1, 5).name('细分激进度');
-fLod.add(params, 'patchResolution', 2, 24, 1).name('patch 分辨率').onFinishChange(rebuild);
+fLod.add(params, 'patchResolution', [4, 8, 16, 32]).name('patch 分辨率').onChange(rebuild);
 
 gui.add(params, 'radius', 10, 500).name('半径').onFinishChange(rebuild);
 gui.add(params, 'maxHeight', 0, 30).name('最大高度').onFinishChange(rebuild);

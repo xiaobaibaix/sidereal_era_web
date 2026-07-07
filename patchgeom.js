@@ -1,83 +1,117 @@
 // 纯几何构建(无 THREE 依赖), 主线程和 Web Worker 共用。
-// 给定球面三角形三个角(单位向量)+分辨率, 生成 patch 的顶点/法线/颜色/索引。
-// heightAt / colorFor 由调用方注入(主线程与 worker 各自持有一致的噪声实现)。
 //
-// 法线用"有限差分"直接对高度场求梯度: 反映真实地形斜率(含高频细节),
-// 消除刻面感; 且只依赖顶点方向, 相邻 patch 在共享位置法线一致 → 无接缝。
+// 关键点(为消除 T 型接缝):
+// 1) 边顶点用"递归中点细分(dyadic)"生成, 使相邻不同层级 patch 的边顶点严格嵌套。
+// 2) strides[edge] 表示该边相对粗邻居要"抽稀"的倍率; 把多余(非保留)顶点吸附到
+//    保留顶点(与粗邻居重合)之间的直线上 → 两侧边完全重合, 缝消失。
+// 法线仍用有限差分(反映真实斜率, 且同一位置结果一致 → 无着色接缝)。
 
-function dist3(a, b) {
-  return Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+function normArr(x, y, z) { const l = 1 / Math.hypot(x, y, z); return [x * l, y * l, z * l]; }
+function dist3(a, b) { return Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]); }
+
+// 递归中点细分一条边(P->Q), N 必须是 2 的幂。返回 N+1 个单位向量。
+function dyadicEdge(P, Q, N) {
+  let pts = [P, Q];
+  while (pts.length - 1 < N) {
+    const next = [];
+    for (let i = 0; i < pts.length - 1; i++) {
+      next.push(pts[i]);
+      next.push(normArr(pts[i][0] + pts[i + 1][0], pts[i][1] + pts[i + 1][1], pts[i][2] + pts[i + 1][2]));
+    }
+    next.push(pts[pts.length - 1]);
+    pts = next;
+  }
+  return pts;
 }
 
-// A, B, C: [x,y,z] 单位向量。返回 { positions, normals, colors, indices } 均为 TypedArray。
-export function buildPatchArrays(A, B, C, N, R, maxHeight, seaLevel, heightAt, colorFor) {
+// 把一条边上"非保留"的顶点吸附到保留顶点之间的直线(粗邻居的边线)上。
+function snapEdge(gi, stride, pos, nor, col, N) {
+  if (stride <= 1) return;
+  for (let k = 1; k < N; k++) {
+    if (k % stride === 0) continue;            // 保留顶点(与粗邻居重合)
+    const lo = Math.floor(k / stride) * stride;
+    const hi = lo + stride;
+    const t = (k - lo) / stride;
+    const a = gi[k] * 3, l = gi[lo] * 3, h = gi[hi] * 3;
+    for (let c = 0; c < 3; c++) {
+      pos[a + c] = pos[l + c] * (1 - t) + pos[h + c] * t;
+      col[a + c] = col[l + c] * (1 - t) + col[h + c] * t;
+    }
+    let nx = nor[l] * (1 - t) + nor[h] * t;
+    let ny = nor[l + 1] * (1 - t) + nor[h + 1] * t;
+    let nz = nor[l + 2] * (1 - t) + nor[h + 2] * t;
+    const nl = 1 / (Math.hypot(nx, ny, nz) || 1);
+    nor[a] = nx * nl; nor[a + 1] = ny * nl; nor[a + 2] = nz * nl;
+  }
+}
+
+// A,B,C: [x,y,z] 单位向量。strides: [sAB, sAC, sBC](默认全 1)。
+export function buildPatchArrays(A, B, C, N, R, maxHeight, seaLevel, heightAt, colorFor, strides) {
+  strides = strides || [1, 1, 1];
   const rowIndex = (i, j) => i * (N + 1) - (i * (i - 1)) / 2 + j;
   const mainCount = ((N + 1) * (N + 2)) / 2;
 
-  const dirs = new Float32Array(mainCount * 3);
-  const P = new Float32Array(mainCount * 3);
-  const normM = new Float32Array(mainCount * 3);
-  const colM = new Float32Array(mainCount * 3);
+  const edgeAB = dyadicEdge(A, B, N);
+  const edgeAC = dyadicEdge(A, C, N);
+  const edgeBC = dyadicEdge(B, C, N);
 
-  const EPS = 1e-3; // 有限差分步长(单位球方向空间)
+  const dirs = new Array(mainCount);
+  const pos = new Float32Array(mainCount * 3);
+  const nor = new Float32Array(mainCount * 3);
+  const col = new Float32Array(mainCount * 3);
 
-  // 计算某方向的抬升世界坐标。不再把海平面以下压平, 让海床也有起伏(半透明海洋下可见)。
-  const surf = (x, y, z, out, o) => {
-    const h = heightAt(x, y, z);
-    const rr = R + h * maxHeight;
-    out[o] = x * rr; out[o + 1] = y * rr; out[o + 2] = z * rr;
-    return h;
-  };
+  const EPS = 1e-3;
 
-  const tmp1 = new Float32Array(3), tmp2 = new Float32Array(3);
-
-  // 1) 主网格顶点 + 有限差分法线
   for (let i = 0; i <= N; i++) {
     for (let j = 0; j <= N - i; j++) {
-      const w0 = (N - i - j) / N, w1 = i / N, w2 = j / N;
-      let vx = A[0] * w0 + B[0] * w1 + C[0] * w2;
-      let vy = A[1] * w0 + B[1] * w1 + C[1] * w2;
-      let vz = A[2] * w0 + B[2] * w1 + C[2] * w2;
-      const inv = 1 / Math.hypot(vx, vy, vz);
-      vx *= inv; vy *= inv; vz *= inv;
-
+      let d;
+      if (j === 0) d = edgeAB[i];
+      else if (i === 0) d = edgeAC[j];
+      else if (i + j === N) d = edgeBC[N - i];
+      else {
+        const w0 = (N - i - j) / N, w1 = i / N, w2 = j / N;
+        d = normArr(A[0] * w0 + B[0] * w1 + C[0] * w2, A[1] * w0 + B[1] * w1 + C[1] * w2, A[2] * w0 + B[2] * w1 + C[2] * w2);
+      }
       const k3 = rowIndex(i, j) * 3;
-      dirs[k3] = vx; dirs[k3 + 1] = vy; dirs[k3 + 2] = vz;
-      const h = surf(vx, vy, vz, P, k3);
+      dirs[rowIndex(i, j)] = d;
+
+      const h = heightAt(d[0], d[1], d[2]);
+      const rr = R + h * maxHeight;
+      pos[k3] = d[0] * rr; pos[k3 + 1] = d[1] * rr; pos[k3 + 2] = d[2] * rr;
       const c = colorFor(h);
-      colM[k3] = c[0]; colM[k3 + 1] = c[1]; colM[k3 + 2] = c[2];
+      col[k3] = c[0]; col[k3 + 1] = c[1]; col[k3 + 2] = c[2];
 
-      // 切平面基: 选一个不与 dir 平行的辅助轴
+      // 有限差分法线
       let hax = 1, hay = 0, haz = 0;
-      if (Math.abs(vx) > 0.9) { hax = 0; hay = 1; haz = 0; }
-      // t1 = normalize(cross(dir, helper))
-      let t1x = vy * haz - vz * hay, t1y = vz * hax - vx * haz, t1z = vx * hay - vy * hax;
-      const t1l = Math.hypot(t1x, t1y, t1z) || 1;
-      t1x /= t1l; t1y /= t1l; t1z /= t1l;
-      // t2 = cross(dir, t1)
-      const t2x = vy * t1z - vz * t1y, t2y = vz * t1x - vx * t1z, t2z = vx * t1y - vy * t1x;
-
-      // 沿 t1、t2 各取一个微偏移点(重新归一化到球面), 求抬升坐标
-      let d1x = vx + t1x * EPS, d1y = vy + t1y * EPS, d1z = vz + t1z * EPS;
-      let l1 = 1 / Math.hypot(d1x, d1y, d1z); d1x *= l1; d1y *= l1; d1z *= l1;
-      surf(d1x, d1y, d1z, tmp1, 0);
-
-      let d2x = vx + t2x * EPS, d2y = vy + t2y * EPS, d2z = vz + t2z * EPS;
-      let l2 = 1 / Math.hypot(d2x, d2y, d2z); d2x *= l2; d2y *= l2; d2z *= l2;
-      surf(d2x, d2y, d2z, tmp2, 0);
-
-      // n = cross(p1 - P, p2 - P)
-      const ax = tmp1[0] - P[k3], ay = tmp1[1] - P[k3 + 1], az = tmp1[2] - P[k3 + 2];
-      const bx = tmp2[0] - P[k3], by = tmp2[1] - P[k3 + 1], bz = tmp2[2] - P[k3 + 2];
+      if (Math.abs(d[0]) > 0.9) { hax = 0; hay = 1; haz = 0; }
+      let t1x = d[1] * haz - d[2] * hay, t1y = d[2] * hax - d[0] * haz, t1z = d[0] * hay - d[1] * hax;
+      const t1l = 1 / (Math.hypot(t1x, t1y, t1z) || 1); t1x *= t1l; t1y *= t1l; t1z *= t1l;
+      const t2x = d[1] * t1z - d[2] * t1y, t2y = d[2] * t1x - d[0] * t1z, t2z = d[0] * t1y - d[1] * t1x;
+      const d1 = normArr(d[0] + t1x * EPS, d[1] + t1y * EPS, d[2] + t1z * EPS);
+      const rr1 = R + heightAt(d1[0], d1[1], d1[2]) * maxHeight;
+      const d2 = normArr(d[0] + t2x * EPS, d[1] + t2y * EPS, d[2] + t2z * EPS);
+      const rr2 = R + heightAt(d2[0], d2[1], d2[2]) * maxHeight;
+      const ax = d1[0] * rr1 - pos[k3], ay = d1[1] * rr1 - pos[k3 + 1], az = d1[2] * rr1 - pos[k3 + 2];
+      const bx = d2[0] * rr2 - pos[k3], by = d2[1] * rr2 - pos[k3 + 1], bz = d2[2] * rr2 - pos[k3 + 2];
       let nx = ay * bz - az * by, ny = az * bx - ax * bz, nz = ax * by - ay * bx;
-      const nl = Math.hypot(nx, ny, nz) || 1;
-      nx /= nl; ny /= nl; nz /= nl;
-      if (nx * vx + ny * vy + nz * vz < 0) { nx = -nx; ny = -ny; nz = -nz; } // 强制朝外
-      normM[k3] = nx; normM[k3 + 1] = ny; normM[k3 + 2] = nz;
+      const nl = 1 / (Math.hypot(nx, ny, nz) || 1); nx *= nl; ny *= nl; nz *= nl;
+      if (nx * d[0] + ny * d[1] + nz * d[2] < 0) { nx = -nx; ny = -ny; nz = -nz; }
+      nor[k3] = nx; nor[k3 + 1] = ny; nor[k3 + 2] = nz;
     }
   }
 
-  // 2) 主三角形索引
+  // 三条边的顶点索引(按各自参数顺序)
+  const giAB = [], giAC = [], giBC = [];
+  for (let i = 0; i <= N; i++) giAB.push(rowIndex(i, 0));       // A->B
+  for (let j = 0; j <= N; j++) giAC.push(rowIndex(0, j));       // A->C
+  for (let p = 0; p <= N; p++) giBC.push(rowIndex(N - p, p));   // B->C
+
+  // 缝合(把多余顶点吸附到粗邻居的边线)
+  snapEdge(giAB, strides[0], pos, nor, col, N);
+  snapEdge(giAC, strides[1], pos, nor, col, N);
+  snapEdge(giBC, strides[2], pos, nor, col, N);
+
+  // 主三角形索引
   const indices = [];
   for (let i = 0; i < N; i++) {
     for (let j = 0; j < N - i; j++) {
@@ -86,47 +120,33 @@ export function buildPatchArrays(A, B, C, N, R, maxHeight, seaLevel, heightAt, c
     }
   }
 
-  // 3) 组装为可增长数组(主网格 + skirt 裙边)
-  const positions = [], normals = [], colors = [];
-  for (let k = 0; k < mainCount * 3; k++) {
-    positions.push(P[k]); normals.push(normM[k]); colors.push(colM[k]);
-  }
+  // 输出数组(主网格 + skirt 裙边; 缝合已消除稳态裂缝, 裙边仅作加载过渡的兜底)
+  const outPos = [], outNor = [], outCol = [];
+  for (let k = 0; k < mainCount * 3; k++) { outPos.push(pos[k]); outNor.push(nor[k]); outCol.push(col[k]); }
 
-  // 裙边深度与 patch 尺寸成正比: 近处高细分的小 patch 裙边很浅(几乎不可见),
-  // 远处粗 patch 裙边深(且被地表挡住)。裂缝大小本身也随 patch 尺寸缩小, 所以正比即可覆盖。
-  // 上限防止粗 patch 的裙边穿过球心。
   const chord = dist3(A, B);
   const edgeWorld = chord * R;
   const skirtDepth = Math.min(edgeWorld * 0.6 + chord * chord * R * 3 + 0.3, R * 0.4);
-  const edges = [[], [], []];
-  for (let i = 0; i <= N; i++) edges[0].push(rowIndex(i, 0));       // A-B
-  for (let j = 0; j <= N; j++) edges[1].push(rowIndex(0, j));       // A-C
-  for (let i = 0; i <= N; i++) edges[2].push(rowIndex(i, N - i));   // B-C
-
-  for (const edge of edges) {
-    const start = positions.length / 3;
-    for (let m = 0; m < edge.length; m++) {
-      const k3 = edge[m] * 3;
-      positions.push(
-        P[k3] - dirs[k3] * skirtDepth,
-        P[k3 + 1] - dirs[k3 + 1] * skirtDepth,
-        P[k3 + 2] - dirs[k3 + 2] * skirtDepth
-      );
-      normals.push(normM[k3], normM[k3 + 1], normM[k3 + 2]);
-      colors.push(colM[k3], colM[k3 + 1], colM[k3 + 2]);
+  for (const eg of [giAB, giAC, giBC]) {
+    const start = outPos.length / 3;
+    for (let m = 0; m < eg.length; m++) {
+      const gi3 = eg[m] * 3, d = dirs[eg[m]];
+      outPos.push(pos[gi3] - d[0] * skirtDepth, pos[gi3 + 1] - d[1] * skirtDepth, pos[gi3 + 2] - d[2] * skirtDepth);
+      outNor.push(nor[gi3], nor[gi3 + 1], nor[gi3 + 2]);
+      outCol.push(col[gi3], col[gi3 + 1], col[gi3 + 2]);
     }
-    for (let m = 0; m < edge.length - 1; m++) {
-      const e0 = edge[m], e1 = edge[m + 1], s0 = start + m, s1 = start + m + 1;
+    for (let m = 0; m < eg.length - 1; m++) {
+      const e0 = eg[m], e1 = eg[m + 1], s0 = start + m, s1 = start + m + 1;
       indices.push(e0, s0, e1, e1, s0, s1);
     }
   }
 
-  const totalVerts = positions.length / 3;
+  const totalVerts = outPos.length / 3;
   const IndexArray = totalVerts > 65535 ? Uint32Array : Uint16Array;
   return {
-    positions: Float32Array.from(positions),
-    normals: Float32Array.from(normals),
-    colors: Float32Array.from(colors),
+    positions: Float32Array.from(outPos),
+    normals: Float32Array.from(outNor),
+    colors: Float32Array.from(outCol),
     indices: IndexArray.from(indices),
   };
 }

@@ -52,7 +52,7 @@ self.onmessage = (ev) => {
     return [0.95, 0.95, 0.98];
   };
 
-  const a = buildPatchArrays(d.A, d.B, d.C, d.N, d.R, d.maxHeight, d.seaLevel, heightAt, colorFor);
+  const a = buildPatchArrays(d.A, d.B, d.C, d.N, d.R, d.maxHeight, d.seaLevel, heightAt, colorFor, d.strides);
   self.postMessage(
     { id: d.id, gen: d.gen, positions: a.positions, normals: a.normals, colors: a.colors, indices: a.indices },
     [a.positions.buffer, a.normals.buffer, a.colors.buffer, a.indices.buffer]

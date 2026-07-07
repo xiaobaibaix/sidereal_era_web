@@ -1,5 +1,6 @@
 // Planet: 正二十面体 + 三角形四叉树 LOD + fBm 噪声位移(three.js)
-// 优化版: patch 网格在 Web Worker 线程池异步生成; 加载未完成时显示父块兜底, 避免空洞。
+// 缝合版: 相邻层级的边通过 dyadic 顶点 + 按邻居层级抽稀吸附实现精确对接(无裂缝)。
+// patch 网格在 Web Worker 异步生成; skirt 仅作加载过渡兜底。
 
 import * as THREE from 'three';
 import { createNoise3D } from 'simplex-noise';
@@ -25,29 +26,43 @@ function ridged(noise, x, y, z, octaves, freq, gain, lac) {
   return sum;
 }
 
+// ---- 小型数组向量工具(供邻居层级查询用, 避免大量 Vector3 分配) ----
+function vnorm(x, y, z) { const l = 1 / Math.hypot(x, y, z); return [x * l, y * l, z * l]; }
+function vmid(a, b) { return vnorm(a[0] + b[0], a[1] + b[1], a[2] + b[2]); }
+function vdot(a, b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+function vcross(a, b) { return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]; }
+function vdist(a, b) { return Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]); }
+// 球面点在三角形内(含边界容差)
+function pointInTri(p, a, b, c) {
+  const nAB = vcross(a, b); if (vdot(p, nAB) * vdot(c, nAB) < -1e-7) return false;
+  const nBC = vcross(b, c); if (vdot(p, nBC) * vdot(a, nBC) < -1e-7) return false;
+  const nCA = vcross(c, a); if (vdot(p, nCA) * vdot(b, nCA) < -1e-7) return false;
+  return true;
+}
+
 // ============================================================================
 export class Planet extends THREE.Group {
   constructor(params) {
     super();
     this.params = params;
     this.stats = { patches: 0, triangles: 0, queued: 0, inflight: 0 };
-    // 实体表面材质。polygonOffset 只在线框模式开启(让线框浮在表面上), 平时关闭避免干扰。
     this.material = new THREE.MeshStandardMaterial({
       vertexColors: true, roughness: 0.9, metalness: 0.0, side: THREE.DoubleSide,
       polygonOffsetFactor: 1, polygonOffsetUnits: 1,
     });
-    // 线框叠加材质(白线)
     this.wireMaterial = new THREE.LineBasicMaterial({ color: 0xffffff });
-    this._wire = false;         // 当前是否线框模式
-    this._solidColor = 0x05070d; // 线框模式下实体填成接近背景色, 只用来遮挡背面
+    this._wire = false;
+    this._solidColor = 0x05070d;
 
     this._heightCb = (x, y, z) => this.heightAt(x, y, z);
     this._colorCb = (h) => this.colorFor(h);
 
-    this._gen = 0;            // 重建代号(丢弃过期的 worker 结果)
-    this._queue = [];         // 待生成节点
-    this._pending = new Map();// id -> node
+    this._gen = 0;
+    this._queue = [];
+    this._pending = new Map();
     this._nextId = 1;
+    this._camPos = [1e9, 1e9, 1e9];
+    this._camMoved = true;   // 相机移动时才重算缝合步长(静止时跳过, 省开销)
 
     this._initWorkers();
     this._buildNoise();
@@ -99,19 +114,53 @@ export class Planet extends THREE.Group {
       [0, -1, t], [0, 1, t], [0, -1, -t], [0, 1, -t],
       [t, 0, -1], [t, 0, 1], [-t, 0, -1], [-t, 0, 1],
     ];
-    const V = raw.map((v) => new THREE.Vector3(v[0], v[1], v[2]).normalize());
-    const faces = [
+    this._V = raw.map((v) => vnorm(v[0], v[1], v[2]));           // 数组形式(邻居查询用)
+    this._faces = [
       [0, 11, 5], [0, 5, 1], [0, 1, 7], [0, 7, 10], [0, 10, 11],
       [1, 5, 9], [5, 11, 4], [11, 10, 2], [10, 7, 6], [7, 1, 8],
       [3, 9, 4], [3, 4, 2], [3, 2, 6], [3, 6, 8], [3, 8, 9],
       [4, 9, 5], [2, 4, 11], [6, 2, 10], [8, 6, 7], [9, 8, 1],
     ];
-    this.roots = faces.map((f) => new QNode(this, V[f[0]], V[f[1]], V[f[2]], 0));
-    // 根 patch 同步生成, 保证开局就有一颗完整(粗糙)的行星, 并作为兜底
-    for (const r of this.roots) r.mesh = this._genMeshSync(r);
+    const V3 = this._V.map((v) => new THREE.Vector3(v[0], v[1], v[2]));
+    this.roots = this._faces.map((f) => new QNode(this, V3[f[0]], V3[f[1]], V3[f[2]], 0));
+    for (const r of this.roots) {                               // 根同步生成(stride 全1)
+      r.mesh = this._genMeshSync(r);
+      r._builtKey = '1,1,1';
+    }
   }
 
-  // ---- 网格创建 ----
+  // ---- 邻居目标层级查询(纯几何, 与四叉树分裂规则一致) ----
+  _rootContaining(p) {
+    for (const f of this._faces) {
+      const a = this._V[f[0]], b = this._V[f[1]], c = this._V[f[2]];
+      if (pointInTri(p, a, b, c)) return [a, b, c];
+    }
+    const f0 = this._faces[0];
+    return [this._V[f0[0]], this._V[f0[1]], this._V[f0[2]]];
+  }
+
+  targetLevelAt(p) {
+    const R = this.params.radius, sf = this.params.splitFactor, maxL = this.params.maxLevel;
+    const cam = this._camPos;
+    let tri = this._rootContaining(p);
+    let A = tri[0], B = tri[1], C = tri[2], level = 0;
+    while (level < maxL) {
+      const cl = 1 / Math.hypot(A[0] + B[0] + C[0], A[1] + B[1] + C[1], A[2] + B[2] + C[2]);
+      const cwx = (A[0] + B[0] + C[0]) * cl * R, cwy = (A[1] + B[1] + C[1]) * cl * R, cwz = (A[2] + B[2] + C[2]) * cl * R;
+      const edgeLen = vdist(A, B) * R;
+      const dcam = Math.hypot(cam[0] - cwx, cam[1] - cwy, cam[2] - cwz);
+      if (dcam < edgeLen * sf) {
+        const ab = vmid(A, B), bc = vmid(B, C), ca = vmid(C, A);
+        const ch = [[A, ab, ca], [ab, B, bc], [ca, bc, C], [ab, bc, ca]];
+        let nxt = ch[3];
+        for (const t of ch) { if (pointInTri(p, t[0], t[1], t[2])) { nxt = t; break; } }
+        A = nxt[0]; B = nxt[1]; C = nxt[2]; level++;
+      } else break;
+    }
+    return level;
+  }
+
+  // ---- 网格 ----
   _arraysToMesh(a) {
     const g = new THREE.BufferGeometry();
     g.setAttribute('position', new THREE.BufferAttribute(a.positions, 3));
@@ -123,26 +172,115 @@ export class Planet extends THREE.Group {
     m.visible = false;
     m.userData.triangles = a.indices.length / 3;
     this.add(m);
-    if (this._wire) this._ensureWire(m);
     return m;
+  }
+
+  _genMeshSync(node) {
+    const p = this.params;
+    const a = buildPatchArrays(
+      [node.A.x, node.A.y, node.A.z], [node.B.x, node.B.y, node.B.z], [node.C.x, node.C.y, node.C.z],
+      p.patchResolution, p.radius, p.maxHeight, p.seaLevel, this._heightCb, this._colorCb, [1, 1, 1]
+    );
+    return this._arraysToMesh(a);
+  }
+
+  // ---- Worker 请求调度(带缝合参数 + 重生成) ----
+  requestMesh(node, strides, key) {
+    if (node.pending) return;
+    if (node.mesh && node._builtKey === key) return;
+    node.pending = true; node._cancelled = false; node._reqStrides = strides; node._reqKey = key;
+    this._queue.push(node);
+    this._pump();
+  }
+
+  _pump() {
+    for (const w of this.workers) {
+      while (!w.busy && this._queue.length > 0) {
+        const node = this._queue.shift();
+        if (node._cancelled || (node.mesh && node._builtKey === node._reqKey)) { node.pending = false; continue; }
+        this._dispatch(w, node);
+      }
+    }
+  }
+
+  _dispatch(w, node) {
+    const id = this._nextId++;
+    node._id = id;
+    this._pending.set(id, node);
+    w.busy = true;
+    const p = this.params;
+    w.postMessage({
+      id, gen: this._gen,
+      A: [node.A.x, node.A.y, node.A.z], B: [node.B.x, node.B.y, node.B.z], C: [node.C.x, node.C.y, node.C.z],
+      N: p.patchResolution, R: p.radius, maxHeight: p.maxHeight, seaLevel: p.seaLevel,
+      strides: node._reqStrides,
+      continentSeed: p.continentSeed, continentFreq: p.continentFreq, continentOctaves: p.continentOctaves,
+      continentGain: p.continentGain, continentLacunarity: p.continentLacunarity,
+      mountainSeed: p.mountainSeed, mountainFreq: p.mountainFreq, mountainOctaves: p.mountainOctaves,
+      mountainStrength: p.mountainStrength,
+    });
+  }
+
+  _onWorkerDone(w, data) {
+    w.busy = false;
+    const node = this._pending.get(data.id);
+    this._pending.delete(data.id);
+    if (node && !node._cancelled && data.gen === this._gen) {
+      const newMesh = this._arraysToMesh(data);
+      const wasVisible = node.mesh ? node.mesh.visible : false;
+      if (node.mesh) this._disposeMesh(node.mesh);   // 重生成: 换掉旧网格
+      newMesh.visible = wasVisible;
+      node.mesh = newMesh;
+      node._builtKey = node._reqKey;
+      node.pending = false;
+      if (this._wire) this._ensureWire(newMesh);
+    }
+    this._pump();
+  }
+
+  _count(node) {
+    this.stats.patches++;
+    this.stats.triangles += node.mesh.userData.triangles;
+  }
+
+  update(camera) {
+    camera.updateMatrixWorld();
+    const cp = camera.position;
+    this._camMoved = (Math.abs(cp.x - this._camPos[0]) + Math.abs(cp.y - this._camPos[1]) + Math.abs(cp.z - this._camPos[2])) > 1e-3;
+    this._camPos[0] = cp.x; this._camPos[1] = cp.y; this._camPos[2] = cp.z;
+    const m = new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+    const frustum = new THREE.Frustum().setFromProjectionMatrix(m);
+    this.stats.patches = 0; this.stats.triangles = 0;
+    for (const r of this.roots) r.selectLOD(camera.position, frustum, this);
+    this.stats.queued = this._queue.length;
+    let busy = 0; for (const w of this.workers) if (w.busy) busy++;
+    this.stats.inflight = busy;
+  }
+
+  rebuild() {
+    this._gen++;
+    for (const r of this.roots) r.dispose(this);
+    this._queue.length = 0;
+    this.clear();
+    this._camMoved = true;
+    this._buildNoise();
+    this._buildRoots();
+    if (this._wire) this.setWireframe(true);
   }
 
   // ---- 线框叠加 ----
   setWireframe(on) {
     this._wire = on;
-    // 线框模式: 实体填成接近背景色(仍不透明, 用于写深度遮挡背面); 否则显示顶点色
     this.material.vertexColors = !on;
     this.material.color.setHex(on ? this._solidColor : 0xffffff);
-    this.material.polygonOffset = on; // 只在线框模式推后实体, 让线框浮在表面上
+    this.material.polygonOffset = on;
     this.material.needsUpdate = true;
     for (const m of this.children) {
       if (!m.isMesh) continue;
-      if (on) this._ensureWire(m);
-      else this._removeWire(m);
+      if (on) this._ensureWire(m); else this._removeWire(m);
     }
   }
 
-  // 只取主网格的边(排除 skirt 裙边)构建线框
   _ensureWire(mesh) {
     if (mesh.userData.wire) { mesh.userData.wire.visible = true; return; }
     const N = this.params.patchResolution;
@@ -171,94 +309,9 @@ export class Planet extends THREE.Group {
     this.remove(m);
     m.geometry.dispose();
   }
-
-  _genMeshSync(node) {
-    const p = this.params;
-    const a = buildPatchArrays(
-      [node.A.x, node.A.y, node.A.z], [node.B.x, node.B.y, node.B.z], [node.C.x, node.C.y, node.C.z],
-      p.patchResolution, p.radius, p.maxHeight, p.seaLevel, this._heightCb, this._colorCb
-    );
-    return this._arraysToMesh(a);
-  }
-
-  // ---- Worker 请求调度 ----
-  ensureMesh(node) {
-    if (node.mesh || node.pending) return;
-    node.pending = true;
-    node._cancelled = false;
-    this._queue.push(node);
-    this._pump();
-  }
-
-  _pump() {
-    for (const w of this.workers) {
-      while (!w.busy && this._queue.length > 0) {
-        const node = this._queue.shift();
-        if (node._cancelled || node.mesh) { node.pending = false; continue; }
-        this._dispatch(w, node);
-      }
-    }
-  }
-
-  _dispatch(w, node) {
-    const id = this._nextId++;
-    node._id = id;
-    this._pending.set(id, node);
-    w.busy = true;
-    const p = this.params;
-    w.postMessage({
-      id, gen: this._gen,
-      A: [node.A.x, node.A.y, node.A.z], B: [node.B.x, node.B.y, node.B.z], C: [node.C.x, node.C.y, node.C.z],
-      N: p.patchResolution, R: p.radius, maxHeight: p.maxHeight, seaLevel: p.seaLevel,
-      continentSeed: p.continentSeed, continentFreq: p.continentFreq, continentOctaves: p.continentOctaves,
-      continentGain: p.continentGain, continentLacunarity: p.continentLacunarity,
-      mountainSeed: p.mountainSeed, mountainFreq: p.mountainFreq, mountainOctaves: p.mountainOctaves,
-      mountainStrength: p.mountainStrength,
-    });
-  }
-
-  _onWorkerDone(w, data) {
-    w.busy = false;
-    const node = this._pending.get(data.id);
-    this._pending.delete(data.id);
-    if (node && !node._cancelled && data.gen === this._gen) {
-      node.mesh = this._arraysToMesh(data);
-      node.pending = false;
-    }
-    this._pump();
-  }
-
-  _count(node) {
-    this.stats.patches++;
-    this.stats.triangles += node.mesh.userData.triangles;
-  }
-
-  // 每帧: LOD 遍历
-  update(camera) {
-    camera.updateMatrixWorld();
-    const m = new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
-    const frustum = new THREE.Frustum().setFromProjectionMatrix(m);
-    this.stats.patches = 0;
-    this.stats.triangles = 0;
-    for (const r of this.roots) r.selectLOD(camera.position, frustum, this);
-    this.stats.queued = this._queue.length;
-    let busy = 0;
-    for (const w of this.workers) if (w.busy) busy++;
-    this.stats.inflight = busy;
-  }
-
-  rebuild() {
-    this._gen++;
-    for (const r of this.roots) r.dispose(this);
-    this._queue.length = 0;
-    this.clear();
-    this._buildNoise();
-    this._buildRoots();
-  }
 }
 
 // ============================================================================
-// 四叉树节点(一个球面三角形 patch)
 class QNode {
   constructor(planet, A, B, C, level) {
     this.A = A; this.B = B; this.C = C;
@@ -268,42 +321,77 @@ class QNode {
     this.pending = false;
     this._cancelled = false;
     this._id = 0;
+    this._builtKey = null;
 
+    const R = planet.params.radius;
     this.centerDir = A.clone().add(B).add(C).normalize();
-    this.centerWorld = planet.displace(this.centerDir);
-    const wa = planet.displace(A), wb = planet.displace(B), wc = planet.displace(C);
-    this.edgeLen = wa.distanceTo(wb);
-    const r = Math.max(this.centerWorld.distanceTo(wa), this.centerWorld.distanceTo(wb), this.centerWorld.distanceTo(wc));
-    this.bsphere = new THREE.Sphere(this.centerWorld.clone(), r + planet.params.maxHeight * 2 + 1);
+    this.centerWorld = this.centerDir.clone().multiplyScalar(R);   // 高度无关(与 targetLevelAt 一致)
+    this.edgeLen = A.distanceTo(B) * R;
+
+    // 包围球: 单位球角点*R 的范围 + 地形高度 + 裙边
+    const wa = A.clone().multiplyScalar(R), wb = B.clone().multiplyScalar(R), wc = C.clone().multiplyScalar(R);
+    const spread = Math.max(this.centerWorld.distanceTo(wa), this.centerWorld.distanceTo(wb), this.centerWorld.distanceTo(wc));
+    const chord = A.distanceTo(B);
+    const skirt = Math.min(chord * R * 0.6 + chord * chord * R * 3, R * 0.4);
+    this.bsphere = new THREE.Sphere(this.centerWorld.clone(), spread + planet.params.maxHeight * 2 + skirt + 1);
   }
 
-  // 返回 true 表示本区域已有(可显示的)覆盖; false 表示需要祖先兜底显示
-  selectLOD(camPos, frustum, planet) {
-    if (!frustum.intersectsSphere(this.bsphere)) {
-      this._hideSubtree();
-      return true; // 屏幕外, 无需覆盖, 也不强制祖先变粗
+  // 计算三条边(AB, AC, BC)的缝合步长
+  computeStrides(planet) {
+    if (this.level === 0) return [1, 1, 1];
+    const A = [this.A.x, this.A.y, this.A.z], B = [this.B.x, this.B.y, this.B.z], C = [this.C.x, this.C.y, this.C.z];
+    const center = [this.centerDir.x, this.centerDir.y, this.centerDir.z];
+    const N = planet.params.patchResolution;
+    const edges = [[A, B], [A, C], [B, C]];
+    const out = [1, 1, 1];
+    for (let e = 0; e < 3; e++) {
+      const P = edges[e][0], Q = edges[e][1];
+      const mid = vnorm(P[0] + Q[0], P[1] + Q[1], P[2] + Q[2]);
+      const sample = vnorm(
+        mid[0] + (mid[0] - center[0]) * 0.35,
+        mid[1] + (mid[1] - center[1]) * 0.35,
+        mid[2] + (mid[2] - center[2]) * 0.35
+      );
+      const nb = planet.targetLevelAt(sample);
+      if (nb < this.level) {
+        let s = 1 << (this.level - nb);
+        if (s > N) s = N;
+        out[e] = s;
+      }
     }
-    planet.ensureMesh(this); // 请求自身网格(作为兜底)
+    return out;
+  }
 
+  selectLOD(camPos, frustum, planet) {
+    if (!frustum.intersectsSphere(this.bsphere)) { this._hideSubtree(); return true; }
     const dist = camPos.distanceTo(this.centerWorld);
     const wantSplit = this.level < planet.params.maxLevel && dist < this.edgeLen * planet.params.splitFactor;
 
     if (wantSplit) {
       if (!this.children) this._split(planet);
-      const childrenReady = this.children[0].mesh && this.children[1].mesh && this.children[2].mesh && this.children[3].mesh;
-      if (childrenReady) {
+      const cr = this.children[0].mesh && this.children[1].mesh && this.children[2].mesh && this.children[3].mesh;
+      if (cr) {
         if (this.mesh) this.mesh.visible = false;
         for (const c of this.children) c.selectLOD(camPos, frustum, planet);
         return true;
       } else {
-        // 子块未就绪: 先请求它们, 本帧显示自身兜底
-        for (const c of this.children) planet.ensureMesh(c);
+        for (const c of this.children) {
+          if (!c.mesh && !c.pending) { const ds = c.computeStrides(planet); planet.requestMesh(c, ds, ds.join(',')); }
+        }
         for (const c of this.children) c._hideSubtree();
+        if (!this.mesh && !this.pending) planet.requestMesh(this, [1, 1, 1], '1,1,1');
         if (this.mesh) { this.mesh.visible = true; planet._count(this); return true; }
         return false;
       }
     } else {
-      if (this.children) this._merge(planet); // 远离 → 合并回收
+      if (this.children) this._merge(planet);
+      if (!this.mesh) {
+        if (!this.pending) { const ds = this.computeStrides(planet); planet.requestMesh(this, ds, ds.join(',')); }
+      } else if (planet._camMoved && !this.pending) {
+        const ds = this.computeStrides(planet);
+        const key = ds.join(',');
+        if (this._builtKey !== key) planet.requestMesh(this, ds, key);
+      }
       if (this.mesh) { this.mesh.visible = true; planet._count(this); return true; }
       return false;
     }
