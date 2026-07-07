@@ -126,11 +126,35 @@ function syncHelperCam() {
 spectatorCamera.position.set(260, 130, 220);
 spectatorCamera.lookAt(0, 0, 0);
 
-let mainIsSpectator = false;   // false: 主画面=轨道相机, 小窗=旁观相机; true: 互换
+// 相机状态模型:
+//   主体相机 primary = 角色模式 ? 角色 : 轨道; 旁观相机始终是"另一个"(alt)。
+//   主画面 = mainIsSpectator ? 旁观 : 主体; 小窗 = 另一个。
+//   LOD 永远由主体相机驱动; 控制权只给当前主画面相机(避免滚轮等误操作影响其它相机)。
+let characterMode = false;
+let walker = null;             // 稍后创建(需要 planet)
+let mainIsSpectator = false;   // 旁观相机是否在主画面槽
 const keys = {};
 const clock = new THREE.Clock();
 const _fwd = new THREE.Vector3(), _right = new THREE.Vector3(), _move = new THREE.Vector3();
 const _worldUp = new THREE.Vector3(0, 1, 0);
+
+function primaryCam() { return characterMode ? walker.camera : camera; }
+function mainCam() { return mainIsSpectator ? spectatorCamera : primaryCam(); }
+function insetCam() { return mainIsSpectator ? primaryCam() : spectatorCamera; }
+function lodCam() { return primaryCam(); }
+
+// 依据当前主画面相机, 独占式启用对应控制, 关闭其它(修复滚轮等误操作影响正常镜头)
+function applyControls() {
+  const main = mainCam();
+  controls.enabled = (main === camera);                       // 轨道控制仅在轨道为主画面
+  if (main === spectatorCamera) { if (plControls.connect) plControls.connect(); }
+  else { plControls.unlock(); if (plControls.disconnect) plControls.disconnect(); }
+  if (walker) walker.setActive(characterMode && main === walker.camera);  // 角色输入仅在角色为主画面
+  const showHelper = (!characterMode && main === spectatorCamera);        // 冻结轨道相机时显示其视锥+标记
+  camHelper.visible = showHelper;
+  camMarker.visible = showHelper;
+  if (showHelper) syncHelperCam();
+}
 
 // 画中画小窗(DOM 覆盖层: 边框 + 标签 + 点击切换; 内部透明, 露出 WebGL 渲染的小窗视口)
 const INSET_FRAC = 0.26, INSET_MARGIN = 12;
@@ -148,7 +172,8 @@ document.body.appendChild(insetEl);
 insetEl.addEventListener('click', (e) => { e.stopPropagation(); swapView(); });
 
 function updateInsetLabel() {
-  insetLabel.textContent = mainIsSpectator ? '主相机 · LOD (点击放大)' : '旁观相机 (点击放大)';
+  if (mainIsSpectator) insetLabel.textContent = (characterMode ? '角色' : '主相机 LOD') + ' (点击放大)';
+  else insetLabel.textContent = '旁观相机 (点击放大)';
 }
 
 function layoutInset() {
@@ -163,22 +188,17 @@ updateInsetLabel();
 
 function swapView() {
   mainIsSpectator = !mainIsSpectator;
-  // 旁观相机做主画面时: 冻结轨道相机(LOD 定格), 显示其视锥框, 允许 WASD 飞行
-  controls.enabled = !mainIsSpectator;
-  camHelper.visible = mainIsSpectator;
-  camMarker.visible = mainIsSpectator;
-  if (mainIsSpectator) syncHelperCam();
-  else plControls.unlock();
+  applyControls();
   updateInsetLabel();
 }
 
-// 点主画面: 若主画面是旁观相机, 锁定鼠标以便 WASD + 视角控制; ESC 解锁
+// 点主画面: 若主画面是旁观相机, 锁定鼠标控制视角; ESC 解锁(角色的锁定在 character.js 内处理)
 renderer.domElement.addEventListener('click', () => {
-  if (mainIsSpectator && !plControls.isLocked) plControls.lock();
+  if (mainCam() === spectatorCamera && !plControls.isLocked) plControls.lock();
 });
 addEventListener('keydown', (e) => {
   keys[e.code] = true;
-  if (mainIsSpectator && plControls.isLocked && e.code === 'Space') e.preventDefault();
+  if (mainCam() === spectatorCamera && plControls.isLocked && e.code === 'Space') e.preventDefault();
 });
 addEventListener('keyup', (e) => { keys[e.code] = false; });
 
@@ -226,27 +246,22 @@ function layoutEffects() {
 layoutEffects();
 
 // 角色(登陆行星, 第三人称)
-const walker = new PlanetWalker(planet, renderer.domElement);
+walker = new PlanetWalker(planet, renderer.domElement);
 scene.add(walker.mesh);
-let characterMode = false;
+applyControls();   // 初始: 轨道为主画面
 
 function setCharacterMode(on) {
   characterMode = on;
+  mainIsSpectator = false;   // 进入角色: 角色为主画面, 旁观在小窗; 退出: 轨道为主画面
   if (on) {
-    controls.enabled = false;
-    if (plControls.disconnect) plControls.disconnect();   // 让出鼠标锁给角色控制器
-    mainIsSpectator = false;
-    camHelper.visible = false;
-    camMarker.visible = false;
-    insetEl.style.display = 'none';
     walker.speed = params.walkSpeed;
     walker.enable(camera.position.clone().normalize());   // 在轨道相机对着的地表处出生
   } else {
     walker.disable();
-    if (plControls.connect) plControls.connect();
-    controls.enabled = true;
-    layoutInset();
   }
+  applyControls();
+  layoutInset();
+  updateInsetLabel();
 }
 
 function rebuild() {
@@ -356,19 +371,17 @@ function updateSpectator(dt) {
 
 function renderViews() {
   const w = innerWidth, h = innerHeight;
-  const mainCam = mainIsSpectator ? spectatorCamera : camera;
   // 主画面(全屏)
   renderer.setScissorTest(false);
   renderer.setViewport(0, 0, w, h);
-  renderer.render(scene, mainCam);
+  renderer.render(scene, mainCam());
   // 小窗(左上角), 独立视口
   if (params.showInset) {
-    const insetCam = mainIsSpectator ? camera : spectatorCamera;
     const x = INSET_MARGIN, y = h - insetH - INSET_MARGIN;
     renderer.setScissorTest(true);
     renderer.setViewport(x, y, insetW, insetH);
     renderer.setScissor(x, y, insetW, insetH);
-    renderer.render(scene, insetCam);
+    renderer.render(scene, insetCam());
     renderer.setScissorTest(false);
   }
 }
@@ -376,36 +389,22 @@ function renderViews() {
 function animate() {
   requestAnimationFrame(animate);
   const dt = Math.min(clock.getDelta(), 0.05);   // 限制步长, 防止掉帧时穿地
-  const s = planet.stats;
+  const main = mainCam();
 
-  // 角色模式: 相机跟随角色, LOD 跟随角色
-  if (characterMode) {
-    walker.update(dt);
-    planet.update(walker.camera);
-    renderer.setScissorTest(false);
-    renderer.setViewport(0, 0, innerWidth, innerHeight);
-    renderer.render(scene, walker.camera);
-    const alt = (walker.position.length() - params.radius).toFixed(1);
-    info.innerHTML =
-      `角色模式 · 点击锁定视角 · WASD 移动 · 空格跳跃 · ESC 释放 · (GUI 取消勾选退出)<br />` +
-      `patch: ${s.patches} · 三角形: ${s.triangles} · 高度: ${alt} · ${walker.grounded ? '地面' : '空中'}`;
-    return;
-  }
+  // 只更新当前主画面相机的控制
+  if (main === camera) controls.update();
+  else if (main === spectatorCamera) updateSpectator(dt);
+  if (characterMode) walker.update(dt);           // 角色始终更新(输入由 active 门控)
 
-  if (mainIsSpectator) updateSpectator(dt);
-  else controls.update();
-
-  planet.update(camera);   // LOD 始终由轨道相机驱动(旁观相机不影响细分)
+  planet.update(lodCam());                        // LOD 由主体相机(轨道/角色)驱动
   renderViews();
 
+  const s = planet.stats;
   const base = `patch: ${s.patches} · 三角形: ${s.triangles} · 队列: ${s.queued} · 生成中: ${s.inflight}`;
-  if (mainIsSpectator) {
-    info.innerHTML =
-      `旁观相机(主画面) · 点击锁定视角 · WASD 移动 · 空格/Shift 升降 · ESC 释放<br />` +
-      `LOD 冻结在轨道相机(白色视锥) · ${base}`;
-  } else {
-    info.innerHTML =
-      `鼠标左键旋转 · 滚轮缩放 · 右键平移 · 点左上小窗切换<br />${base}`;
-  }
+  let hint;
+  if (main === spectatorCamera) hint = '旁观相机(主画面) · 点击锁定 · WASD 移动 · 空格/Shift 升降 · ESC 释放';
+  else if (walker && main === walker.camera) hint = '角色(主画面) · 点击锁定 · WASD 移动 · 空格跳 · ESC 释放';
+  else hint = '鼠标左键旋转 · 滚轮缩放 · 右键平移';
+  info.innerHTML = `${hint} · 点左上小窗切换<br />${base}`;
 }
 animate();

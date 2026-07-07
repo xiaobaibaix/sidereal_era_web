@@ -28,6 +28,7 @@ export class PlanetWalker {
     this.pitch = 0.55;
     this.radialVel = 0;
     this.grounded = false;
+    this.active = false;      // 仅当角色是主画面时接管输入
     this._dYaw = 0; this._dPitch = 0;
     this.keys = {};
 
@@ -52,9 +53,9 @@ export class PlanetWalker {
     this._look = new THREE.Vector3();
 
     // 绑定事件处理器
-    this._onKeyDown = (e) => { this.keys[e.code] = true; if (this._locked && e.code === 'Space') e.preventDefault(); };
+    this._onKeyDown = (e) => { this.keys[e.code] = true; if (this.active && this._locked && e.code === 'Space') e.preventDefault(); };
     this._onKeyUp = (e) => { this.keys[e.code] = false; };
-    this._onClick = () => { if (this.enabled && !this._locked) this.dom.requestPointerLock(); };
+    this._onClick = () => { if (this.enabled && this.active && !this._locked) this.dom.requestPointerLock(); };
     this._onMove = (e) => { if (this._locked) { this._dYaw -= e.movementX * this.sens; this._dPitch += e.movementY * this.sens * (this.invertY ? 1 : -1); } };
     this._onLockChange = () => { this._locked = (document.pointerLockElement === this.dom); };
     this._locked = false;
@@ -95,16 +96,23 @@ export class PlanetWalker {
     document.removeEventListener('pointerlockchange', this._onLockChange);
   }
 
+  // 是否接管输入(仅当角色是主画面)。非激活时释放鼠标锁并清空累积。
+  setActive(v) {
+    this.active = v;
+    if (!v) { if (this._locked) document.exitPointerLock(); this._dYaw = 0; this._dPitch = 0; }
+  }
+
   update(dt) {
     if (!this.enabled) return;
-    const P = this.planet.params.radius, mh = this.planet.params.maxHeight;
 
     // 当前径向上方向
     this._n.copy(this.position).normalize();
 
-    // 鼠标: yaw 绕 up 旋转 forward, pitch 调相机仰角
-    if (this._dYaw) { this.forward.applyAxisAngle(this._n, this._dYaw); this._dYaw = 0; }
-    this.pitch = Math.max(-0.2, Math.min(1.35, this.pitch + this._dPitch)); this._dPitch = 0;
+    // 鼠标: yaw 绕 up 旋转 forward, pitch 调相机仰角(仅激活时)
+    if (this.active) {
+      if (this._dYaw) { this.forward.applyAxisAngle(this._n, this._dYaw); this._dYaw = 0; }
+      this.pitch = Math.max(-0.2, Math.min(1.35, this.pitch + this._dPitch)); this._dPitch = 0;
+    } else { this._dYaw = 0; this._dPitch = 0; }
 
     // forward 重新投影到切平面
     this.forward.addScaledVector(this._n, -this.forward.dot(this._n));
@@ -112,12 +120,14 @@ export class PlanetWalker {
     this.forward.normalize();
     this._right.crossVectors(this.forward, this._n).normalize();
 
-    // 切平面移动
+    // 切平面移动(仅激活时)
     let mz = 0, mx = 0;
-    if (this.keys['KeyW']) mz += 1;
-    if (this.keys['KeyS']) mz -= 1;
-    if (this.keys['KeyD']) mx += 1;
-    if (this.keys['KeyA']) mx -= 1;
+    if (this.active) {
+      if (this.keys['KeyW']) mz += 1;
+      if (this.keys['KeyS']) mz -= 1;
+      if (this.keys['KeyD']) mx += 1;
+      if (this.keys['KeyA']) mx -= 1;
+    }
     this._move.set(0, 0, 0).addScaledVector(this.forward, mz).addScaledVector(this._right, mx);
     if (this._move.lengthSq() > 0) {
       this._move.normalize().multiplyScalar(this.speed * dt);
@@ -131,7 +141,7 @@ export class PlanetWalker {
     const groundR = this.groundRadius(this._n) + this.feetOffset;
     if (r <= groundR) { r = groundR; this.radialVel = 0; this.grounded = true; }
     else this.grounded = false;
-    if (this.grounded && this.keys['Space']) this.radialVel = this.jumpSpeed;
+    if (this.active && this.grounded && this.keys['Space']) this.radialVel = this.jumpSpeed;
     this.position.copy(this._n).multiplyScalar(r);
 
     // 胶囊朝向: 局部 +Y = up, -Z = forward
