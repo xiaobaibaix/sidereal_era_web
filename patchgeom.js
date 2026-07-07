@@ -78,7 +78,7 @@ export function buildPatchArrays(A, B, C, N, R, maxHeight, seaLevel, heightAt, c
       const h = heightAt(d[0], d[1], d[2]);
       const rr = R + h * maxHeight;
       pos[k3] = d[0] * rr; pos[k3 + 1] = d[1] * rr; pos[k3 + 2] = d[2] * rr;
-      const c = colorFor(h);
+      const c = colorFor(h, d[0], d[1], d[2]);
       col[k3] = c[0]; col[k3 + 1] = c[1]; col[k3 + 2] = c[2];
 
       // 有限差分法线

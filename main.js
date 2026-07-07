@@ -54,6 +54,18 @@ const params = {
   mountainFreq: 3.0,
   mountainOctaves: 5,
   mountainStrength: 0.6,
+
+  // 结构增强 (Tier 1)
+  warpSeed: 777,
+  warpStrength: 0.2,      // 域扭曲强度(0=关)
+  warpFreq: 1.0,
+  plateSeed: 555,
+  plateFreq: 1.6,         // Worley 板块频率(越大板块越多越小)
+  plateStrength: 0.5,     // 板块边界山脉带强度(0=关)
+  moistureSeed: 333,
+  moistureFreq: 1.2,
+  useClimate: true,       // 气候配色(温湿度→生物群系)
+  climateAltRange: 1.0,
 };
 
 // ----------------------------------------------------------------------------
@@ -295,6 +307,18 @@ fMtn.add(params, 'mountainSeed', 0, 99999, 1).name('种子').onFinishChange(rebu
 fMtn.add(params, 'mountainFreq', 0.5, 8).name('频率').onFinishChange(rebuild);
 fMtn.add(params, 'mountainOctaves', 1, 8, 1).name('八度').onFinishChange(rebuild);
 fMtn.add(params, 'mountainStrength', 0, 1.5).name('强度').onFinishChange(rebuild);
+
+const fStruct = gui.addFolder('结构增强 (Tier1)');
+fStruct.add(params, 'warpStrength', 0, 0.6).name('域扭曲强度').onFinishChange(rebuild);
+fStruct.add(params, 'warpFreq', 0.3, 3).name('域扭曲频率').onFinishChange(rebuild);
+fStruct.add(params, 'warpSeed', 0, 99999, 1).name('域扭曲种子').onFinishChange(rebuild);
+fStruct.add(params, 'plateStrength', 0, 1.2).name('板块带强度').onFinishChange(rebuild);
+fStruct.add(params, 'plateFreq', 0.5, 5).name('板块频率').onFinishChange(rebuild);
+fStruct.add(params, 'plateSeed', 0, 99999, 1).name('板块种子').onFinishChange(rebuild);
+fStruct.add(params, 'useClimate').name('气候配色').onFinishChange(rebuild);
+fStruct.add(params, 'moistureFreq', 0.3, 3).name('湿度频率').onFinishChange(rebuild);
+fStruct.add(params, 'moistureSeed', 0, 99999, 1).name('湿度种子').onFinishChange(rebuild);
+fStruct.add(params, 'climateAltRange', 0.3, 2).name('气候海拔范围').onFinishChange(rebuild);
 
 // ----------------------------------------------------------------------------
 // 主循环
