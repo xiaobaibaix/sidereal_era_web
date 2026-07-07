@@ -33,6 +33,8 @@ const params = {
   maxLevel: 8,             // 四叉树最大细分层数
   splitFactor: 2.5,        // 相机距离 < 边长*splitFactor 时细分(越大越激进)
   patchResolution: 16,     // 每个 patch 的网格分辨率(必须是 2 的幂, 缝合依赖 dyadic 嵌套)
+  frustumMargin: 0.15,     // 视锥外扩余量(屏幕外预细分一圈, 减少旋转 pop-in)
+  nearRadius: 50,          // 相机周围此半径内一律细分(不受视锥限制, 环视不卡)
 
   // 大陆噪声 (fBm)
   continentSeed: 1337,
@@ -80,6 +82,14 @@ const camHelper = new THREE.CameraHelper(helperCam);
 camHelper.visible = false;
 scene.add(camHelper);
 
+// 轨道相机(LOD 相机)的位置标记, 旁观模式下显示
+const camMarker = new THREE.Mesh(
+  new THREE.SphereGeometry(1, 16, 12),
+  new THREE.MeshBasicMaterial({ color: 0xff5566 })
+);
+camMarker.visible = false;
+scene.add(camMarker);
+
 function syncHelperCam() {
   helperCam.fov = camera.fov;
   helperCam.aspect = camera.aspect;
@@ -90,6 +100,8 @@ function syncHelperCam() {
   helperCam.updateProjectionMatrix();
   helperCam.updateMatrixWorld(true);
   camHelper.update();
+  camMarker.position.copy(camera.position);
+  camMarker.scale.setScalar(Math.max(2, params.radius * 0.03));
 }
 
 // 旁观相机初始摆到侧面观察
@@ -136,6 +148,7 @@ function swapView() {
   // 旁观相机做主画面时: 冻结轨道相机(LOD 定格), 显示其视锥框, 允许 WASD 飞行
   controls.enabled = !mainIsSpectator;
   camHelper.visible = mainIsSpectator;
+  camMarker.visible = mainIsSpectator;
   if (mainIsSpectator) syncHelperCam();
   else plControls.unlock();
   updateInsetLabel();
@@ -228,6 +241,8 @@ const fLod = gui.addFolder('LOD');
 fLod.add(params, 'maxLevel', 0, 12, 1).name('最大层数');
 fLod.add(params, 'splitFactor', 1, 5).name('细分激进度');
 fLod.add(params, 'patchResolution', [4, 8, 16, 32]).name('patch 分辨率').onChange(rebuild);
+fLod.add(params, 'frustumMargin', 0, 0.5).name('视锥余量');
+fLod.add(params, 'nearRadius', 0, 300).name('预细分半径');
 
 gui.add(params, 'radius', 10, 500).name('半径').onFinishChange(rebuild);
 gui.add(params, 'maxHeight', 0, 30).name('最大高度').onFinishChange(rebuild);

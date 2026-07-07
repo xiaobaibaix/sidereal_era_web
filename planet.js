@@ -40,6 +40,8 @@ function pointInTri(p, a, b, c) {
   return true;
 }
 
+const _testSphere = new THREE.Sphere();   // 剔除测试用的临时包围球(避免每帧分配)
+
 // ============================================================================
 export class Planet extends THREE.Group {
   constructor(params) {
@@ -363,9 +365,15 @@ class QNode {
   }
 
   selectLOD(camPos, frustum, planet) {
-    if (!frustum.intersectsSphere(this.bsphere)) { this._hideSubtree(); return true; }
-    const dist = camPos.distanceTo(this.centerWorld);
-    const wantSplit = this.level < planet.params.maxLevel && dist < this.edgeLen * planet.params.splitFactor;
+    const d = camPos.distanceTo(this.centerWorld);
+    // 近处(预细分球内)不受视锥限制, 始终按距离细分 —— 避免原地环视时背后需要现补细分。
+    // 远处用带余量(margin)的视锥测试 —— 屏幕外预留一圈已细分好, 减少旋转时的 pop-in。
+    if (d >= planet.params.nearRadius) {
+      _testSphere.center.copy(this.centerWorld);
+      _testSphere.radius = this.bsphere.radius + d * planet.params.frustumMargin;
+      if (!frustum.intersectsSphere(_testSphere)) { this._hideSubtree(); return true; }
+    }
+    const wantSplit = this.level < planet.params.maxLevel && d < this.edgeLen * planet.params.splitFactor;
 
     if (wantSplit) {
       if (!this.children) this._split(planet);
