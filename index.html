@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Icosphere Planet (three.js)</title>
+  <style>
+    html, body { margin: 0; height: 100%; overflow: hidden; background: #05070d; }
+    #info {
+      position: fixed; left: 12px; top: 12px; z-index: 10;
+      color: #9fb3c8; font: 12px/1.5 monospace; pointer-events: none;
+      text-shadow: 0 1px 2px #000;
+    }
+  </style>
+
+  <!-- ES 模块从 CDN 加载。注意: 必须用本地服务器打开(见 README)，file:// 直接打开会被 CORS 拦截。 -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/",
+      "simplex-noise": "https://cdn.jsdelivr.net/npm/simplex-noise@4.0.0/dist/esm/simplex-noise.js",
+      "lil-gui": "https://cdn.jsdelivr.net/npm/lil-gui@0.19.2/dist/lil-gui.esm.js"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="info">
+    鼠标左键拖动旋转 · 滚轮缩放 · 右键平移<br />
+    右上角面板可实时调参
+  </div>
+  <script type="module" src="./main.js"></script>
+</body>
+</html>
