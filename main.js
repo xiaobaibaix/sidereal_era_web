@@ -46,6 +46,7 @@ const params = {
   atmoLightSteps: 8,        // 太阳方向外散射步数
   atmoShadowSoftness: 0.6,  // 晨昏过渡带宽度(越大越柔和)
   atmoTwilight: 0.3,        // 暮光弧强度(0=辉光贴地表, 1=完整地平下沉, 越大越"上翘")
+  atmoACES: true,           // true=ACES filmic tonemap, false=Reinhard
 
   // 太阳(方向 = 平行光方向, 同时驱动地形光照/海面高光/大气)
   sunElevation: 35,         // 仰角(度)
@@ -257,8 +258,9 @@ function makeSceneRT(w, h) {
     magFilter: THREE.LinearFilter,
     depthBuffer: true,
     depthTexture: new THREE.DepthTexture(Math.max(1, w), Math.max(1, h)),
+    type: THREE.HalfFloatType,            // HDR: 保留 >1 的高光, 供大气 pass 做 tonemap
   });
-  rt.texture.colorSpace = THREE.SRGBColorSpace;   // 与屏幕一致, 直通不变色
+  rt.texture.colorSpace = THREE.LinearSRGBColorSpace;  // 场景以线性 HDR 写入(不提前编码)
   rt.depthTexture.type = THREE.UnsignedIntType;
   return rt;
 }
@@ -298,6 +300,7 @@ function layoutEffects() {
   u.uLightSteps.value = params.atmoLightSteps;
   u.uShadowSoftness.value = params.atmoShadowSoftness;
   u.uTwilight.value = params.atmoTwilight;
+  u.uTonemap.value = params.atmoACES ? 1 : 0;
 }
 layoutEffects();
 
@@ -383,6 +386,7 @@ fAtmo.add(params, 'atmoSteps', 4, 32, 1).name('视线步数').onChange(layoutEff
 fAtmo.add(params, 'atmoLightSteps', 2, 16, 1).name('太阳步数').onChange(layoutEffects);
 fAtmo.add(params, 'atmoShadowSoftness', 0.05, 1.5).name('晨昏柔和度').onChange(layoutEffects);
 fAtmo.add(params, 'atmoTwilight', 0.0, 1.0).name('暮光弧(上翘)').onChange(layoutEffects);
+fAtmo.add(params, 'atmoACES').name('ACES 电影色调').onChange(layoutEffects);
 
 const fLod = gui.addFolder('LOD');
 fLod.add(params, 'maxLevel', 0, 12, 1).name('最大层数');
