@@ -3,28 +3,16 @@
 // patch 网格在 Web Worker 异步生成; skirt 仅作加载过渡兜底。
 
 import * as THREE from 'three';
-import { createNoise3D } from 'simplex-noise';
 import { buildPatchArrays } from './patchgeom.js';
+import { makeTerrain } from './terrain.js';
 
-function mulberry32(seed) {
-  let a = seed >>> 0;
-  return function () {
-    a |= 0; a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-function fbm(noise, x, y, z, octaves, freq, gain, lac) {
-  let sum = 0, amp = 1, f = freq;
-  for (let i = 0; i < octaves; i++) { sum += amp * noise(x * f, y * f, z * f); f *= lac; amp *= gain; }
-  return sum;
-}
-function ridged(noise, x, y, z, octaves, freq, gain, lac) {
-  let sum = 0, amp = 1, f = freq;
-  for (let i = 0; i < octaves; i++) { let n = 1 - Math.abs(noise(x * f, y * f, z * f)); n *= n; sum += amp * n; f *= lac; amp *= gain; }
-  return sum;
-}
+// 地形参数字段(供快照传给 worker, 保证主线程/worker 一致)
+const TERRAIN_KEYS = [
+  'continentSeed', 'continentFreq', 'continentOctaves', 'continentGain', 'continentLacunarity',
+  'mountainSeed', 'mountainFreq', 'mountainOctaves', 'mountainStrength', 'seaLevel',
+  'warpSeed', 'warpStrength', 'warpFreq', 'plateSeed', 'plateFreq', 'plateStrength',
+  'moistureSeed', 'moistureFreq', 'useClimate', 'climateAltRange',
+];
 
 // ---- 小型数组向量工具(供邻居层级查询用, 避免大量 Vector3 分配) ----
 function vnorm(x, y, z) { const l = 1 / Math.hypot(x, y, z); return [x * l, y * l, z * l]; }
@@ -57,7 +45,7 @@ export class Planet extends THREE.Group {
     this._solidColor = 0x05070d;
 
     this._heightCb = (x, y, z) => this.heightAt(x, y, z);
-    this._colorCb = (h) => this.colorFor(h);
+    this._colorCb = (h, x, y, z) => this.colorFor(h, x, y, z);
 
     this._gen = 0;
     this._queue = [];
@@ -82,31 +70,23 @@ export class Planet extends THREE.Group {
     }
   }
 
-  _buildNoise() {
-    this.noiseC = createNoise3D(mulberry32(this.params.continentSeed));
-    this.noiseM = createNoise3D(mulberry32(this.params.mountainSeed));
+  // 从 params 快照出地形相关字段(传给 worker + 构建主线程 terrain)
+  _terrainParams() {
+    const tp = {};
+    for (const k of TERRAIN_KEYS) tp[k] = this.params[k];
+    return tp;
   }
 
-  heightAt(x, y, z) {
-    const p = this.params;
-    const c = fbm(this.noiseC, x, y, z, p.continentOctaves, p.continentFreq, p.continentGain, p.continentLacunarity);
-    const m = ridged(this.noiseM, x, y, z, p.mountainOctaves, p.mountainFreq, 0.5, 2.0);
-    const mask = Math.min(1, Math.max(0, c));
-    return c + m * p.mountainStrength * mask;
+  _buildNoise() {
+    this.terrain = makeTerrain(this._terrainParams());
   }
+
+  heightAt(x, y, z) { return this.terrain.heightAt(x, y, z); }
+  colorFor(h, x, y, z) { return this.terrain.colorFor(h, x, y, z); }
 
   displace(dir) {
     const h = this.heightAt(dir.x, dir.y, dir.z);
     return dir.clone().multiplyScalar(this.params.radius + h * this.params.maxHeight);
-  }
-
-  colorFor(h) {
-    if (h < this.params.seaLevel) return [0.05, 0.2, 0.5];
-    const t = Math.min(1, Math.max(0, h));
-    if (t < 0.05) return [0.85, 0.8, 0.55];
-    if (t < 0.4) return [0.2, 0.5, 0.15];
-    if (t < 0.7) return [0.4, 0.3, 0.2];
-    return [0.95, 0.95, 0.98];
   }
 
   _buildRoots() {
@@ -214,12 +194,9 @@ export class Planet extends THREE.Group {
     w.postMessage({
       id, gen: this._gen,
       A: [node.A.x, node.A.y, node.A.z], B: [node.B.x, node.B.y, node.B.z], C: [node.C.x, node.C.y, node.C.z],
-      N: p.patchResolution, R: p.radius, maxHeight: p.maxHeight, seaLevel: p.seaLevel,
+      N: p.patchResolution, R: p.radius, maxHeight: p.maxHeight,
       strides: node._reqStrides,
-      continentSeed: p.continentSeed, continentFreq: p.continentFreq, continentOctaves: p.continentOctaves,
-      continentGain: p.continentGain, continentLacunarity: p.continentLacunarity,
-      mountainSeed: p.mountainSeed, mountainFreq: p.mountainFreq, mountainOctaves: p.mountainOctaves,
-      mountainStrength: p.mountainStrength,
+      terrain: this._terrainParams(),
     });
   }
 
