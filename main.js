@@ -42,11 +42,13 @@ const params = {
   atmoMieFalloff: 16.0,     // 米氏密度衰减
   atmoSunIntensity: 22.0,
   atmoExposure: 1.0,
-  atmoSteps: 16,            // 视线积分步数
+  atmoSteps: 24,            // 视线积分步数(越高越少噪点/色带, 越耗性能)
   atmoLightSteps: 8,        // 太阳方向外散射步数
   atmoShadowSoftness: 0.6,  // 晨昏过渡带宽度(越大越柔和)
   atmoTwilight: 0.3,        // 暮光弧强度(0=辉光贴地表, 1=完整地平下沉, 越大越"上翘")
   atmoACES: true,           // true=ACES filmic tonemap, false=Reinhard
+  atmoOzone: 0.02,          // 臭氧吸收强度(0=关, 日落品红/天空更纯净蓝)
+  atmoDither: 0.5,          // raymarch 抖动强度(去同心圆 banding; 太高会变颗粒噪点)
 
   // 太阳(方向 = 平行光方向, 同时驱动地形光照/海面高光/大气)
   sunElevation: 35,         // 仰角(度)
@@ -277,6 +279,8 @@ resizeSceneRTs();
 
 // 瑞利散射 RGB 比值(∝ 1/λ⁴, 波长 700/530/440nm), 乘以强度得到散射系数
 const RAY_RATIO = new THREE.Vector3(0.1066, 0.3245, 0.6830);
+// 臭氧吸收 RGB 比值(绿最强, 蓝最弱; 归一到绿=1), 乘以强度得到吸收系数
+const OZONE_RATIO = new THREE.Vector3(0.35, 1.0, 0.045);
 
 function layoutEffects() {
   const oceanR = params.radius + params.seaLevel * params.maxHeight;
@@ -301,6 +305,8 @@ function layoutEffects() {
   u.uShadowSoftness.value = params.atmoShadowSoftness;
   u.uTwilight.value = params.atmoTwilight;
   u.uTonemap.value = params.atmoACES ? 1 : 0;
+  u.uOzone.value.copy(OZONE_RATIO).multiplyScalar(params.atmoOzone);
+  u.uDither.value = params.atmoDither;
 }
 layoutEffects();
 
@@ -387,6 +393,8 @@ fAtmo.add(params, 'atmoLightSteps', 2, 16, 1).name('太阳步数').onChange(layo
 fAtmo.add(params, 'atmoShadowSoftness', 0.05, 1.5).name('晨昏柔和度').onChange(layoutEffects);
 fAtmo.add(params, 'atmoTwilight', 0.0, 1.0).name('暮光弧(上翘)').onChange(layoutEffects);
 fAtmo.add(params, 'atmoACES').name('ACES 电影色调').onChange(layoutEffects);
+fAtmo.add(params, 'atmoOzone', 0.0, 0.1).name('臭氧(日落品红)').onChange(layoutEffects);
+fAtmo.add(params, 'atmoDither', 0.0, 1.0).name('抖动去带').onChange(layoutEffects);
 
 const fLod = gui.addFolder('LOD');
 fLod.add(params, 'maxLevel', 0, 12, 1).name('最大层数');
@@ -423,6 +431,134 @@ fStruct.add(params, 'useClimate').name('气候配色').onFinishChange(rebuild);
 fStruct.add(params, 'moistureFreq', 0.3, 3).name('湿度频率').onFinishChange(rebuild);
 fStruct.add(params, 'moistureSeed', 0, 99999, 1).name('湿度种子').onFinishChange(rebuild);
 fStruct.add(params, 'climateAltRange', 0.3, 2).name('气候海拔范围').onFinishChange(rebuild);
+
+// ----------------------------------------------------------------------------
+// 参数预设: 自动持久化到 localStorage(刷新后自动恢复) + 导出/导入 JSON + 重置默认
+// ----------------------------------------------------------------------------
+const DEFAULTS = JSON.parse(JSON.stringify(params));   // 启动时的代码默认值(供重置)
+const LS_KEY = 'planet.params.v1';
+const NO_PERSIST = ['characterMode'];                  // 运行态, 不持久化
+
+function collectParams() {
+  const o = {};
+  for (const k in params) if (!NO_PERSIST.includes(k)) o[k] = params[k];
+  return o;
+}
+function saveParams() {
+  try { localStorage.setItem(LS_KEY, JSON.stringify(collectParams())); } catch (e) { /* 隐私模式等 */ }
+}
+// 把一组参数应用到 params 并驱动场景全部刷新
+function applyParams(src) {
+  for (const k in src) if (k in params && !NO_PERSIST.includes(k)) params[k] = src[k];
+  gui.controllersRecursive().forEach((c) => c.updateDisplay());   // 同步滑块显示
+  planet.setWireframe(params.wireframe);
+  if (walker) { walker.speed = params.walkSpeed; walker.invertY = params.invertY; }
+  updateSun();
+  rebuild();          // 重建地形 + layoutEffects(海洋/大气全部 uniform)
+  layoutInset();
+}
+function loadParams() {
+  try {
+    const s = localStorage.getItem(LS_KEY);
+    if (s) { applyParams(JSON.parse(s)); return true; }
+  } catch (e) { /* 忽略损坏数据 */ }
+  return false;
+}
+function resetParams() { applyParams(DEFAULTS); saveParams(); }
+
+// 项目内置预设文件(可提交到 git, 跟着项目走)
+const PRESET_URL = './presets/default.json';
+async function loadProjectPreset() {
+  try {
+    const res = await fetch(PRESET_URL, { cache: 'no-store' });
+    if (!res.ok) return false;
+    applyParams(await res.json());
+    return true;
+  } catch (e) { return false; }
+}
+function exportParams() {
+  const blob = new Blob([JSON.stringify(collectParams(), null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = 'planet-params.json';
+  a.click();
+  URL.revokeObjectURL(url);
+}
+function importParams() {
+  const inp = document.createElement('input');
+  inp.type = 'file'; inp.accept = 'application/json,.json';
+  inp.onchange = () => {
+    const f = inp.files && inp.files[0];
+    if (!f) return;
+    const r = new FileReader();
+    r.onload = () => {
+      try { applyParams(JSON.parse(r.result)); saveParams(); }
+      catch (e) { alert('参数文件解析失败: ' + e.message); }
+    };
+    r.readAsText(f);
+  };
+  inp.click();
+}
+
+// 项目预设: 直接读写 three_planet/presets/(需用 serve.py 启动才能"保存到项目")
+const projState = { name: 'default', selected: '' };
+let projLoadCtrl = null;
+
+function attachProjDropdown(opts) {
+  const list = opts.length ? opts : ['(无)'];
+  projLoadCtrl = projLoadCtrl ? projLoadCtrl.options(list) : fPreset.add(projState, 'selected', list);
+  projLoadCtrl.name('项目预设 → 选择加载').onChange((v) => {
+    if (v && v !== '(无)') loadProjectNamed(v);
+  });
+}
+async function refreshPresetList() {
+  try {
+    const res = await fetch('/api/presets', { cache: 'no-store' });
+    if (!res.ok) throw new Error();
+    const { presets } = await res.json();
+    attachProjDropdown(presets);
+    return true;
+  } catch (e) { return false; }   // 后端不可用(普通静态服务器): 保持占位
+}
+async function loadProjectNamed(name) {
+  try {
+    const res = await fetch('./presets/' + encodeURIComponent(name) + '.json', { cache: 'no-store' });
+    if (res.ok) { applyParams(await res.json()); saveParams(); }
+  } catch (e) { /* ignore */ }
+}
+async function saveToProject() {
+  const name = (projState.name || 'default').trim();
+  try {
+    const res = await fetch('/api/presets/save', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, params: collectParams() }),
+    });
+    const j = await res.json().catch(() => ({}));
+    if (res.ok) { projState.selected = name; await refreshPresetList(); }
+    else alert('保存失败: ' + (j.error || res.status));
+  } catch (e) {
+    alert('“保存到项目”需要用 serve.py 启动服务器:\n  python3 serve.py\n(当前是只读静态服务器)');
+  }
+}
+
+const fPreset = gui.addFolder('参数预设');
+fPreset.add(projState, 'name').name('预设名(存到项目)');
+fPreset.add({ f: saveToProject }, 'f').name('▸ 保存到项目 presets/');
+attachProjDropdown([]);        // 占位, 启动后由 refreshPresetList 填充
+fPreset.add({ f: refreshPresetList }, 'f').name('刷新项目预设列表');
+fPreset.add({ f: () => saveParams() }, 'f').name('保存到浏览器');
+fPreset.add({ f: () => { loadProjectPreset().then(saveParams); } }, 'f').name('加载 default.json');
+fPreset.add({ f: resetParams }, 'f').name('重置为出厂默认');
+fPreset.add({ f: exportParams }, 'f').name('导出 JSON(下载)');
+fPreset.add({ f: importParams }, 'f').name('导入 JSON(上传)');
+
+// 启动加载顺序: 浏览器上次调的(localStorage) > 项目内置预设(default.json) > 代码默认。
+// 只要没在本地改过参数, 每次都会拿最新的 default.json; 一旦调过则以本地为准。
+(async function initParams() {
+  if (!loadParams()) await loadProjectPreset();
+  await refreshPresetList();
+  gui.onFinishChange(() => saveParams());   // 之后每次调完自动持久化
+})();
 
 // ----------------------------------------------------------------------------
 // 主循环
