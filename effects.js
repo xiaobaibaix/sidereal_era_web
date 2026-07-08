@@ -403,7 +403,8 @@ export function createCloudPass() {
         float r = length(pos - uPlanetCenter);
         float h = (r - uBottom) / max(uTop - uBottom, 1e-4);   // 0..1
         if (h < 0.0 || h > 1.0) return 0.0;
-        float heightGrad = smoothstep(0.0, 0.15, h) * (1.0 - smoothstep(0.6, 1.0, h));
+        // 高度权重: 中间浓、上下柔和渐隐(范围放宽, 过渡更软)
+        float heightGrad = smoothstep(0.0, 0.3, h) * (1.0 - smoothstep(0.45, 1.0, h));
 
         vec3 sp = pos * uFreq + uWind * (uTime * uWindSpeed);
         float base;
@@ -413,8 +414,9 @@ export function createCloudPass() {
         } else {
           base = fbm(sp, 3);
         }
+        // 关键: 先把噪声乘上高度权重再阈值化 → 云顶/云底被噪声啃成参差形状, 不再是平切的球面
         float thr = 1.0 - uCoverage;
-        return smoothstep(thr - 0.08, thr + 0.12, base) * heightGrad;
+        return smoothstep(thr, thr + 0.18, base * heightGrad);
       }
 
       // 向太阳的自阴影(Beer): 沿 sunDir 累积密度(用便宜密度)
