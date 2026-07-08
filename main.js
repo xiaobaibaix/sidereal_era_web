@@ -482,6 +482,24 @@ function renderView(cam, rt, vpX, vpY, vpW, vpH, scissor) {
   renderer.setScissorTest(false);
 }
 
+// 动态近/远裁剪面: 相机离行星越远, 近平面抬得越高 → far/near 比变小, 深度精度大幅提升,
+// 消除海洋球与海岸线地形深度几乎相等时的 z-fighting 闪烁。贴近地表(角色)时近平面自动
+// 回落到很小, 不裁近处地形。远平面收紧到刚好包住星空(50000)。
+const _clipPos = new THREE.Vector3();
+function updateClip(cam) {
+  cam.getWorldPosition(_clipPos);
+  const d = _clipPos.length();                         // 行星在原点
+  const clearance = d - (params.radius + params.maxHeight);
+  cam.near = THREE.MathUtils.clamp(clearance * 0.4, 0.1, 5000);
+  cam.far = Math.max(d + params.radius * 4.0, 60000);
+  cam.updateProjectionMatrix();
+}
+function updateClips() {
+  updateClip(camera);
+  updateClip(spectatorCamera);
+  if (walker) updateClip(walker.camera);
+}
+
 function renderViews() {
   const pr = renderer.getPixelRatio();
   const w = innerWidth, h = innerHeight;
@@ -515,6 +533,7 @@ function animate() {
   else if (main === spectatorCamera) updateSpectator(dt);
   if (characterMode) walker.update(dt);           // 角色始终更新(输入由 active 门控)
 
+  updateClips();                                  // 动态近/远面, 消除 z-fighting
   planet.update(lodCam());                        // LOD 由主体相机(轨道/角色)驱动
   renderViews();
 
