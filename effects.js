@@ -82,6 +82,8 @@ export function createAtmospherePass() {
     uExposure: { value: 1.0 },
     uSteps: { value: 16 },            // 视线积分步数
     uLightSteps: { value: 8 },        // 太阳方向外散射步数
+    uShadowSoftness: { value: 0.6 },  // 晨昏过渡带宽度
+    uTwilight: { value: 0.3 },        // 暮光弧强度(0=贴地表, 1=完整几何地平下沉)
   };
 
   const material = new THREE.ShaderMaterial({
@@ -118,6 +120,8 @@ export function createAtmospherePass() {
       uniform float uExposure;
       uniform int   uSteps;
       uniform int   uLightSteps;
+      uniform float uShadowSoftness;   // 晨昏过渡带宽度
+      uniform float uTwilight;         // 暮光弧强度(0=贴地表, 1=完整几何地平下沉)
 
       const float PI = 3.14159265359;
 
@@ -146,12 +150,13 @@ export function createAtmospherePass() {
                     exp(-t * uMieFalloff)     * edge);
       }
 
-      // 从点 p 沿 dir 到大气顶的光学深度 (瑞利, 米氏)。若中途撞地面, 视为完全遮挡。
+      // 从点 p 沿 dir 的大气光学深度 (瑞利, 米氏)。撞地面则只积到地表(有限值),
+      // 遮挡由 planetShadow() 平滑处理, 不再硬性丢弃 → 避免晨昏线硬边。
       vec2 opticalDepthToSun(vec3 p, vec3 dir) {
-        vec2 g = raySphere(p, dir, uPlanetCenter, uRground);
-        if (g.x > 0.0 && g.y > g.x) return vec2(1e9);
         vec2 a = raySphere(p, dir, uPlanetCenter, uRatmo);
         float far = max(a.y, 0.0);
+        vec2 g = raySphere(p, dir, uPlanetCenter, uRground);
+        if (g.x > 0.0 && g.y > g.x) far = min(far, g.x);
         int N = uLightSteps;
         float step = far / float(N);
         vec2 od = vec2(0.0);
@@ -162,6 +167,17 @@ export function createAtmospherePass() {
           q += dir * step;
         }
         return od;
+      }
+
+      // 行星本体对太阳的软遮挡: 1=全亮, 0=在阴影里。基于太阳相对"当地地平"的仰角,
+      // 连续无硬跳变(白天全亮不被压暗); 高度越高地平越下沉 → 晨昏线之上仍受光(暮光)。
+      float planetShadow(vec3 p, vec3 sunDir) {
+        vec3 q = p - uPlanetCenter;
+        float r = max(length(q), 1e-4);
+        float sinElev = dot(q / r, sunDir);                        // 太阳相对当地地平的 sin
+        float dip = sqrt(max(1.0 - (uRground * uRground) / (r * r), 0.0)) * uTwilight; // 地平下沉(可调)
+        float soft = max(uShadowSoftness * 0.25, 1e-3);            // 过渡带宽度(sin 角度单位)
+        return smoothstep(-soft, soft, sinElev + dip);
       }
 
       void main() {
@@ -205,11 +221,12 @@ export function createAtmospherePass() {
           vec2 dens = densityAt(p) * step;
           odView += dens;
 
-          vec2 odSun = opticalDepthToSun(p, uSunDir);
-          if (odSun.x < 1e8) {
+          float shadow = planetShadow(p, uSunDir);
+          if (shadow > 0.0) {
+            vec2 odSun = opticalDepthToSun(p, uSunDir);
             vec3 tau = uScatterR * (odView.x + odSun.x)
                      + uScatterM * 1.1 * (odView.y + odSun.y);
-            vec3 T = exp(-tau);
+            vec3 T = exp(-tau) * shadow;   // 软遮挡: 晨昏线平滑过渡
             sumR += dens.x * T;
             sumM += dens.y * T;
           }
