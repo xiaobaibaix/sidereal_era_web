@@ -84,6 +84,9 @@ export function createAtmospherePass() {
     uLightSteps: { value: 8 },        // 太阳方向外散射步数
     uShadowSoftness: { value: 0.6 },  // 晨昏过渡带宽度
     uTwilight: { value: 0.3 },        // 暮光弧强度(0=贴地表, 1=完整几何地平下沉)
+    uTonemap: { value: 1 },           // 0=Reinhard, 1=ACES filmic
+    uOzone: { value: new THREE.Vector3(0.007, 0.02, 0.0009) }, // 臭氧吸收(绿>红>蓝)
+    uDither: { value: 1.0 },          // raymarch 抖动强度(去 banding)
   };
 
   const material = new THREE.ShaderMaterial({
@@ -122,8 +125,34 @@ export function createAtmospherePass() {
       uniform int   uLightSteps;
       uniform float uShadowSoftness;   // 晨昏过渡带宽度
       uniform float uTwilight;         // 暮光弧强度(0=贴地表, 1=完整几何地平下沉)
+      uniform int   uTonemap;          // 0=Reinhard, 1=ACES filmic
+      uniform vec3  uOzone;            // 臭氧吸收系数(只消光, 不散射)
+      uniform float uDither;           // raymarch 起点抖动强度(去 banding)
 
       const float PI = 3.14159265359;
+
+      // 每像素伪随机(去 banding 的抖动用)
+      float hash12(vec2 p) {
+        vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+        p3 += dot(p3, p3.yzx + 33.33);
+        return fract((p3.x + p3.y) * p3.z);
+      }
+
+      // ACES filmic 近似(Narkowicz): 线性 HDR → 显示线性, 高光自然滚降
+      vec3 acesFilm(vec3 x) {
+        return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+      }
+      // 线性 → sRGB 编码(手动, 因为 ShaderMaterial 输出不自动转)
+      vec3 linearToSRGB(vec3 c) {
+        c = clamp(c, 0.0, 1.0);
+        return mix(12.92 * c, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, c));
+      }
+      // 统一末端处理: 曝光 → tonemap → sRGB。整条管线在线性 HDR 空间, 这里落地到屏幕。
+      vec3 tonemap(vec3 c) {
+        c *= uExposure;
+        vec3 m = (uTonemap == 1) ? acesFilm(c) : (c / (1.0 + c));  // ACES 或 Reinhard
+        return linearToSRGB(m);
+      }
 
       // 射线与球求交, 返回 (near, far); 未命中返回 near>far。rd 需归一化(a=1)。
       vec2 raySphere(vec3 ro, vec3 rd, vec3 ce, float r) {
@@ -142,24 +171,27 @@ export function createAtmospherePass() {
         return clamp(h / max(uRatmo - uRground, 1e-4), 0.0, 1.0);
       }
 
-      // 某点的相对密度 (x=瑞利, y=米氏), 边缘平滑归零
-      vec2 densityAt(vec3 p) {
+      // 某点的相对密度 (x=瑞利, y=米氏, z=臭氧)。瑞利/米氏指数衰减且边缘归零;
+      // 臭氧用 tent 分布(集中在中高空), 只用于消光。
+      vec3 densityAt(vec3 p) {
         float t = heightFrac(p);
         float edge = 1.0 - t;
-        return vec2(exp(-t * uDensityFalloff) * edge,
-                    exp(-t * uMieFalloff)     * edge);
+        float dR = exp(-t * uDensityFalloff) * edge;
+        float dM = exp(-t * uMieFalloff)     * edge;
+        float dO = max(0.0, 1.0 - abs(t - 0.35) / 0.35);   // 臭氧 tent (峰在 h01≈0.35)
+        return vec3(dR, dM, dO);
       }
 
       // 从点 p 沿 dir 的大气光学深度 (瑞利, 米氏)。撞地面则只积到地表(有限值),
       // 遮挡由 planetShadow() 平滑处理, 不再硬性丢弃 → 避免晨昏线硬边。
-      vec2 opticalDepthToSun(vec3 p, vec3 dir) {
+      vec3 opticalDepthToSun(vec3 p, vec3 dir) {
         vec2 a = raySphere(p, dir, uPlanetCenter, uRatmo);
         float far = max(a.y, 0.0);
         vec2 g = raySphere(p, dir, uPlanetCenter, uRground);
         if (g.x > 0.0 && g.y > g.x) far = min(far, g.x);
         int N = uLightSteps;
         float step = far / float(N);
-        vec2 od = vec2(0.0);
+        vec3 od = vec3(0.0);
         vec3 q = p + dir * (step * 0.5);
         for (int i = 0; i < 64; i++) {
           if (i >= N) break;
@@ -181,8 +213,8 @@ export function createAtmospherePass() {
       }
 
       void main() {
-        vec3 sceneColor = texture2D(tDiffuse, vUv).rgb;
-        if (uEnabled < 0.5) { gl_FragColor = vec4(sceneColor, 1.0); return; }
+        vec3 sceneColor = texture2D(tDiffuse, vUv).rgb;   // 线性 HDR
+        if (uEnabled < 0.5) { gl_FragColor = vec4(tonemap(sceneColor), 1.0); return; }
 
         // 从深度重建视线方向与场景距离
         vec2 ndc = vUv * 2.0 - 1.0;
@@ -201,31 +233,35 @@ export function createAtmospherePass() {
         vec2 atmo = raySphere(ro, rd, uPlanetCenter, uRatmo);
         float tNear = max(atmo.x, 0.0);
         float tFar  = atmo.y;
-        if (tFar <= tNear) { gl_FragColor = vec4(sceneColor, 1.0); return; }
+        if (tFar <= tNear) { gl_FragColor = vec4(tonemap(sceneColor), 1.0); return; }
 
         // 止于真实地表(深度)或海平面球(海洋不写深度, 用解析球兜底)
         tFar = min(tFar, sceneDist);
         vec2 gnd = raySphere(ro, rd, uPlanetCenter, uRground);
         if (gnd.x > 0.0 && gnd.y > gnd.x) tFar = min(tFar, gnd.x);
-        if (tFar <= tNear) { gl_FragColor = vec4(sceneColor, 1.0); return; }
+        if (tFar <= tNear) { gl_FragColor = vec4(tonemap(sceneColor), 1.0); return; }
 
         int N = uSteps;
         float step = (tFar - tNear) / float(N);
-        vec2 odView = vec2(0.0);
+        vec3 odView = vec3(0.0);
         vec3 sumR = vec3(0.0);
         vec3 sumM = vec3(0.0);
 
-        vec3 p = ro + rd * (tNear + step * 0.5);
+        // 起点抖动: 打散低步数产生的同心圆条带
+        float jitter = mix(0.5, hash12(gl_FragCoord.xy), uDither);
+        vec3 p = ro + rd * (tNear + step * jitter);
         for (int i = 0; i < 64; i++) {
           if (i >= N) break;
-          vec2 dens = densityAt(p) * step;
+          vec3 dens = densityAt(p) * step;
           odView += dens;
 
           float shadow = planetShadow(p, uSunDir);
           if (shadow > 0.0) {
-            vec2 odSun = opticalDepthToSun(p, uSunDir);
+            vec3 odSun = opticalDepthToSun(p, uSunDir);
+            // 消光 = 瑞利 + 米氏(散射×1.1) + 臭氧(纯吸收)
             vec3 tau = uScatterR * (odView.x + odSun.x)
-                     + uScatterM * 1.1 * (odView.y + odSun.y);
+                     + uScatterM * 1.1 * (odView.y + odSun.y)
+                     + uOzone * (odView.z + odSun.z);
             vec3 T = exp(-tau) * shadow;   // 软遮挡: 晨昏线平滑过渡
             sumR += dens.x * T;
             sumM += dens.y * T;
@@ -241,15 +277,15 @@ export function createAtmospherePass() {
                      * ((1.0 - g2) * (1.0 + mu * mu))
                      / ((2.0 + g2) * pow(1.0 + g2 - 2.0 * g * mu, 1.5));
 
+        // 线性 HDR 内散射(不在这里 tonemap, 留到末端统一处理)
         vec3 inscatter = uSunIntensity *
             (sumR * uScatterR * phaseR + sumM * uScatterM * phaseM);
-        inscatter = vec3(1.0) - exp(-inscatter * uExposure);   // 曝光 tonemap
 
-        // aerial perspective: 地表颜色被视线透射率衰减, 再叠加内散射
-        vec3 Tview = exp(-(uScatterR * odView.x + uScatterM * 1.1 * odView.y));
+        // aerial perspective: 地表颜色被视线透射率衰减(含臭氧), 再叠加内散射(全在线性 HDR 空间)
+        vec3 Tview = exp(-(uScatterR * odView.x + uScatterM * 1.1 * odView.y + uOzone * odView.z));
         vec3 color = sceneColor * Tview + inscatter;
 
-        gl_FragColor = vec4(color, 1.0);
+        gl_FragColor = vec4(tonemap(color), 1.0);   // 曝光 + ACES/Reinhard + sRGB
       }
     `,
   });
