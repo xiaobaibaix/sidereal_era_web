@@ -12,6 +12,9 @@ const TERRAIN_KEYS = [
   'mountainSeed', 'mountainFreq', 'mountainOctaves', 'mountainStrength', 'seaLevel',
   'warpSeed', 'warpStrength', 'warpFreq', 'plateSeed', 'plateFreq', 'plateStrength',
   'moistureSeed', 'moistureFreq', 'useClimate', 'climateAltRange',
+  // 可调调色板(缺省时 terrain.js 用默认色)
+  'colOceanShallow', 'colOceanDeep', 'colBeach', 'colDry', 'colWet',
+  'colColdDry', 'colColdWet', 'colRock', 'colSnow',
 ];
 
 // ---- 小型数组向量工具(供邻居层级查询用, 避免大量 Vector3 分配) ----

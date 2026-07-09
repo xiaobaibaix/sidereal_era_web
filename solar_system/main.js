@@ -388,6 +388,11 @@ const tune = {
   nearRadiusFrac: 0.5, maxHeightFrac: 0.03,
   continentFreq: 1.2, continentOctaves: 5, mountainFreq: 3.0, mountainStrength: 0.6,
   warpStrength: 0.2, plateStrength: 0.5, useClimate: true,
+  // 地形调色板([r,g,b] 0..1, lil-gui addColor 原地编辑)
+  colOceanShallow: [0.20, 0.45, 0.62], colOceanDeep: [0.03, 0.12, 0.30],
+  colBeach: [0.82, 0.78, 0.55], colDry: [0.78, 0.70, 0.42], colWet: [0.13, 0.45, 0.15],
+  colColdDry: [0.55, 0.53, 0.45], colColdWet: [0.22, 0.38, 0.32],
+  colRock: [0.50, 0.50, 0.52], colSnow: [0.97, 0.97, 1.0],
 };
 
 function hashSeed(str) {
@@ -407,6 +412,10 @@ function planetParamsFor(body) {
     warpSeed: s + 23, warpStrength: tune.warpStrength, warpFreq: 1.0,
     plateSeed: s + 37, plateFreq: 1.6, plateStrength: tune.plateStrength,
     moistureSeed: s + 51, moistureFreq: 1.2, useClimate: tune.useClimate, climateAltRange: 1.0,
+    colOceanShallow: tune.colOceanShallow, colOceanDeep: tune.colOceanDeep,
+    colBeach: tune.colBeach, colDry: tune.colDry, colWet: tune.colWet,
+    colColdDry: tune.colColdDry, colColdWet: tune.colColdWet,
+    colRock: tune.colRock, colSnow: tune.colSnow,
   };
 }
 // LOD 类参数: 写入当前近距行星, 实时生效(无需重建)
@@ -485,6 +494,19 @@ fAtm.add(atm, 'dither', 0, 1).name('抖动去带');
 fAtm.add(atm, 'steps', 4, 32, 1).name('视线步数');
 fAtm.add(atm, 'lightSteps', 2, 16, 1).name('太阳步数');
 fAtm.add(atm, 'aces').name('ACES(整屏)');
+
+// 地形调色板(改颜色重建当前近距行星)
+const fCol = gui.addFolder('地形颜色');
+fCol.addColor(tune, 'colOceanShallow').name('浅海').onFinishChange(applyDetailRebuild);
+fCol.addColor(tune, 'colOceanDeep').name('深海').onFinishChange(applyDetailRebuild);
+fCol.addColor(tune, 'colBeach').name('海岸').onFinishChange(applyDetailRebuild);
+fCol.addColor(tune, 'colWet').name('湿润低地/雨林').onFinishChange(applyDetailRebuild);
+fCol.addColor(tune, 'colDry').name('干旱低地/荒漠').onFinishChange(applyDetailRebuild);
+fCol.addColor(tune, 'colColdWet').name('针叶林').onFinishChange(applyDetailRebuild);
+fCol.addColor(tune, 'colColdDry').name('苔原').onFinishChange(applyDetailRebuild);
+fCol.addColor(tune, 'colRock').name('岩石/高山').onFinishChange(applyDetailRebuild);
+fCol.addColor(tune, 'colSnow').name('雪').onFinishChange(applyDetailRebuild);
+fCol.close();
 
 // ----------------------------------------------------------------------------
 // 主循环: 固定步长物理 + 浮动原点渲染

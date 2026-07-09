@@ -72,6 +72,19 @@ export function makeTerrain(p) {
   const useClimate = p.useClimate;
   const altRange = p.climateAltRange || 1.0;
 
+  // 可调调色板(缺省回退到原硬编码值 → 不传颜色的调用者行为不变)
+  const C = {
+    oceanShallow: p.colOceanShallow || [0.20, 0.45, 0.62],
+    oceanDeep: p.colOceanDeep || [0.03, 0.12, 0.30],
+    beach: p.colBeach || [0.82, 0.78, 0.55],
+    dry: p.colDry || [0.78, 0.70, 0.42],       // 暖·干 → 荒漠
+    wet: p.colWet || [0.13, 0.45, 0.15],       // 暖·湿 → 雨林/低地绿
+    coldDry: p.colColdDry || [0.55, 0.53, 0.45], // 冷·干 → 苔原
+    coldWet: p.colColdWet || [0.22, 0.38, 0.32], // 冷·湿 → 针叶林
+    rock: p.colRock || [0.50, 0.50, 0.52],
+    snow: p.colSnow || [0.97, 0.97, 1.0],
+  };
+
   const noiseC = createNoise3D(mulberry32(cSeed));
   const noiseM = createNoise3D(mulberry32(mSeed));
   const noiseW = createNoise3D(mulberry32(warpSeed));
@@ -105,17 +118,17 @@ export function makeTerrain(p) {
     // 海洋: 深浅水渐变
     if (h < sea) {
       const d = clamp01((sea - h) / 0.3);
-      return lerp3([0.20, 0.45, 0.62], [0.03, 0.12, 0.30], d);
+      return lerp3(C.oceanShallow, C.oceanDeep, d);
     }
     if (!useClimate) {
       const t = clamp01(h);
-      if (t < 0.05) return [0.85, 0.8, 0.55];
-      if (t < 0.4) return [0.2, 0.5, 0.15];
-      if (t < 0.7) return [0.4, 0.3, 0.2];
-      return [0.95, 0.95, 0.98];
+      if (t < 0.05) return C.beach;
+      if (t < 0.4) return C.wet;
+      if (t < 0.7) return C.rock;
+      return C.snow;
     }
     // 海岸沙滩
-    if (h - sea < 0.02) return [0.82, 0.78, 0.55];
+    if (h - sea < 0.02) return C.beach;
     // 气候: 温度(海拔+纬度) × 湿度 → 生物群系
     const alt = clamp01((h - sea) / altRange);
     const lat = Math.abs(y);                                   // 纬度 0..1
@@ -125,10 +138,10 @@ export function makeTerrain(p) {
     // 高海拔 / 极寒 → 岩石到雪
     if (alt > 0.72 || temp < 0.12) {
       const s = clamp01((Math.max(alt, 1 - temp) - 0.6) / 0.4);
-      return lerp3([0.5, 0.5, 0.52], [0.97, 0.97, 1.0], s);
+      return lerp3(C.rock, C.snow, s);
     }
-    const cold = lerp3([0.55, 0.53, 0.45], [0.22, 0.38, 0.32], moist);  // 冷: 苔原→针叶林
-    const warm = lerp3([0.78, 0.70, 0.42], [0.13, 0.45, 0.15], moist);  // 热: 荒漠→雨林
+    const cold = lerp3(C.coldDry, C.coldWet, moist);  // 冷: 苔原→针叶林
+    const warm = lerp3(C.dry, C.wet, moist);          // 热: 荒漠→雨林
     return lerp3(cold, warm, temp);
   }
 
