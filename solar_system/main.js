@@ -27,6 +27,9 @@ const CONFIG = {
     ] },
     { name: '行星3', mass: 1600, radius: 16, dist: 1850, phase: 3.6, incl: 0.02, color: 0x66d9a6, moons: [] },
   ],
+  // 小行星带(绕恒星, 在行星2与行星3之间) + 行星环(绕某行星)。都是测试粒子。
+  belt: { count: 1600, inner: 1380, outer: 1620, thickness: 28 },
+  ring: { planet: '行星2', count: 1400, inner: 30, outer: 46, thickness: 2.5, tilt: 0.4 },
 };
 
 const params = {
@@ -35,6 +38,7 @@ const params = {
   softening: 2,
   paused: false,
   orbits: true,
+  showBelt: true,
   focus: '恒星',
 };
 
@@ -79,8 +83,9 @@ scene.add(sunLight);
 // ----------------------------------------------------------------------------
 // 系统构建
 // ----------------------------------------------------------------------------
-let system, entries, starBody;
+let system, entries, starBody, particlePoints = null;
 const _off = new THREE.Vector3();      // 浮动原点偏移(聚焦天体位置)
+const _AX = new THREE.Vector3(1, 0, 0);
 
 function buildSystem() {
   system = new NBodySystem({ G: params.G, softening: params.softening });
@@ -106,12 +111,53 @@ function buildSystem() {
   system.zeroMomentum();
 }
 
+// 小行星带(绕恒星) + 行星环(绕某行星), 都是测试粒子。zeroMomentum 之后再加(不参与动量)。
+function buildParticles() {
+  const bc = CONFIG.belt;
+  for (let i = 0; i < bc.count; i++) {
+    const r = bc.inner + Math.random() * (bc.outer - bc.inner);
+    const ph = Math.random() * Math.PI * 2;
+    const pos = new THREE.Vector3(Math.cos(ph) * r, (Math.random() - 0.5) * bc.thickness, Math.sin(ph) * r).add(starBody.pos);
+    const vmag = Math.sqrt(system.G * starBody.mass / r) * (0.98 + Math.random() * 0.04);
+    const vel = new THREE.Vector3(-Math.sin(ph), 0, Math.cos(ph)).multiplyScalar(vmag).add(starBody.vel);
+    system.addParticle(pos, vel);
+  }
+  const rc = CONFIG.ring;
+  const planet = system.bodies.find((b) => b.name === rc.planet);
+  if (planet) {
+    for (let i = 0; i < rc.count; i++) {
+      const r = rc.inner + Math.random() * (rc.outer - rc.inner);
+      const ph = Math.random() * Math.PI * 2;
+      const pos = new THREE.Vector3(Math.cos(ph) * r, (Math.random() - 0.5) * rc.thickness, Math.sin(ph) * r)
+        .applyAxisAngle(_AX, rc.tilt).add(planet.pos);
+      const vmag = Math.sqrt(system.G * planet.mass / r);
+      const vel = new THREE.Vector3(-Math.sin(ph), 0, Math.cos(ph)).applyAxisAngle(_AX, rc.tilt)
+        .multiplyScalar(vmag).add(planet.vel);
+      system.addParticle(pos, vel);
+    }
+  }
+}
+
 function disposeMeshes() {
+  if (particlePoints) {
+    scene.remove(particlePoints); particlePoints.geometry.dispose(); particlePoints.material.dispose();
+    particlePoints = null;
+  }
   if (!entries) return;
   for (const e of entries) {
     scene.remove(e.mesh); e.mesh.geometry.dispose(); e.mesh.material.dispose();
     if (e.line) { scene.remove(e.line); e.line.geometry.dispose(); e.line.material.dispose(); }
   }
+}
+
+function buildParticleMesh() {
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(system.particles.length * 3), 3));
+  particlePoints = new THREE.Points(geo, new THREE.PointsMaterial({
+    color: 0x9aa2b2, size: 3.2, sizeAttenuation: true, transparent: true, opacity: 0.9,
+  }));
+  particlePoints.frustumCulled = false;
+  scene.add(particlePoints);
 }
 
 function buildMeshes() {
@@ -144,7 +190,9 @@ function buildMeshes() {
 function rebuild() {
   disposeMeshes();
   buildSystem();
+  buildParticles();
   buildMeshes();
+  buildParticleMesh();
   refreshFocusOptions();
 }
 
@@ -200,6 +248,20 @@ function updateRender() {
     e.mesh.position.copy(e.body.pos).sub(_off);
     if (e.line) e.line.visible = params.orbits && writeOrbit(e.body, e.line);
   }
+  // 小行星带 / 环粒子(相对浮动原点)
+  if (particlePoints) {
+    if (params.showBelt) {
+      const arr = particlePoints.geometry.attributes.position.array;
+      const P = system.particles;
+      for (let i = 0; i < P.length; i++) {
+        arr[i * 3] = P[i].pos.x - _off.x; arr[i * 3 + 1] = P[i].pos.y - _off.y; arr[i * 3 + 2] = P[i].pos.z - _off.z;
+      }
+      particlePoints.geometry.attributes.position.needsUpdate = true;
+      particlePoints.visible = true;
+    } else {
+      particlePoints.visible = false;
+    }
+  }
   sunLight.position.copy(starBody.pos).sub(_off);
 }
 
@@ -212,6 +274,7 @@ gui.add(params, 'timeScale', 0.0, 8.0).name('时间倍率');
 gui.add(params, 'softening', 0.1, 20).name('软化(防奇点)').onFinishChange(() => { system.softening = params.softening; });
 gui.add(params, 'paused').name('暂停');
 gui.add(params, 'orbits').name('轨道线(完整椭圆)');
+gui.add(params, 'showBelt').name('小行星带/环');
 let focusCtrl = gui.add(params, 'focus', ['恒星']).name('聚焦天体');
 gui.add({ reset: rebuild }, 'reset').name('重置星系');
 gui.add({ recenter: () => { controls.target.set(0, 0, 0); } }, 'recenter').name('相机对准聚焦');

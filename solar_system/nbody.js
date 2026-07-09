@@ -25,13 +25,32 @@ export class Body {
 export class NBodySystem {
   constructor({ G = 1, softening = 1 } = {}) {
     this.bodies = [];
+    this.particles = [];           // 测试粒子(小行星带/环): 只受大质量天体引力, 不参与两两
     this.G = G;
     this.softening = softening;    // 软化长度(避免 r→0 时力爆炸)
     this.time = 0;
   }
 
   add(body) { this.bodies.push(body); return body; }
-  clear() { this.bodies.length = 0; this.time = 0; }
+  clear() { this.bodies.length = 0; this.particles.length = 0; this.time = 0; }
+
+  // 加一个测试粒子(质量忽略, 不影响其它天体)
+  addParticle(pos, vel) {
+    this.particles.push({ pos: pos.clone(), vel: vel.clone(), acc: new THREE.Vector3(), _a0: new THREE.Vector3() });
+  }
+
+  // 某点处来自所有大质量天体的加速度(测试粒子用)
+  accelAt(pos, out) {
+    out.set(0, 0, 0);
+    const b = this.bodies, n = b.length, G = this.G, eps2 = this.softening * this.softening;
+    for (let j = 0; j < n; j++) {
+      const dx = b[j].pos.x - pos.x, dy = b[j].pos.y - pos.y, dz = b[j].pos.z - pos.z;
+      const r2 = dx * dx + dy * dy + dz * dz + eps2;
+      const s = G * b[j].mass / (r2 * Math.sqrt(r2));
+      out.x += s * dx; out.y += s * dy; out.z += s * dz;
+    }
+    return out;
+  }
 
   // 计算所有天体的加速度(两两引力), 写入 body.acc
   computeAccelerations() {
@@ -62,23 +81,40 @@ export class NBodySystem {
   //   v(t+dt) = v + ½·(a + a_new)·dt
   step(dt) {
     const b = this.bodies, n = b.length;
-    if (n === 0) return;
-    this.computeAccelerations();                 // a(t)
-    const half = 0.5 * dt * dt;
-    for (let i = 0; i < n; i++) {
+    const parts = this.particles, np = parts.length;
+    if (n === 0 && np === 0) return;
+    const half = 0.5 * dt * dt, hdt = 0.5 * dt;
+
+    this.computeAccelerations();                 // 大质量 a(t)
+    for (let k = 0; k < np; k++) this.accelAt(parts[k].pos, parts[k]._a0);   // 粒子 a0(用 t 时massive位置)
+
+    for (let i = 0; i < n; i++) {                // drift massive
       const p = b[i];
       p.pos.x += p.vel.x * dt + p.acc.x * half;
       p.pos.y += p.vel.y * dt + p.acc.y * half;
       p.pos.z += p.vel.z * dt + p.acc.z * half;
       p._accOld.copy(p.acc);
     }
-    this.computeAccelerations();                 // a(t+dt)
-    const hdt = 0.5 * dt;
-    for (let i = 0; i < n; i++) {
+    for (let k = 0; k < np; k++) {               // drift particles
+      const p = parts[k];
+      p.pos.x += p.vel.x * dt + p._a0.x * half;
+      p.pos.y += p.vel.y * dt + p._a0.y * half;
+      p.pos.z += p.vel.z * dt + p._a0.z * half;
+    }
+
+    this.computeAccelerations();                 // 大质量 a(t+dt)
+    for (let i = 0; i < n; i++) {                // kick massive
       const p = b[i];
       p.vel.x += (p._accOld.x + p.acc.x) * hdt;
       p.vel.y += (p._accOld.y + p.acc.y) * hdt;
       p.vel.z += (p._accOld.z + p.acc.z) * hdt;
+    }
+    for (let k = 0; k < np; k++) {               // kick particles(用 t+dt 时massive位置)
+      const p = parts[k];
+      this.accelAt(p.pos, p.acc);
+      p.vel.x += (p._a0.x + p.acc.x) * hdt;
+      p.vel.y += (p._a0.y + p.acc.y) * hdt;
+      p.vel.z += (p._a0.z + p.acc.z) * hdt;
     }
     this.time += dt;
   }
