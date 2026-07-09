@@ -8,7 +8,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
 import GUI from 'lil-gui';
 import { Planet } from './planet.js';
-import { createOcean, createAtmospherePass } from './effects.js';
+import { createOcean, createAtmospherePass, createCloudPass } from './effects.js';
 import { PlanetWalker } from './character.js';
 
 // ----------------------------------------------------------------------------
@@ -49,6 +49,19 @@ const params = {
   atmoACES: true,           // true=ACES filmic tonemap, false=Reinhard
   atmoOzone: 0.02,          // 臭氧吸收强度(0=关, 日落品红/天空更纯净蓝)
   atmoDither: 0.5,          // raymarch 抖动强度(去同心圆 banding; 太高会变颗粒噪点)
+
+  // 体积云(全屏 raymarch pass)
+  showClouds: true,
+  cloudBottom: 1.01,        // 云底 = radius * 此值
+  cloudTop: 1.06,           // 云顶 = radius * 此值
+  cloudCoverage: 0.5,       // 覆盖率
+  cloudDensity: 1.2,        // 密度(消光)
+  cloudFreq: 0.06,          // 噪声频率(越大越碎)
+  cloudWarp: 0.5,           // 域扭曲(飘逸)
+  cloudWindSpeed: 0.6,      // 飘动速度
+  cloudSteps: 24,           // 视线步数
+  cloudLightSteps: 6,       // 太阳方向步数
+  cloudAbsorb: 1.0,         // 自阴影强度
 
   // 太阳(方向 = 平行光方向, 同时驱动地形光照/海面高光/大气)
   sunElevation: 35,         // 仰角(度)
@@ -266,14 +279,33 @@ function makeSceneRT(w, h) {
   rt.depthTexture.type = THREE.UnsignedIntType;
   return rt;
 }
+// 云 pass 的中转 RT(HalfFloat 线性, 无深度): 场景→rtScene→云→rtCloud→大气→屏幕
+function makeColorRT(w, h) {
+  const rt = new THREE.WebGLRenderTarget(Math.max(1, w), Math.max(1, h), {
+    minFilter: THREE.LinearFilter,
+    magFilter: THREE.LinearFilter,
+    depthBuffer: false,
+    type: THREE.HalfFloatType,
+  });
+  rt.texture.colorSpace = THREE.LinearSRGBColorSpace;
+  return rt;
+}
+
+const cloudPass = createCloudPass();
 const _pr = renderer.getPixelRatio();
 const rtMain = makeSceneRT(innerWidth * _pr, innerHeight * _pr);
 const rtInset = makeSceneRT(1, 1);   // 尺寸随小窗动态调整
+const rtCloudMain = makeColorRT(innerWidth * _pr, innerHeight * _pr);
+const rtCloudInset = makeColorRT(1, 1);
 const _pv = new THREE.Matrix4();
+const _invVP = new THREE.Matrix4();
+const _camPos = new THREE.Vector3();
 
 function resizeSceneRTs() {
   const pr = renderer.getPixelRatio();
-  rtMain.setSize(Math.floor(innerWidth * pr), Math.floor(innerHeight * pr));
+  const w = Math.floor(innerWidth * pr), h = Math.floor(innerHeight * pr);
+  rtMain.setSize(w, h);
+  rtCloudMain.setSize(w, h);
 }
 resizeSceneRTs();
 
@@ -307,6 +339,19 @@ function layoutEffects() {
   u.uTonemap.value = params.atmoACES ? 1 : 0;
   u.uOzone.value.copy(OZONE_RATIO).multiplyScalar(params.atmoOzone);
   u.uDither.value = params.atmoDither;
+
+  // 云层 uniforms
+  const c = cloudPass.uniforms;
+  c.uBottom.value = params.radius * params.cloudBottom;
+  c.uTop.value = params.radius * params.cloudTop;
+  c.uCoverage.value = params.cloudCoverage;
+  c.uDensity.value = params.cloudDensity;
+  c.uFreq.value = params.cloudFreq / params.radius * 100.0;   // 频率随半径归一(基准 radius=100)
+  c.uWarp.value = params.cloudWarp;
+  c.uWindSpeed.value = params.cloudWindSpeed;
+  c.uSteps.value = params.cloudSteps;
+  c.uLightSteps.value = params.cloudLightSteps;
+  c.uAbsorb.value = params.cloudAbsorb;
 }
 layoutEffects();
 
@@ -322,6 +367,7 @@ function updateSun() {
   sun.position.copy(dir);
   ocean.material.uniforms.uSunDir.value.copy(dir);
   atmoPass.uniforms.uSunDir.value.copy(dir);
+  cloudPass.uniforms.uSunDir.value.copy(dir);
 }
 updateSun();
 
@@ -395,6 +441,19 @@ fAtmo.add(params, 'atmoTwilight', 0.0, 1.0).name('暮光弧(上翘)').onChange(l
 fAtmo.add(params, 'atmoACES').name('ACES 电影色调').onChange(layoutEffects);
 fAtmo.add(params, 'atmoOzone', 0.0, 0.1).name('臭氧(日落品红)').onChange(layoutEffects);
 fAtmo.add(params, 'atmoDither', 0.0, 1.0).name('抖动去带').onChange(layoutEffects);
+
+const fCloud = gui.addFolder('体积云');
+fCloud.add(params, 'showClouds').name('云层开关');
+fCloud.add(params, 'cloudCoverage', 0.0, 1.0).name('覆盖率').onChange(layoutEffects);
+fCloud.add(params, 'cloudDensity', 0.1, 4.0).name('密度').onChange(layoutEffects);
+fCloud.add(params, 'cloudFreq', 0.01, 0.2).name('噪声频率').onChange(layoutEffects);
+fCloud.add(params, 'cloudWarp', 0.0, 1.5).name('域扭曲(飘逸)').onChange(layoutEffects);
+fCloud.add(params, 'cloudWindSpeed', 0.0, 3.0).name('飘动速度').onChange(layoutEffects);
+fCloud.add(params, 'cloudBottom', 1.0, 1.1).name('云底比例').onChange(layoutEffects);
+fCloud.add(params, 'cloudTop', 1.02, 1.2).name('云顶比例').onChange(layoutEffects);
+fCloud.add(params, 'cloudAbsorb', 0.2, 3.0).name('自阴影强度').onChange(layoutEffects);
+fCloud.add(params, 'cloudSteps', 8, 48, 1).name('视线步数').onChange(layoutEffects);
+fCloud.add(params, 'cloudLightSteps', 2, 12, 1).name('光照步数').onChange(layoutEffects);
 
 const fLod = gui.addFolder('LOD');
 fLod.add(params, 'maxLevel', 0, 12, 1).name('最大层数');
@@ -595,8 +654,8 @@ function updateSpectator(dt) {
   }
 }
 
-// 渲染一个视口: 场景 → RT(带深度), 再用大气 pass 合成到屏幕对应视口。
-function renderView(cam, rt, vpX, vpY, vpW, vpH, scissor) {
+// 渲染一个视口: 场景 → RT(带深度) →(可选)体积云 → 大气 pass → 屏幕对应视口。
+function renderView(cam, rt, rtCloud, vpX, vpY, vpW, vpH, scissor) {
   // 1) 场景(行星 + 海洋)渲染到 RT。绑定 RT 后 three 会自动用整张 RT 作为视口。
   renderer.setScissorTest(false);
   renderer.setRenderTarget(rt);
@@ -604,13 +663,31 @@ function renderView(cam, rt, vpX, vpY, vpW, vpH, scissor) {
   renderer.render(scene, cam);   // 这一步会刷新 cam.matrixWorldInverse
   renderer.setRenderTarget(null);
 
-  // 2) 大气 pass 合成到屏幕
-  const u = atmoPass.uniforms;
-  u.tDiffuse.value = rt.texture;
-  u.tDepth.value = rt.depthTexture;
+  // 相机矩阵(云/大气 pass 共用)
   _pv.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
-  u.uInvViewProj.value.copy(_pv).invert();
-  cam.getWorldPosition(u.uCamPos.value);
+  _invVP.copy(_pv).invert();
+  cam.getWorldPosition(_camPos);
+
+  // 2) 体积云 pass: 场景 → rtCloud(线性 HDR)。关时直接用场景 RT。
+  let srcTex = rt.texture;
+  if (params.showClouds) {
+    const cu = cloudPass.uniforms;
+    cu.tDiffuse.value = rt.texture;
+    cu.tDepth.value = rt.depthTexture;
+    cu.uInvViewProj.value.copy(_invVP);
+    cu.uCamPos.value.copy(_camPos);
+    renderer.setRenderTarget(rtCloud);
+    cloudPass.render(renderer);
+    renderer.setRenderTarget(null);
+    srcTex = rtCloud.texture;
+  }
+
+  // 3) 大气 pass 合成到屏幕
+  const u = atmoPass.uniforms;
+  u.tDiffuse.value = srcTex;
+  u.tDepth.value = rt.depthTexture;
+  u.uInvViewProj.value.copy(_invVP);
+  u.uCamPos.value.copy(_camPos);
   u.uEnabled.value = params.showAtmosphere ? 1.0 : 0.0;
 
   renderer.setViewport(vpX, vpY, vpW, vpH);
@@ -645,15 +722,15 @@ function renderViews() {
   const w = innerWidth, h = innerHeight;
 
   // 主画面(全屏)
-  renderView(mainCam(), rtMain, 0, 0, w, h, false);
+  renderView(mainCam(), rtMain, rtCloudMain, 0, 0, w, h, false);
 
   // 小窗(左上角): 独立视口 + 独立 RT(尺寸随小窗)
   if (params.showInset) {
     const iw = Math.max(1, Math.floor(insetW * pr));
     const ih = Math.max(1, Math.floor(insetH * pr));
-    if (rtInset.width !== iw || rtInset.height !== ih) rtInset.setSize(iw, ih);
+    if (rtInset.width !== iw || rtInset.height !== ih) { rtInset.setSize(iw, ih); rtCloudInset.setSize(iw, ih); }
     const x = INSET_MARGIN, y = h - insetH - INSET_MARGIN;
-    renderView(insetCam(), rtInset, x, y, insetW, insetH, true);
+    renderView(insetCam(), rtInset, rtCloudInset, x, y, insetW, insetH, true);
   }
 }
 
@@ -673,6 +750,7 @@ function animate() {
   else if (main === spectatorCamera) updateSpectator(dt);
   if (characterMode) walker.update(dt);           // 角色始终更新(输入由 active 门控)
 
+  cloudPass.uniforms.uTime.value = clock.elapsedTime;   // 云飘动
   updateClips();                                  // 动态近/远面, 消除 z-fighting
   planet.update(lodCam());                        // LOD 由主体相机(轨道/角色)驱动
   renderViews();

@@ -302,3 +302,208 @@ export function createAtmospherePass() {
     render(renderer) { renderer.render(quadScene, quadCam); },
   };
 }
+
+// 体积云(全屏 raymarch pass) —— 插在 场景 → 云 → 大气 之间。
+//
+// 在行星上方一层球壳 [R_bottom, R_top] 内步进采样 3D 噪声密度: 每个采样点再向太阳做
+// 一小段 light march 算自阴影(Beer 定律), front-to-back 累积颜色与透射率; 被场景深度
+// 裁剪(云在地形之后的部分不画)。输出线性 HDR(sceneColor*T + 云光), 由后续大气 pass 统一
+// tonemap。对主/旁观/角色三相机通用(每视口传各自矩阵)。
+export function createCloudPass() {
+  const uniforms = {
+    tDiffuse: { value: null },
+    tDepth: { value: null },
+    uInvViewProj: { value: new THREE.Matrix4() },
+    uCamPos: { value: new THREE.Vector3() },
+    uTime: { value: 0 },
+
+    uSunDir: { value: new THREE.Vector3(1, 0.6, 0.8).normalize() },
+    uPlanetCenter: { value: new THREE.Vector3(0, 0, 0) },
+    uBottom: { value: 101.0 },        // 云层底半径
+    uTop: { value: 106.0 },           // 云层顶半径
+    uCoverage: { value: 0.5 },        // 覆盖率(越大云越多)
+    uDensity: { value: 1.2 },         // 云密度(消光强度)
+    uFreq: { value: 0.06 },           // 噪声频率(越大云越碎)
+    uWarp: { value: 0.5 },            // 域扭曲强度(飘逸感)
+    uWind: { value: new THREE.Vector3(1, 0, 0.3) }, // 风向
+    uWindSpeed: { value: 0.6 },       // 飘动速度
+    uSteps: { value: 24 },            // 视线步数
+    uLightSteps: { value: 6 },        // 太阳方向步数
+    uAbsorb: { value: 1.0 },          // 光照吸收(自阴影强度)
+    uSunColor: { value: new THREE.Vector3(1.7, 1.6, 1.5) }, // 云受阳光颜色(HDR)
+    uAmbient: { value: new THREE.Vector3(0.28, 0.34, 0.45) }, // 天空环境光
+  };
+
+  const material = new THREE.ShaderMaterial({
+    uniforms,
+    depthTest: false,
+    depthWrite: false,
+    vertexShader: /* glsl */`
+      varying vec2 vUv;
+      void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }
+    `,
+    fragmentShader: /* glsl */`
+      precision highp float;
+      varying vec2 vUv;
+
+      uniform sampler2D tDiffuse;
+      uniform sampler2D tDepth;
+      uniform mat4  uInvViewProj;
+      uniform vec3  uCamPos;
+      uniform float uTime;
+      uniform vec3  uSunDir;
+      uniform vec3  uPlanetCenter;
+      uniform float uBottom;
+      uniform float uTop;
+      uniform float uCoverage;
+      uniform float uDensity;
+      uniform float uFreq;
+      uniform float uWarp;
+      uniform vec3  uWind;
+      uniform float uWindSpeed;
+      uniform int   uSteps;
+      uniform int   uLightSteps;
+      uniform float uAbsorb;
+      uniform vec3  uSunColor;
+      uniform vec3  uAmbient;
+
+      vec2 raySphere(vec3 ro, vec3 rd, vec3 ce, float r) {
+        vec3 oc = ro - ce;
+        float b = dot(oc, rd);
+        float c = dot(oc, oc) - r * r;
+        float d = b * b - c;
+        if (d < 0.0) return vec2(1e20, -1e20);
+        float s = sqrt(d);
+        return vec2(-b - s, -b + s);
+      }
+
+      // 3D value noise + fbm
+      float hash(vec3 p) {
+        p = fract(p * 0.3183099 + 0.1);
+        p *= 17.0;
+        return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+      }
+      float vnoise(vec3 x) {
+        vec3 i = floor(x); vec3 f = fract(x);
+        f = f * f * (3.0 - 2.0 * f);
+        return mix(mix(mix(hash(i + vec3(0,0,0)), hash(i + vec3(1,0,0)), f.x),
+                       mix(hash(i + vec3(0,1,0)), hash(i + vec3(1,1,0)), f.x), f.y),
+                   mix(mix(hash(i + vec3(0,0,1)), hash(i + vec3(1,0,1)), f.x),
+                       mix(hash(i + vec3(0,1,1)), hash(i + vec3(1,1,1)), f.x), f.y), f.z);
+      }
+      float fbm(vec3 p, int oct) {
+        float s = 0.0, a = 0.5;
+        for (int i = 0; i < 5; i++) { if (i >= oct) break; s += a * vnoise(p); p *= 2.02; a *= 0.5; }
+        return s;
+      }
+
+      // 云密度: 高度梯度(上下边缘渐隐) × 覆盖阈值化的 fbm。
+      // hi=true 为视线采样(带域扭曲 + 4 octave, 高细节); false 为光照采样(便宜: 无扭曲 + 3 octave)。
+      float cloudDensity(vec3 pos, bool hi) {
+        float r = length(pos - uPlanetCenter);
+        float h = (r - uBottom) / max(uTop - uBottom, 1e-4);   // 0..1
+        if (h < 0.0 || h > 1.0) return 0.0;
+        // 高度权重: 中间浓、上下柔和渐隐(范围放宽, 过渡更软)
+        float heightGrad = smoothstep(0.0, 0.3, h) * (1.0 - smoothstep(0.45, 1.0, h));
+
+        vec3 sp = pos * uFreq + uWind * (uTime * uWindSpeed);
+        float base;
+        if (hi) {
+          vec3 w = vec3(fbm(sp * 0.5 + 11.5, 2), fbm(sp * 0.5 + 47.2, 2), fbm(sp * 0.5 + 83.1, 2)) - 0.5;
+          base = fbm(sp + uWarp * w, 4);
+        } else {
+          base = fbm(sp, 3);
+        }
+        // 关键: 先把噪声乘上高度权重再阈值化 → 云顶/云底被噪声啃成参差形状, 不再是平切的球面
+        float thr = 1.0 - uCoverage;
+        return smoothstep(thr, thr + 0.18, base * heightGrad);
+      }
+
+      // 向太阳的自阴影(Beer): 沿 sunDir 累积密度(用便宜密度)
+      float lightMarch(vec3 pos) {
+        float st = (uTop - uBottom) / float(uLightSteps);
+        float sum = 0.0;
+        vec3 q = pos;
+        for (int i = 0; i < 12; i++) {
+          if (i >= uLightSteps) break;
+          q += uSunDir * st;
+          sum += cloudDensity(q, false) * st;
+        }
+        return exp(-sum * uDensity * uAbsorb);
+      }
+
+      // 昼夜: 采样点当地地平上太阳仰角(软过渡)
+      float dayFactor(vec3 pos) {
+        vec3 up = normalize(pos - uPlanetCenter);
+        return smoothstep(-0.12, 0.12, dot(up, uSunDir));
+      }
+
+      void main() {
+        vec3 sceneColor = texture2D(tDiffuse, vUv).rgb;
+
+        vec2 ndc = vUv * 2.0 - 1.0;
+        vec4 farP = uInvViewProj * vec4(ndc, 1.0, 1.0);
+        vec3 rd = normalize(farP.xyz / farP.w - uCamPos);
+        vec3 ro = uCamPos;
+
+        float depth = texture2D(tDepth, vUv).x;
+        float sceneDist = 1e20;
+        if (depth < 1.0) {
+          vec4 hp = uInvViewProj * vec4(ndc, depth * 2.0 - 1.0, 1.0);
+          sceneDist = distance(hp.xyz / hp.w, uCamPos);
+        }
+
+        // 视线与云壳区间 = 外壳内部 - 内壳内部
+        vec2 outer = raySphere(ro, rd, uPlanetCenter, uTop);
+        vec2 inner = raySphere(ro, rd, uPlanetCenter, uBottom);
+        // 命中区间(取外壳内、内壳外的两段中靠前那段)
+        float t0 = max(outer.x, 0.0);
+        float t1 = outer.y;
+        if (t1 <= t0) { gl_FragColor = vec4(sceneColor, 1.0); return; }
+        // 若内壳被命中, 视线穿过空心区: 只积到内壳近交点(近段云)
+        if (inner.x > t0 && inner.x < t1) t1 = inner.x;
+        // 相机在内壳里(地表附近)向上看: 从内壳远交点开始
+        if (inner.x < 0.0 && inner.y > 0.0) t0 = max(t0, inner.y);
+        t1 = min(t1, sceneDist);
+        if (t1 <= t0) { gl_FragColor = vec4(sceneColor, 1.0); return; }
+
+        int N = uSteps;
+        float step = (t1 - t0) / float(N);
+        // 起点抖动去 banding
+        float jitter = hash(vec3(gl_FragCoord.xy, uTime));
+        vec3 p = ro + rd * (t0 + step * jitter);
+
+        float T = 1.0;
+        vec3 L = vec3(0.0);
+        for (int i = 0; i < 96; i++) {
+          if (i >= N || T < 0.02) break;
+          float dens = cloudDensity(p, true) * step * uDensity;
+          if (dens > 0.001) {
+            float sun = lightMarch(p);
+            float day = dayFactor(p);
+            vec3 lit = uSunColor * (sun * day) + uAmbient;
+            float a = 1.0 - exp(-dens);
+            L += T * a * lit;
+            T *= exp(-dens);
+          }
+          p += rd * step;
+        }
+
+        vec3 color = sceneColor * T + L;   // front-to-back 合成; 线性 HDR
+        gl_FragColor = vec4(color, 1.0);
+      }
+    `,
+  });
+
+  const quadScene = new THREE.Scene();
+  const quadCam = new THREE.Camera();
+  const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), material);
+  quad.frustumCulled = false;
+  quadScene.add(quad);
+
+  return {
+    uniforms,
+    material,
+    render(renderer) { renderer.render(quadScene, quadCam); },
+  };
+}
