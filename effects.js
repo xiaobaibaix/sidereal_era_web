@@ -544,10 +544,12 @@ export function createCloudPass() {
           float dens = dloc * step * uDensity;
           if (dens > 0.001) {
             float sun = lightMarch(p);                       // 向太阳透射率(Beer)
-            float day = dayFactor(p);
+            float sunUp = dot(normalize(p - uPlanetCenter), uSunDir);
+            float day = smoothstep(-0.12, 0.12, sunUp);      // 直射昼夜(窄)
+            float amb = smoothstep(-0.4, 0.15, sunUp);       // 环境光昼夜(宽, 含暮光) → 夜面云变暗
             // powder(糖粉暗边): 朝光的薄处偏暗, 增强体积感
             float powder = mix(1.0, 1.0 - exp(-dloc * uDensity * 2.0), uPowder);
-            vec3 lit = uSunColor * (sun * day * phase * powder) + uAmbient;
+            vec3 lit = uSunColor * (sun * day * phase * powder) + uAmbient * amb;
             float a = 1.0 - exp(-dens);
             L += T * a * lit;
             T *= exp(-dens);
