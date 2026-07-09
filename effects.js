@@ -559,3 +559,75 @@ export function createCloudPass() {
     render(renderer) { renderer.render(quadScene, quadCam); },
   };
 }
+
+// God rays(体积光/曙暮光)—— 屏幕空间径向光束。
+//
+// 在大气 pass 之后运行: 以太阳的屏幕位置为中心, 沿"每像素→太阳"方向对已合成图像做径向
+// 采样, 只取较亮的部分(天空/太阳)作为光源, 逐步衰减累加 → 云/山缝隙间透出的光束。
+// 太阳在屏幕后方/侧向时按视线夹角淡出。输入/输出都是 tonemap 后的显示色(sRGB, 直通)。
+export function createGodrayPass() {
+  const uniforms = {
+    tLit: { value: null },
+    uSunUV: { value: new THREE.Vector2(0.5, 0.5) },
+    uSunVis: { value: 0.0 },        // 太阳可见度(视线夹角 → 0..1)
+    uStrength: { value: 0.6 },      // 光束强度
+    uDensity: { value: 0.7 },       // 光束扩散(采样跨度)
+    uDecay: { value: 0.96 },        // 沿程衰减
+    uWeight: { value: 0.6 },        // 每样本权重
+    uSamples: { value: 48 },        // 采样数
+    uThreshold: { value: 0.45 },    // 亮度阈值(只有更亮处才发出光束)
+  };
+  const material = new THREE.ShaderMaterial({
+    uniforms,
+    depthTest: false,
+    depthWrite: false,
+    vertexShader: /* glsl */`
+      varying vec2 vUv;
+      void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }
+    `,
+    fragmentShader: /* glsl */`
+      precision highp float;
+      varying vec2 vUv;
+      uniform sampler2D tLit;
+      uniform vec2  uSunUV;
+      uniform float uSunVis;
+      uniform float uStrength;
+      uniform float uDensity;
+      uniform float uDecay;
+      uniform float uWeight;
+      uniform int   uSamples;
+      uniform float uThreshold;
+
+      void main() {
+        vec3 base = texture2D(tLit, vUv).rgb;
+        if (uSunVis <= 0.001) { gl_FragColor = vec4(base, 1.0); return; }
+
+        vec2 delta = (vUv - uSunUV) * (uDensity / float(uSamples));
+        vec2 coord = vUv;
+        float illum = 1.0;
+        vec3 accum = vec3(0.0);
+        for (int i = 0; i < 128; i++) {
+          if (i >= uSamples) break;
+          coord -= delta;
+          vec3 s = texture2D(tLit, coord).rgb;
+          float lum = dot(s, vec3(0.299, 0.587, 0.114));
+          s *= smoothstep(uThreshold, uThreshold + 0.35, lum);   // 只取较亮处作光源
+          accum += s * illum * uWeight;
+          illum *= uDecay;
+        }
+        accum /= float(uSamples);
+        gl_FragColor = vec4(base + accum * uStrength * uSunVis, 1.0);
+      }
+    `,
+  });
+  const quadScene = new THREE.Scene();
+  const quadCam = new THREE.Camera();
+  const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), material);
+  quad.frustumCulled = false;
+  quadScene.add(quad);
+  return {
+    uniforms,
+    material,
+    render(renderer) { renderer.render(quadScene, quadCam); },
+  };
+}

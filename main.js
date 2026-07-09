@@ -8,7 +8,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
 import GUI from 'lil-gui';
 import { Planet } from './planet.js';
-import { createOcean, createAtmospherePass, createCloudPass } from './effects.js';
+import { createOcean, createAtmospherePass, createCloudPass, createGodrayPass } from './effects.js';
 import { PlanetWalker } from './character.js';
 
 // ----------------------------------------------------------------------------
@@ -65,6 +65,13 @@ const params = {
   cloudSilver: 1.0,         // 银边(前向散射)强度
   cloudPowder: 0.6,         // powder 暗边强度
   cloudShadow: 0.7,         // 云影投到地表强度(0=关)
+
+  // 体积光 God rays(屏幕空间光束)
+  showGodrays: true,
+  godrayStrength: 0.6,      // 光束强度
+  godrayDensity: 0.7,       // 扩散
+  godraySamples: 48,        // 采样数
+  godrayThreshold: 0.45,    // 亮度阈值
 
   // 太阳(方向 = 平行光方向, 同时驱动地形光照/海面高光/大气)
   sunElevation: 35,         // 仰角(度)
@@ -295,11 +302,15 @@ function makeColorRT(w, h) {
 }
 
 const cloudPass = createCloudPass();
+const godrayPass = createGodrayPass();
 const _pr = renderer.getPixelRatio();
 const rtMain = makeSceneRT(innerWidth * _pr, innerHeight * _pr);
 const rtInset = makeSceneRT(1, 1);   // 尺寸随小窗动态调整
 const rtCloudMain = makeColorRT(innerWidth * _pr, innerHeight * _pr);
 const rtCloudInset = makeColorRT(1, 1);
+const rtLitMain = makeColorRT(innerWidth * _pr, innerHeight * _pr);   // 大气输出(供 God rays)
+const rtLitInset = makeColorRT(1, 1);
+const _sunProj = new THREE.Vector3(), _camFwd = new THREE.Vector3();
 const _pv = new THREE.Matrix4();
 const _invVP = new THREE.Matrix4();
 const _camPos = new THREE.Vector3();
@@ -309,6 +320,7 @@ function resizeSceneRTs() {
   const w = Math.floor(innerWidth * pr), h = Math.floor(innerHeight * pr);
   rtMain.setSize(w, h);
   rtCloudMain.setSize(w, h);
+  rtLitMain.setSize(w, h);
 }
 resizeSceneRTs();
 
@@ -358,6 +370,13 @@ function layoutEffects() {
   c.uSilver.value = params.cloudSilver;
   c.uPowder.value = params.cloudPowder;
   c.uCloudShadow.value = params.cloudShadow;
+
+  // God rays uniforms
+  const g = godrayPass.uniforms;
+  g.uStrength.value = params.godrayStrength;
+  g.uDensity.value = params.godrayDensity;
+  g.uSamples.value = params.godraySamples;
+  g.uThreshold.value = params.godrayThreshold;
 }
 layoutEffects();
 
@@ -463,6 +482,13 @@ fCloud.add(params, 'cloudLightSteps', 2, 12, 1).name('光照步数').onChange(la
 fCloud.add(params, 'cloudSilver', 0.0, 3.0).name('银边(前向散射)').onChange(layoutEffects);
 fCloud.add(params, 'cloudPowder', 0.0, 1.0).name('powder 暗边').onChange(layoutEffects);
 fCloud.add(params, 'cloudShadow', 0.0, 1.0).name('云影投地表').onChange(layoutEffects);
+
+const fGod = gui.addFolder('体积光 God rays');
+fGod.add(params, 'showGodrays').name('开关');
+fGod.add(params, 'godrayStrength', 0.0, 2.0).name('强度').onChange(layoutEffects);
+fGod.add(params, 'godrayDensity', 0.2, 1.2).name('扩散').onChange(layoutEffects);
+fGod.add(params, 'godrayThreshold', 0.0, 1.0).name('亮度阈值').onChange(layoutEffects);
+fGod.add(params, 'godraySamples', 16, 96, 1).name('采样数').onChange(layoutEffects);
 
 const fLod = gui.addFolder('LOD');
 fLod.add(params, 'maxLevel', 0, 12, 1).name('最大层数');
@@ -663,8 +689,8 @@ function updateSpectator(dt) {
   }
 }
 
-// 渲染一个视口: 场景 → RT(带深度) →(可选)体积云 → 大气 pass → 屏幕对应视口。
-function renderView(cam, rt, rtCloud, vpX, vpY, vpW, vpH, scissor) {
+// 渲染一个视口: 场景 → RT(带深度) →(可选)体积云 →(可选)大气→rtLit→God rays → 屏幕。
+function renderView(cam, rt, rtCloud, rtLit, vpX, vpY, vpW, vpH, scissor) {
   // 1) 场景(行星 + 海洋)渲染到 RT。绑定 RT 后 three 会自动用整张 RT 作为视口。
   renderer.setScissorTest(false);
   renderer.setRenderTarget(rt);
@@ -691,7 +717,7 @@ function renderView(cam, rt, rtCloud, vpX, vpY, vpW, vpH, scissor) {
     srcTex = rtCloud.texture;
   }
 
-  // 3) 大气 pass 合成到屏幕
+  // 3) 大气 pass。开 God rays 时先渲染到 rtLit(整张), 否则直接到屏幕视口。
   const u = atmoPass.uniforms;
   u.tDiffuse.value = srcTex;
   u.tDepth.value = rt.depthTexture;
@@ -699,13 +725,30 @@ function renderView(cam, rt, rtCloud, vpX, vpY, vpW, vpH, scissor) {
   u.uCamPos.value.copy(_camPos);
   u.uEnabled.value = params.showAtmosphere ? 1.0 : 0.0;
 
-  renderer.setViewport(vpX, vpY, vpW, vpH);
-  if (scissor) {
-    renderer.setScissorTest(true);
-    renderer.setScissor(vpX, vpY, vpW, vpH);
+  if (params.showGodrays) {
+    renderer.setRenderTarget(rtLit);
+    atmoPass.render(renderer);
+    renderer.setRenderTarget(null);
+
+    // 4) God rays 到屏幕视口
+    const g = godrayPass.uniforms;
+    g.tLit.value = rtLit.texture;
+    // 太阳屏幕位置 + 可见度(视线朝太阳夹角)
+    _sunProj.copy(sun.position).multiplyScalar(1e7).project(cam);
+    g.uSunUV.value.set(_sunProj.x * 0.5 + 0.5, _sunProj.y * 0.5 + 0.5);
+    cam.getWorldDirection(_camFwd);
+    g.uSunVis.value = THREE.MathUtils.smoothstep(_camFwd.dot(sun.position), 0.0, 0.35);
+
+    renderer.setViewport(vpX, vpY, vpW, vpH);
+    if (scissor) { renderer.setScissorTest(true); renderer.setScissor(vpX, vpY, vpW, vpH); }
+    godrayPass.render(renderer);
+    renderer.setScissorTest(false);
+  } else {
+    renderer.setViewport(vpX, vpY, vpW, vpH);
+    if (scissor) { renderer.setScissorTest(true); renderer.setScissor(vpX, vpY, vpW, vpH); }
+    atmoPass.render(renderer);
+    renderer.setScissorTest(false);
   }
-  atmoPass.render(renderer);
-  renderer.setScissorTest(false);
 }
 
 // 动态近/远裁剪面: 相机离行星越远, 近平面抬得越高 → far/near 比变小, 深度精度大幅提升,
@@ -731,15 +774,17 @@ function renderViews() {
   const w = innerWidth, h = innerHeight;
 
   // 主画面(全屏)
-  renderView(mainCam(), rtMain, rtCloudMain, 0, 0, w, h, false);
+  renderView(mainCam(), rtMain, rtCloudMain, rtLitMain, 0, 0, w, h, false);
 
   // 小窗(左上角): 独立视口 + 独立 RT(尺寸随小窗)
   if (params.showInset) {
     const iw = Math.max(1, Math.floor(insetW * pr));
     const ih = Math.max(1, Math.floor(insetH * pr));
-    if (rtInset.width !== iw || rtInset.height !== ih) { rtInset.setSize(iw, ih); rtCloudInset.setSize(iw, ih); }
+    if (rtInset.width !== iw || rtInset.height !== ih) {
+      rtInset.setSize(iw, ih); rtCloudInset.setSize(iw, ih); rtLitInset.setSize(iw, ih);
+    }
     const x = INSET_MARGIN, y = h - insetH - INSET_MARGIN;
-    renderView(insetCam(), rtInset, rtCloudInset, x, y, insetW, insetH, true);
+    renderView(insetCam(), rtInset, rtCloudInset, rtLitInset, x, y, insetW, insetH, true);
   }
 }
 
