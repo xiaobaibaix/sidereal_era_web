@@ -9,7 +9,7 @@
   "invertY": true,
   "showOcean": true,
   "showAtmosphere": true,
-  "atmoScale": 1.20,
+  "atmoScale": 1.08,
   "atmoRayleigh": 0.08,
   "atmoMie": 0.03,
   "atmoMieG": 0.76,

@@ -34,7 +34,7 @@ const params = {
 
   // 大气(瑞利 + 米氏单次散射)
   showAtmosphere: true,
-  atmoScale: 1.20,          // 大气顶半径 = radius * atmoScale
+  atmoScale: 1.08,          // 大气顶半径 = radius * atmoScale(≈厚度8%, 接近地球薄大气)
   atmoRayleigh: 0.08,       // 瑞利散射强度
   atmoMie: 0.03,            // 米氏散射强度
   atmoMieG: 0.76,           // 米氏前向峰(0.5~0.95)
