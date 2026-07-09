@@ -8,7 +8,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
 import GUI from 'lil-gui';
 import { Planet } from './planet.js';
-import { createOcean, createAtmospherePass, createCloudPass, createGodrayPass } from './effects.js';
+import { createOcean, createAtmospherePass, createCloudPass, createGodrayPass, createTransmittanceLUT } from './effects.js';
 import { PlanetWalker } from './character.js';
 
 // ----------------------------------------------------------------------------
@@ -49,6 +49,7 @@ const params = {
   atmoACES: true,           // true=ACES filmic tonemap, false=Reinhard
   atmoOzone: 0.02,          // 臭氧吸收强度(0=关, 日落品红/天空更纯净蓝)
   atmoDither: 0.5,          // raymarch 抖动强度(去同心圆 banding; 太高会变颗粒噪点)
+  atmoLUT: true,            // 透射率 LUT 加速(省太阳方向内循环; 关=实时 raymarch)
 
   // 体积云(全屏 raymarch pass)
   showClouds: true,
@@ -303,6 +304,14 @@ function makeColorRT(w, h) {
 
 const cloudPass = createCloudPass();
 const godrayPass = createGodrayPass();
+const transLUT = createTransmittanceLUT();
+// 透射率 LUT 目标(x=太阳天顶余弦, y=高度), 大气参数变化时重烘
+const lutRT = new THREE.WebGLRenderTarget(256, 64, {
+  type: THREE.HalfFloatType, depthBuffer: false,
+  minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+});
+lutRT.texture.colorSpace = THREE.LinearSRGBColorSpace;
+atmoPass.uniforms.uTransLUT.value = lutRT.texture;
 const _pr = renderer.getPixelRatio();
 const rtMain = makeSceneRT(innerWidth * _pr, innerHeight * _pr);
 const rtInset = makeSceneRT(1, 1);   // 尺寸随小窗动态调整
@@ -354,6 +363,15 @@ function layoutEffects() {
   u.uTonemap.value = params.atmoACES ? 1 : 0;
   u.uOzone.value.copy(OZONE_RATIO).multiplyScalar(params.atmoOzone);
   u.uDither.value = params.atmoDither;
+  u.uUseLUT.value = params.atmoLUT ? 1.0 : 0.0;
+
+  // 重烘透射率 LUT(依赖半径/大气顶/密度衰减)
+  const lu = transLUT.uniforms;
+  lu.uRground.value = Rground;
+  lu.uRatmo.value = Ratmo;
+  lu.uDensityFalloff.value = params.atmoDensityFalloff;
+  lu.uMieFalloff.value = params.atmoMieFalloff;
+  transLUT.render(renderer, lutRT);
 
   // 云层 uniforms
   const c = cloudPass.uniforms;
@@ -466,6 +484,7 @@ fAtmo.add(params, 'atmoTwilight', 0.0, 1.0).name('暮光弧(上翘)').onChange(l
 fAtmo.add(params, 'atmoACES').name('ACES 电影色调').onChange(layoutEffects);
 fAtmo.add(params, 'atmoOzone', 0.0, 0.1).name('臭氧(日落品红)').onChange(layoutEffects);
 fAtmo.add(params, 'atmoDither', 0.0, 1.0).name('抖动去带').onChange(layoutEffects);
+fAtmo.add(params, 'atmoLUT').name('LUT 加速').onChange(layoutEffects);
 
 const fCloud = gui.addFolder('体积云');
 fCloud.add(params, 'showClouds').name('云层开关');
