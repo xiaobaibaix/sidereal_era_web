@@ -8,6 +8,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import GUI from 'lil-gui';
 import { Body, NBodySystem } from './nbody.js';
+import { Planet } from '../planet.js';       // 复用主项目的 LOD 地形行星(近距详细表现)
 
 // ----------------------------------------------------------------------------
 // 星系配置(初始条件; 之后可纳入预设)
@@ -39,6 +40,7 @@ const params = {
   paused: false,
   orbits: true,
   showBelt: true,
+  detail: true,       // 近距切换到 LOD 地形行星
   focus: '恒星',
 };
 
@@ -188,6 +190,7 @@ function buildMeshes() {
 }
 
 function rebuild() {
+  clearDetail();
   disposeMeshes();
   buildSystem();
   buildParticles();
@@ -246,6 +249,7 @@ function updateRender() {
   _off.copy(focusBody().pos);
   for (const e of entries) {
     e.mesh.position.copy(e.body.pos).sub(_off);
+    e.mesh.visible = (e.body !== detailBody);   // 详细行星显示时隐藏对应简单球
     if (e.line) e.line.visible = params.orbits && writeOrbit(e.body, e.line);
   }
   // 小行星带 / 环粒子(相对浮动原点)
@@ -275,6 +279,7 @@ gui.add(params, 'softening', 0.1, 20).name('软化(防奇点)').onFinishChange((
 gui.add(params, 'paused').name('暂停');
 gui.add(params, 'orbits').name('轨道线(完整椭圆)');
 gui.add(params, 'showBelt').name('小行星带/环');
+gui.add(params, 'detail').name('近距地形(LOD)');
 let focusCtrl = gui.add(params, 'focus', ['恒星']).name('聚焦天体');
 gui.add({ reset: rebuild }, 'reset').name('重置星系');
 gui.add({ recenter: () => { controls.target.set(0, 0, 0); } }, 'recenter').name('相机对准聚焦');
@@ -316,6 +321,98 @@ renderer.domElement.addEventListener('pointerup', (e) => {
 });
 
 // ----------------------------------------------------------------------------
+// 近距详细表现: 靠近聚焦天体时, 用主项目的 LOD 地形行星替代简单球(在原点=浮动原点中心)
+// ----------------------------------------------------------------------------
+let detailPlanet = null, detailBody = null;
+
+// 近距行星的共享 LOD/地形调参(所有近距行星共用; 地形种子仍按天体名区分)
+const tune = {
+  maxLevel: 8, splitFactor: 2.5, patchResolution: 16, frustumMargin: 0.15,
+  nearRadiusFrac: 0.5, maxHeightFrac: 0.06,
+  continentFreq: 1.2, continentOctaves: 5, mountainFreq: 3.0, mountainStrength: 0.6,
+  warpStrength: 0.2, plateStrength: 0.5, useClimate: true,
+};
+
+function hashSeed(str) {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return (h >>> 0) % 99999;
+}
+function planetParamsFor(body) {
+  const s = hashSeed(body.name);
+  return {
+    radius: body.radius, maxHeight: body.radius * tune.maxHeightFrac, seaLevel: 0.0,
+    patchResolution: tune.patchResolution, maxLevel: tune.maxLevel, splitFactor: tune.splitFactor,
+    nearRadius: body.radius * tune.nearRadiusFrac, frustumMargin: tune.frustumMargin,
+    continentSeed: s, continentFreq: tune.continentFreq, continentOctaves: tune.continentOctaves,
+    continentGain: 0.5, continentLacunarity: 2.0,
+    mountainSeed: s + 11, mountainFreq: tune.mountainFreq, mountainOctaves: 5, mountainStrength: tune.mountainStrength,
+    warpSeed: s + 23, warpStrength: tune.warpStrength, warpFreq: 1.0,
+    plateSeed: s + 37, plateFreq: 1.6, plateStrength: tune.plateStrength,
+    moistureSeed: s + 51, moistureFreq: 1.2, useClimate: tune.useClimate, climateAltRange: 1.0,
+  };
+}
+// LOD 类参数: 写入当前近距行星, 实时生效(无需重建)
+function applyLODLive() {
+  if (!detailPlanet || !detailBody) return;
+  const p = detailPlanet.params;
+  p.maxLevel = tune.maxLevel; p.splitFactor = tune.splitFactor; p.frustumMargin = tune.frustumMargin;
+  p.nearRadius = detailBody.radius * tune.nearRadiusFrac;
+}
+// 结构/地形类参数: 需要重建当前近距行星
+function applyDetailRebuild() {
+  if (!detailPlanet || !detailBody) return;
+  Object.assign(detailPlanet.params, planetParamsFor(detailBody));
+  detailPlanet.rebuild();
+}
+function setDetail(body) {
+  clearDetail();
+  detailPlanet = new Planet(planetParamsFor(body));
+  scene.add(detailPlanet);       // 位于原点 = 浮动原点中心(聚焦天体处)
+  detailBody = body;
+}
+function clearDetail() {
+  if (detailPlanet) {
+    for (const r of detailPlanet.roots) r.dispose(detailPlanet);
+    detailPlanet.clear();
+    for (const w of detailPlanet.workers) w.terminate();
+    scene.remove(detailPlanet);
+    detailPlanet = null;
+  }
+  detailBody = null;
+}
+// 距离阈值带迟滞, 避免临界抖动
+function manageDetail() {
+  if (!params.detail) { if (detailBody) clearDetail(); return; }
+  const f = focusBody();
+  const dist = camera.position.length();     // 浮动原点下 = 相机到聚焦天体距离
+  const R = f.radius;
+  const canDetail = f.type !== 'star';
+  if (canDetail && dist < R * 24) {
+    if (detailBody !== f) setDetail(f);
+  } else if (detailBody && (dist > R * 34 || detailBody !== f || !canDetail)) {
+    clearDetail();
+  }
+  if (detailPlanet) detailPlanet.update(camera);
+}
+
+// 近距行星 LOD/地形 GUI(LOD 类实时生效; 结构/地形类重建当前近距行星)
+const fLOD = gui.addFolder('近距行星 (LOD/地形)');
+fLOD.add(tune, 'maxLevel', 0, 12, 1).name('最大层数').onChange(applyLODLive);
+fLOD.add(tune, 'splitFactor', 1, 5).name('细分激进度').onChange(applyLODLive);
+fLOD.add(tune, 'frustumMargin', 0, 0.5).name('视锥余量').onChange(applyLODLive);
+fLOD.add(tune, 'nearRadiusFrac', 0, 2).name('预细分半径 ×R').onChange(applyLODLive);
+fLOD.add(tune, 'patchResolution', [4, 8, 16, 32]).name('patch 分辨率').onChange(applyDetailRebuild);
+fLOD.add(tune, 'maxHeightFrac', 0, 0.2).name('地形起伏 ×R').onFinishChange(applyDetailRebuild);
+fLOD.add(tune, 'continentFreq', 0.2, 4).name('大陆频率').onFinishChange(applyDetailRebuild);
+fLOD.add(tune, 'continentOctaves', 1, 8, 1).name('大陆八度').onFinishChange(applyDetailRebuild);
+fLOD.add(tune, 'mountainFreq', 0.5, 8).name('山脉频率').onFinishChange(applyDetailRebuild);
+fLOD.add(tune, 'mountainStrength', 0, 1.5).name('山脉强度').onFinishChange(applyDetailRebuild);
+fLOD.add(tune, 'warpStrength', 0, 0.6).name('域扭曲').onFinishChange(applyDetailRebuild);
+fLOD.add(tune, 'plateStrength', 0, 1.2).name('板块带').onFinishChange(applyDetailRebuild);
+fLOD.add(tune, 'useClimate').name('气候配色').onChange(applyDetailRebuild);
+
+// ----------------------------------------------------------------------------
 // 主循环: 固定步长物理 + 浮动原点渲染
 // ----------------------------------------------------------------------------
 const hud = document.getElementById('hud');
@@ -341,6 +438,7 @@ function animate() {
   }
 
   controls.update();
+  manageDetail();
   updateRender();
   renderer.render(scene, camera);
 
