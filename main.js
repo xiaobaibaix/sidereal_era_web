@@ -62,6 +62,8 @@ const params = {
   cloudSteps: 24,           // 视线步数
   cloudLightSteps: 6,       // 太阳方向步数
   cloudAbsorb: 1.0,         // 自阴影强度
+  cloudSilver: 1.0,         // 银边(前向散射)强度
+  cloudPowder: 0.6,         // powder 暗边强度
 
   // 太阳(方向 = 平行光方向, 同时驱动地形光照/海面高光/大气)
   sunElevation: 35,         // 仰角(度)
@@ -352,6 +354,8 @@ function layoutEffects() {
   c.uSteps.value = params.cloudSteps;
   c.uLightSteps.value = params.cloudLightSteps;
   c.uAbsorb.value = params.cloudAbsorb;
+  c.uSilver.value = params.cloudSilver;
+  c.uPowder.value = params.cloudPowder;
 }
 layoutEffects();
 
@@ -454,6 +458,8 @@ fCloud.add(params, 'cloudTop', 1.02, 1.2).name('云顶比例').onChange(layoutEf
 fCloud.add(params, 'cloudAbsorb', 0.2, 3.0).name('自阴影强度').onChange(layoutEffects);
 fCloud.add(params, 'cloudSteps', 8, 48, 1).name('视线步数').onChange(layoutEffects);
 fCloud.add(params, 'cloudLightSteps', 2, 12, 1).name('光照步数').onChange(layoutEffects);
+fCloud.add(params, 'cloudSilver', 0.0, 3.0).name('银边(前向散射)').onChange(layoutEffects);
+fCloud.add(params, 'cloudPowder', 0.0, 1.0).name('powder 暗边').onChange(layoutEffects);
 
 const fLod = gui.addFolder('LOD');
 fLod.add(params, 'maxLevel', 0, 12, 1).name('最大层数');
