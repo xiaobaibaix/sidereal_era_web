@@ -9,6 +9,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import GUI from 'lil-gui';
 import { Body, NBodySystem } from './nbody.js';
 import { Planet } from '../planet.js';       // 复用主项目的 LOD 地形行星(近距详细表现)
+import { createAtmospherePass } from '../effects.js';   // 复用深度感知大气(止于真实地表)
 
 // ----------------------------------------------------------------------------
 // 星系配置(初始条件; 之后可纳入预设)
@@ -41,6 +42,7 @@ const params = {
   orbits: true,
   showBelt: true,
   detail: true,       // 近距切换到 LOD 地形行星
+  detailAtmo: true,   // 近距行星大气壳
   focus: '恒星',
 };
 
@@ -52,10 +54,12 @@ const ORBIT_SEG = 192;   // 每条轨道椭圆的采样段数
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x03040a);
 
-const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.5, 1e8);
+// 标准深度(不用对数深度): 本尺度下 near/far 比 ~4e4, 精度足够, 且兼容深度感知大气 pass。
+// (未来真实大尺度 1e6+ 时再引入分层深度/对数重建。)
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.5, 20000);
 camera.position.set(0, 1600, 3800);
 
-const renderer = new THREE.WebGLRenderer({ antialias: true, logarithmicDepthBuffer: true });
+const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setSize(innerWidth, innerHeight);
 document.body.appendChild(renderer.domElement);
@@ -70,17 +74,52 @@ scene.add(new THREE.AmbientLight(0xffffff, 0.28));
 const sunLight = new THREE.PointLight(0xffffff, 3.5, 0, 0);   // decay=0: 全系统可见(P1 不追求光照真实)
 scene.add(sunLight);
 
-// 星空背景
+// 星空背景(在远平面内, 固定屏幕像素大小)
 (function stars() {
   const g = new THREE.BufferGeometry();
   const n = 2000, p = new Float32Array(n * 3);
   for (let i = 0; i < n; i++) {
-    const v = new THREE.Vector3().randomDirection().multiplyScalar(4e6);
+    const v = new THREE.Vector3().randomDirection().multiplyScalar(15000);
     p[i * 3] = v.x; p[i * 3 + 1] = v.y; p[i * 3 + 2] = v.z;
   }
   g.setAttribute('position', new THREE.BufferAttribute(p, 3));
-  scene.add(new THREE.Points(g, new THREE.PointsMaterial({ color: 0x8899aa, size: 6000, sizeAttenuation: true })));
+  scene.add(new THREE.Points(g, new THREE.PointsMaterial({ color: 0x8899aa, size: 1.8, sizeAttenuation: false })));
 })();
+
+// ----------------------------------------------------------------------------
+// 深度感知大气(全屏 pass): 场景 → HDR RT(带深度) → 大气 pass → 屏幕
+// ----------------------------------------------------------------------------
+const RAY_ATMO = new THREE.Vector3(0.1066, 0.3245, 0.6830);   // 瑞利比值(∝1/λ⁴)
+function makeSceneRT(w, h) {
+  const rt = new THREE.WebGLRenderTarget(Math.max(1, w), Math.max(1, h), {
+    minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+    type: THREE.HalfFloatType, depthBuffer: true,
+    depthTexture: new THREE.DepthTexture(Math.max(1, w), Math.max(1, h)),
+  });
+  rt.texture.colorSpace = THREE.LinearSRGBColorSpace;
+  rt.depthTexture.type = THREE.UnsignedIntType;
+  return rt;
+}
+const _spr = renderer.getPixelRatio();
+const sceneRT = makeSceneRT(innerWidth * _spr, innerHeight * _spr);
+const atmoPass = createAtmospherePass();
+const OZONE_BASE = new THREE.Vector3(0.0035, 0.010, 0.00045);
+const bodyEdit = { radius: 20 };   // 聚焦天体半径(GUI 编辑用)
+// 大气可调参数(渲染循环每帧读取 → GUI 实时生效)
+const atm = {
+  scale: 1.08, rayleigh: 1.0, mie: 1.0, mieG: 0.76,
+  densityFalloff: 6.0, mieFalloff: 16.0, sunIntensity: 22.0, exposure: 1.0,
+  shadowSoftness: 0.6, twilight: 0.3, ozone: 1.0, dither: 0.5, steps: 16, lightSteps: 8, aces: true,
+};
+(function initAtmoStatics() {
+  const u = atmoPass.uniforms;
+  u.uPlanetCenter.value.set(0, 0, 0);
+  u.uUseLUT.value = 0.0;                 // 直接 raymarch(免 LUT 预烘)
+  const dummy = new THREE.DataTexture(new Uint8Array([0, 0, 0, 255]), 1, 1);   // 避免空 sampler
+  dummy.needsUpdate = true;
+  u.uTransLUT.value = dummy;
+})();
+const _pv = new THREE.Matrix4();
 
 // ----------------------------------------------------------------------------
 // 系统构建
@@ -280,25 +319,43 @@ gui.add(params, 'paused').name('暂停');
 gui.add(params, 'orbits').name('轨道线(完整椭圆)');
 gui.add(params, 'showBelt').name('小行星带/环');
 gui.add(params, 'detail').name('近距地形(LOD)');
-let focusCtrl = gui.add(params, 'focus', ['恒星']).name('聚焦天体');
+gui.add(params, 'detailAtmo').name('近距大气');
+let focusCtrl = gui.add(params, 'focus', ['恒星']).name('聚焦天体').onChange(syncBodyEdit);
+const radiusCtrl = gui.add(bodyEdit, 'radius', 2, 300).name('聚焦天体半径').onChange(applyBodyRadius);
 gui.add({ reset: rebuild }, 'reset').name('重置星系');
 gui.add({ recenter: () => { controls.target.set(0, 0, 0); } }, 'recenter').name('相机对准聚焦');
 
 function refreshFocusOptions() {
   const names = system.bodies.map((b) => b.name);
-  focusCtrl = focusCtrl.options(names).name('聚焦天体');
+  focusCtrl = focusCtrl.options(names).name('聚焦天体').onChange(syncBodyEdit);
   if (!names.includes(params.focus)) params.focus = names[0];
   focusCtrl.setValue(params.focus);
+  syncBodyEdit();
 }
 
 // 设置观察中心(聚焦天体), 相机自动对准并拉到合适距离
 function setFocus(body) {
   params.focus = body.name;
   focusCtrl.setValue(body.name);
+  syncBodyEdit();
   const d = THREE.MathUtils.clamp(body.radius * 8, controls.minDistance, controls.maxDistance);
   if (camera.position.lengthSq() > 1e-6) camera.position.setLength(d);
   controls.target.set(0, 0, 0);
   controls.update();
+}
+
+// 半径滑块与聚焦天体同步 / 应用
+function syncBodyEdit() {
+  const b = focusBody(); if (!b) return;
+  bodyEdit.radius = b.radius;
+  if (typeof radiusCtrl !== 'undefined' && radiusCtrl) radiusCtrl.updateDisplay();
+}
+function applyBodyRadius() {
+  const b = focusBody(); if (!b) return;
+  b.radius = bodyEdit.radius;
+  const e = entries.find((en) => en.body === b);
+  if (e) { e.mesh.geometry.dispose(); e.mesh.geometry = new THREE.SphereGeometry(b.radius, 32, 24); }
+  if (detailBody === b) setDetail(b);   // 重建近距地形以匹配新半径
 }
 
 // 点击天体切换观察中心(区分点击/拖动)
@@ -328,7 +385,7 @@ let detailPlanet = null, detailBody = null;
 // 近距行星的共享 LOD/地形调参(所有近距行星共用; 地形种子仍按天体名区分)
 const tune = {
   maxLevel: 8, splitFactor: 2.5, patchResolution: 16, frustumMargin: 0.15,
-  nearRadiusFrac: 0.5, maxHeightFrac: 0.06,
+  nearRadiusFrac: 0.5, maxHeightFrac: 0.03,
   continentFreq: 1.2, continentOctaves: 5, mountainFreq: 3.0, mountainStrength: 0.6,
   warpStrength: 0.2, plateStrength: 0.5, useClimate: true,
 };
@@ -412,6 +469,23 @@ fLOD.add(tune, 'warpStrength', 0, 0.6).name('域扭曲').onFinishChange(applyDet
 fLOD.add(tune, 'plateStrength', 0, 1.2).name('板块带').onFinishChange(applyDetailRebuild);
 fLOD.add(tune, 'useClimate').name('气候配色').onChange(applyDetailRebuild);
 
+// 近距行星大气(实时生效)
+const fAtm = gui.addFolder('大气 (近距)');
+fAtm.add(atm, 'scale', 1.02, 1.4).name('大气顶比例');
+fAtm.add(atm, 'rayleigh', 0, 3).name('瑞利强度');
+fAtm.add(atm, 'mie', 0, 3).name('米氏强度');
+fAtm.add(atm, 'mieG', 0.3, 0.95).name('米氏g(光晕)');
+fAtm.add(atm, 'densityFalloff', 1, 20).name('密度衰减');
+fAtm.add(atm, 'sunIntensity', 1, 60).name('太阳强度');
+fAtm.add(atm, 'exposure', 0.2, 4).name('曝光(整屏)');
+fAtm.add(atm, 'shadowSoftness', 0.05, 1.5).name('晨昏柔和');
+fAtm.add(atm, 'twilight', 0, 1).name('暮光弧');
+fAtm.add(atm, 'ozone', 0, 3).name('臭氧');
+fAtm.add(atm, 'dither', 0, 1).name('抖动去带');
+fAtm.add(atm, 'steps', 4, 32, 1).name('视线步数');
+fAtm.add(atm, 'lightSteps', 2, 16, 1).name('太阳步数');
+fAtm.add(atm, 'aces').name('ACES(整屏)');
+
 // ----------------------------------------------------------------------------
 // 主循环: 固定步长物理 + 浮动原点渲染
 // ----------------------------------------------------------------------------
@@ -424,6 +498,8 @@ addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(innerWidth, innerHeight);
+  const pr = renderer.getPixelRatio();
+  sceneRT.setSize(Math.floor(innerWidth * pr), Math.floor(innerHeight * pr));
 });
 
 function animate() {
@@ -440,7 +516,45 @@ function animate() {
   controls.update();
   manageDetail();
   updateRender();
+
+  // 场景 → HDR RT(带深度)
+  renderer.setRenderTarget(sceneRT);
+  renderer.clear();
   renderer.render(scene, camera);
+  renderer.setRenderTarget(null);
+
+  // 深度感知大气 pass → 屏幕(近距行星有大气时启用; 否则仅 tonemap 直通)
+  const u = atmoPass.uniforms;
+  u.tDiffuse.value = sceneRT.texture;
+  u.tDepth.value = sceneRT.depthTexture;
+  _pv.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+  u.uInvViewProj.value.copy(_pv).invert();
+  camera.getWorldPosition(u.uCamPos.value);
+  // 影响整屏(含 uEnabled=0 的直通 tonemap)
+  u.uExposure.value = atm.exposure;
+  u.uTonemap.value = atm.aces ? 1 : 0;
+  u.uDither.value = atm.dither;
+  if (detailPlanet && detailBody && params.detailAtmo) {
+    const R = detailBody.radius;
+    u.uEnabled.value = 1.0;
+    u.uRground.value = R;
+    u.uRatmo.value = R * atm.scale;
+    u.uScatterR.value.copy(RAY_ATMO).multiplyScalar(8.0 / R * atm.rayleigh);   // ∝1/半径
+    u.uScatterM.value = 3.0 / R * atm.mie;
+    u.uOzone.value.copy(OZONE_BASE).multiplyScalar(100.0 / R * atm.ozone);
+    u.uMieG.value = atm.mieG;
+    u.uDensityFalloff.value = atm.densityFalloff;
+    u.uMieFalloff.value = atm.mieFalloff;
+    u.uSunIntensity.value = atm.sunIntensity;
+    u.uShadowSoftness.value = atm.shadowSoftness;
+    u.uTwilight.value = atm.twilight;
+    u.uSteps.value = atm.steps;
+    u.uLightSteps.value = atm.lightSteps;
+    u.uSunDir.value.copy(starBody.pos).sub(detailBody.pos).normalize();
+  } else {
+    u.uEnabled.value = 0.0;
+  }
+  atmoPass.render(renderer);
 
   const e = system.energy();
   if (e0 === null) e0 = e.total;
