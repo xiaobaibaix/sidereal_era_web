@@ -332,6 +332,8 @@ export function createCloudPass() {
     uAbsorb: { value: 1.0 },          // 光照吸收(自阴影强度)
     uSunColor: { value: new THREE.Vector3(1.7, 1.6, 1.5) }, // 云受阳光颜色(HDR)
     uAmbient: { value: new THREE.Vector3(0.28, 0.34, 0.45) }, // 天空环境光
+    uSilver: { value: 1.0 },          // 银边(前向散射相位)强度
+    uPowder: { value: 0.6 },          // powder 暗边强度(0=关)
   };
 
   const material = new THREE.ShaderMaterial({
@@ -366,6 +368,19 @@ export function createCloudPass() {
       uniform float uAbsorb;
       uniform vec3  uSunColor;
       uniform vec3  uAmbient;
+      uniform float uSilver;
+      uniform float uPowder;
+
+      const float PI = 3.14159265359;
+
+      // Henyey-Greenstein 相位; 双叶(前向峰=银边 + 一点后向)近似米氏
+      float hg(float mu, float g) {
+        float g2 = g * g;
+        return (1.0 - g2) / (4.0 * PI * pow(max(1.0 + g2 - 2.0 * g * mu, 1e-4), 1.5));
+      }
+      float cloudPhase(float mu) {
+        return mix(hg(mu, 0.8), hg(mu, -0.5), 0.5);
+      }
 
       vec2 raySphere(vec3 ro, vec3 rd, vec3 ce, float r) {
         vec3 oc = ro - ce;
@@ -473,15 +488,22 @@ export function createCloudPass() {
         float jitter = hash(vec3(gl_FragCoord.xy, uTime));
         vec3 p = ro + rd * (t0 + step * jitter);
 
+        // 相位: 前向峰在视线朝太阳时最强 → 背光云的边缘银边
+        float mu = dot(rd, uSunDir);
+        float phase = 0.4 + uSilver * cloudPhase(mu);   // 0.4 基底保证背光侧也有照明
+
         float T = 1.0;
         vec3 L = vec3(0.0);
         for (int i = 0; i < 96; i++) {
           if (i >= N || T < 0.02) break;
-          float dens = cloudDensity(p, true) * step * uDensity;
+          float dloc = cloudDensity(p, true);
+          float dens = dloc * step * uDensity;
           if (dens > 0.001) {
-            float sun = lightMarch(p);
+            float sun = lightMarch(p);                       // 向太阳透射率(Beer)
             float day = dayFactor(p);
-            vec3 lit = uSunColor * (sun * day) + uAmbient;
+            // powder(糖粉暗边): 朝光的薄处偏暗, 增强体积感
+            float powder = mix(1.0, 1.0 - exp(-dloc * uDensity * 2.0), uPowder);
+            vec3 lit = uSunColor * (sun * day * phase * powder) + uAmbient;
             float a = 1.0 - exp(-dens);
             L += T * a * lit;
             T *= exp(-dens);
