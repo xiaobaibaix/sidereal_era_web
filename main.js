@@ -433,9 +433,20 @@ function setCharacterMode(on) {
   updateInsetLabel();
 }
 
+// 记录上次半径, 半径变化时按比例缩放相机到球心的距离(保持方向/构图), 避免相机卡进球里
+let lastRadius = params.radius;
 function rebuild() {
+  const ratio = params.radius / lastRadius;
+  if (isFinite(ratio) && ratio > 0 && Math.abs(ratio - 1) > 1e-6) {
+    camera.position.multiplyScalar(ratio);          // 轨道相机(target 为球心)按比例外扩
+    spectatorCamera.position.multiplyScalar(ratio);  // 旁观相机同步
+  }
+  lastRadius = params.radius;
+
   planet.rebuild();
   controls.minDistance = params.radius + params.maxHeight * 2.5;
+  controls.maxDistance = Math.max(8000, params.radius * 40);
+  controls.update();
   layoutEffects();
 }
 
