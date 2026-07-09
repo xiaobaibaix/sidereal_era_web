@@ -334,6 +334,7 @@ export function createCloudPass() {
     uAmbient: { value: new THREE.Vector3(0.28, 0.34, 0.45) }, // 天空环境光
     uSilver: { value: 1.0 },          // 银边(前向散射相位)强度
     uPowder: { value: 0.6 },          // powder 暗边强度(0=关)
+    uCloudShadow: { value: 0.7 },     // 云影投到地表强度(0=关)
   };
 
   const material = new THREE.ShaderMaterial({
@@ -370,6 +371,7 @@ export function createCloudPass() {
       uniform vec3  uAmbient;
       uniform float uSilver;
       uniform float uPowder;
+      uniform float uCloudShadow;
 
       const float PI = 3.14159265359;
 
@@ -453,6 +455,25 @@ export function createCloudPass() {
         return smoothstep(-0.12, 0.12, dot(up, uSunDir));
       }
 
+      // 地表点的云影: 从地面点沿太阳方向穿过云层累积密度 → 透射率(1=无遮, 0=全影)
+      float cloudShadow(vec3 gp) {
+        vec2 o = raySphere(gp, uSunDir, uPlanetCenter, uTop);
+        vec2 inr = raySphere(gp, uSunDir, uPlanetCenter, uBottom);
+        float s0 = max(inr.y, 0.0);      // 穿出云底球 = 进入云层
+        float s1 = o.y;                  // 穿出云顶球
+        if (s1 <= s0) return 1.0;
+        int N = uLightSteps;
+        float st = (s1 - s0) / float(N);
+        float sum = 0.0;
+        vec3 q = gp + uSunDir * (s0 + st * 0.5);
+        for (int i = 0; i < 12; i++) {
+          if (i >= N) break;
+          sum += cloudDensity(q, false) * st;
+          q += uSunDir * st;
+        }
+        return exp(-sum * uDensity * uAbsorb);
+      }
+
       void main() {
         vec3 sceneColor = texture2D(tDiffuse, vUv).rgb;
 
@@ -465,7 +486,16 @@ export function createCloudPass() {
         float sceneDist = 1e20;
         if (depth < 1.0) {
           vec4 hp = uInvViewProj * vec4(ndc, depth * 2.0 - 1.0, 1.0);
-          sceneDist = distance(hp.xyz / hp.w, uCamPos);
+          vec3 hitPos = hp.xyz / hp.w;
+          sceneDist = distance(hitPos, uCamPos);
+          // 云影投到地表(仅行星表面、白天侧)
+          if (uCloudShadow > 0.0 && length(hitPos - uPlanetCenter) < uTop) {
+            float day = dayFactor(hitPos);
+            if (day > 0.01) {
+              float sh = cloudShadow(hitPos);
+              sceneColor *= mix(1.0, sh, uCloudShadow * day);
+            }
+          }
         }
 
         // 视线与云壳区间 = 外壳内部 - 内壳内部

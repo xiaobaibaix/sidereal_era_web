@@ -37,6 +37,7 @@
   "cloudAbsorb": 1.0,
   "cloudSilver": 1.0,
   "cloudPowder": 0.6,
+  "cloudShadow": 0.7,
   "sunElevation": 35,
   "sunAzimuth": 40,
   "autoSun": false,
