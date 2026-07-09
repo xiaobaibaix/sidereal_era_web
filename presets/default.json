@@ -24,6 +24,7 @@
   "atmoACES": true,
   "atmoOzone": 0.02,
   "atmoDither": 0.5,
+  "atmoLUT": true,
   "showClouds": true,
   "cloudBottom": 1.01,
   "cloudTop": 1.06,

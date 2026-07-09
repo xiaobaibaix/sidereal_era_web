@@ -85,6 +85,8 @@ export function createAtmospherePass() {
     uShadowSoftness: { value: 0.6 },  // 晨昏过渡带宽度
     uTwilight: { value: 0.3 },        // 暮光弧强度(0=贴地表, 1=完整几何地平下沉)
     uTonemap: { value: 1 },           // 0=Reinhard, 1=ACES filmic
+    uTransLUT: { value: null },       // 透射率 LUT(太阳方向光学深度)
+    uUseLUT: { value: 1.0 },          // 1=查表加速, 0=实时 raymarch(回退)
     uOzone: { value: new THREE.Vector3(0.007, 0.02, 0.0009) }, // 臭氧吸收(绿>红>蓝)
     uDither: { value: 1.0 },          // raymarch 抖动强度(去 banding)
   };
@@ -128,6 +130,8 @@ export function createAtmospherePass() {
       uniform int   uTonemap;          // 0=Reinhard, 1=ACES filmic
       uniform vec3  uOzone;            // 臭氧吸收系数(只消光, 不散射)
       uniform float uDither;           // raymarch 起点抖动强度(去 banding)
+      uniform sampler2D uTransLUT;     // 透射率 LUT
+      uniform float uUseLUT;           // 1=查表, 0=实时 raymarch
 
       const float PI = 3.14159265359;
 
@@ -257,7 +261,17 @@ export function createAtmospherePass() {
 
           float shadow = planetShadow(p, uSunDir);
           if (shadow > 0.0) {
-            vec3 odSun = opticalDepthToSun(p, uSunDir);
+            // 太阳方向光学深度: 查 LUT(球对称精确, 省内循环) 或回退实时 march
+            vec3 odSun;
+            if (uUseLUT > 0.5) {
+              float rr = length(p - uPlanetCenter);
+              float mus = dot(normalize(p - uPlanetCenter), uSunDir);
+              vec2 luv = vec2(mus * 0.5 + 0.5,
+                              clamp((rr - uRground) / max(uRatmo - uRground, 1e-4), 0.0, 1.0));
+              odSun = texture2D(uTransLUT, luv).rgb;
+            } else {
+              odSun = opticalDepthToSun(p, uSunDir);
+            }
             // 消光 = 瑞利 + 米氏(散射×1.1) + 臭氧(纯吸收)
             vec3 tau = uScatterR * (odView.x + odSun.x)
                      + uScatterM * 1.1 * (odView.y + odSun.y)
@@ -629,5 +643,87 @@ export function createGodrayPass() {
     uniforms,
     material,
     render(renderer) { renderer.render(quadScene, quadCam); },
+  };
+}
+
+// 透射率 LUT 预计算(M6 的务实子集)。
+//
+// 大气球对称 → 太阳方向光学深度只取决于(采样点半径 r, 太阳天顶余弦 mu)。把它预烘成一张
+// 2D 表(x=mu, y=高度), rgb = (瑞利, 米氏, 臭氧)光学深度。运行时大气 pass 直接查表, 省掉
+// 每个视线采样点里那层 M 步的"向太阳 march"内循环。表随大气参数变化时重烘一次即可。
+export function createTransmittanceLUT() {
+  const uniforms = {
+    uRground: { value: 100.0 },
+    uRatmo: { value: 120.0 },
+    uDensityFalloff: { value: 6.0 },
+    uMieFalloff: { value: 16.0 },
+  };
+  const material = new THREE.ShaderMaterial({
+    uniforms,
+    depthTest: false,
+    depthWrite: false,
+    vertexShader: /* glsl */`
+      varying vec2 vUv;
+      void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }
+    `,
+    fragmentShader: /* glsl */`
+      precision highp float;
+      varying vec2 vUv;
+      uniform float uRground;
+      uniform float uRatmo;
+      uniform float uDensityFalloff;
+      uniform float uMieFalloff;
+
+      vec2 raySphere(vec3 ro, vec3 rd, float r) {
+        float b = dot(ro, rd);
+        float c = dot(ro, ro) - r * r;
+        float d = b * b - c;
+        if (d < 0.0) return vec2(1e20, -1e20);
+        float s = sqrt(d);
+        return vec2(-b - s, -b + s);
+      }
+      vec3 densityAt(vec3 p) {
+        float t = clamp((length(p) - uRground) / max(uRatmo - uRground, 1e-4), 0.0, 1.0);
+        float edge = 1.0 - t;
+        float dR = exp(-t * uDensityFalloff) * edge;
+        float dM = exp(-t * uMieFalloff) * edge;
+        float dO = max(0.0, 1.0 - abs(t - 0.35) / 0.35);
+        return vec3(dR, dM, dO);
+      }
+
+      void main() {
+        float mu = vUv.x * 2.0 - 1.0;                 // 天顶余弦 [-1,1]
+        float r = mix(uRground, uRatmo, vUv.y);       // 半径
+        vec3 origin = vec3(0.0, r, 0.0);
+        vec3 dir = vec3(sqrt(max(1.0 - mu * mu, 0.0)), mu, 0.0);
+
+        vec2 top = raySphere(origin, dir, uRatmo);
+        float far = max(top.y, 0.0);
+        vec2 gnd = raySphere(origin, dir, uRground);
+        if (gnd.x > 0.0 && gnd.y > gnd.x) far = min(far, gnd.x);
+
+        const int N = 40;
+        float st = far / float(N);
+        vec3 od = vec3(0.0);
+        vec3 p = origin + dir * (st * 0.5);
+        for (int i = 0; i < N; i++) { od += densityAt(p) * st; p += dir * st; }
+        gl_FragColor = vec4(od, 1.0);
+      }
+    `,
+  });
+  const quadScene = new THREE.Scene();
+  const quadCam = new THREE.Camera();
+  const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), material);
+  quad.frustumCulled = false;
+  quadScene.add(quad);
+  return {
+    uniforms,
+    material,
+    render(renderer, target) {
+      const prev = renderer.getRenderTarget();
+      renderer.setRenderTarget(target);
+      renderer.render(quadScene, quadCam);
+      renderer.setRenderTarget(prev);
+    },
   };
 }
