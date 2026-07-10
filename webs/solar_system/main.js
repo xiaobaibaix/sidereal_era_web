@@ -9,7 +9,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import GUI from 'lil-gui';
 import { Body, NBodySystem } from './nbody.js';
 import { Planet } from '../../src/planet.js';       // 复用主项目的 LOD 地形行星(近距详细表现)
-import { createAtmospherePass, createCloudPass, createOcean } from '../../src/effects.js';   // 复用深度感知大气 + 体积云 + 海洋 海洋
+import { createAtmospherePass, createCloudPass, createOcean, createGasGiant } from '../../src/effects.js';   // 复用深度感知大气 + 体积云 + 海洋 海洋
 
 // ----------------------------------------------------------------------------
 // 星系配置(初始条件; 之后可纳入预设)
@@ -28,6 +28,9 @@ const CONFIG = {
       { name: '卫星2b', mass: 2, radius: 3.5, hillFrac: 0.34, phase: 2.4, incl: -0.22, color: 0xa9b4d0 },
     ] },
     { name: '行星3', mass: 1600, radius: 16, dist: 1850, phase: 3.6, incl: 0.02, color: 0x66d9a6, moons: [] },
+    { name: '行星4', mass: 5200, radius: 34, dist: 2650, phase: 5.1, incl: 0.03, color: 0xd9b38c, moons: [
+      { name: '卫星4a', mass: 3, radius: 4, hillFrac: 0.22, phase: 1.1, incl: 0.15, color: 0xcbb8a0 },
+    ] },
   ],
   // 小行星带(绕恒星, 在行星2与行星3之间) + 行星环(绕某行星)。都是测试粒子。
   belt: { count: 1600, inner: 1380, outer: 1620, thickness: 28 },
@@ -443,7 +446,10 @@ function applyBodyRadius() {
   const e0 = entries.find((en) => en.body === b);
   if (e0) { e0.mesh.geometry.dispose(); e0.mesh.geometry = new THREE.SphereGeometry(b.radius, 32, 24); }
   const e = detailMap.get(b);
-  if (e) { Object.assign(e.planet.params, planetParamsFor(b)); e.planet.rebuild(); }   // 重建近距地形以匹配新半径
+  if (e) {
+    if (e.gas) e.gas.scale.setScalar(b.radius);
+    else { Object.assign(e.planet.params, planetParamsFor(b)); e.planet.rebuild(); }   // 重建近距地形以匹配新半径
+  }
 }
 
 // 点击天体切换观察中心(区分点击/拖动)
@@ -484,6 +490,9 @@ const tune = {
   nearRadiusFrac: 0.5, maxHeightFrac: 0.03, seaLevel: 0.0, oceanEnabled: true,
   continentFreq: 1.2, continentOctaves: 5, mountainFreq: 3.0, mountainStrength: 0.6,
   warpStrength: 0.2, plateStrength: 0.5, useClimate: true,
+  // 气态行星(替代地形: 纬向气带 + 湍流; gas=true 时不生成地形/海洋)
+  gas: false, gasBands: 14, gasWarp: 0.6, gasFlow: 0.03,
+  colGasA: [0.72, 0.62, 0.45], colGasB: [0.90, 0.83, 0.68], colGasC: [0.55, 0.44, 0.34],
   // 地形调色板([r,g,b] 0..1, lil-gui addColor 原地编辑)
   colOceanShallow: [0.20, 0.45, 0.62], colOceanDeep: [0.03, 0.12, 0.30],
   colBeach: [0.82, 0.78, 0.55], colDry: [0.78, 0.70, 0.42], colWet: [0.13, 0.45, 0.15],
@@ -525,6 +534,14 @@ const BODY_CFG = {
     },
     atm: { enabled: true, scale: 1.10, rayleigh: 1.3, mie: 0.9, tint: [0.7, 1.0, 0.9] },
     cloud: { enabled: true, coverage: 0.62, density: 1.4 },
+  },
+  '行星4': {   // 气态巨行星: 木星风格棕黄气带, 无地形/海洋, 大气与云由气带 shader 自身表现
+    tune: {
+      gas: true, gasBands: 16, gasWarp: 0.7, gasFlow: 0.03,
+      colGasA: [0.78, 0.66, 0.46], colGasB: [0.94, 0.87, 0.72], colGasC: [0.55, 0.40, 0.30],
+    },
+    atm: { enabled: false },
+    cloud: { enabled: false },
   },
   '卫星1a': {  // 岩石灰月: 无海, 密集陨坑感(高山脉频率), 灰
     tune: {
@@ -652,7 +669,7 @@ function applyLODLive() {
   saveCfg(editingBody);              // 把 GUI 改动持久化进聚焦天体的 cfg
   const b = focusBody();
   const e = detailMap.get(b);
-  if (!e) return;
+  if (!e || e.gas) return;
   const p = e.planet.params;
   p.maxLevel = tune.maxLevel; p.splitFactor = tune.splitFactor; p.frustumMargin = tune.frustumMargin;
   p.nearRadius = b.radius * tune.nearRadiusFrac;
@@ -662,7 +679,7 @@ function applyDetailRebuild() {
   saveCfg(editingBody);
   const b = focusBody();
   const e = detailMap.get(b);
-  if (!e) return;
+  if (!e || e.gas) return;
   Object.assign(e.planet.params, planetParamsFor(b));
   e.planet.rebuild();
   disposeOcean(e);                       // 海洋(颜色/半径/开关可能都变了)重建
@@ -690,6 +707,16 @@ function disposeOcean(e) {
 // ---- 多行星详细网格的建立/销毁 ----
 function addDetail(body) {
   ensureCfg(body);
+  if (tuneFor(body).gas) {              // 气态行星: 气带 shader 球替代地形 LOD(无海洋)
+    const gas = createGasGiant();
+    gas.frustumCulled = false;
+    gas.scale.setScalar(body.radius);
+    applyGasUniforms(gas, body, tuneFor(body));
+    scene.add(gas);
+    const e = { gas };
+    detailMap.set(body, e);
+    return e;
+  }
   const planet = new Planet(planetParamsFor(body));
   scene.add(planet);
   const ocean = makeOcean(body);       // 海洋是独立 mesh 加到 scene(不做 Planet 子节点, 因 rebuild 会 clear)
@@ -701,6 +728,11 @@ function addDetail(body) {
 function removeDetail(body) {
   const e = detailMap.get(body);
   if (!e) return;
+  if (e.gas) {                                            // 气态: 释放气带 shader 球
+    scene.remove(e.gas); e.gas.geometry.dispose(); e.gas.material.dispose();
+    detailMap.delete(body);
+    return;
+  }
   for (const r of e.planet.roots) r.dispose(e.planet);   // 取消未完成 job + 释放网格
   e.planet.clear();
   scene.remove(e.planet);                                 // worker 是共享池, 不 terminate
@@ -731,6 +763,13 @@ function manageDetail() {
 
   // 更新所有 LOD 行星位置 + LOD(远处自然停在最低细分); 海洋跟随并按距离显隐
   for (const [b, e] of detailMap) {
+    if (e.gas) {                                 // 气态行星: 定位 + 驱动流动/光照(无 LOD/海洋)
+      e.gas.position.copy(b.pos).sub(_off);
+      const gu = e.gas.material.uniforms;
+      gu.uTime.value = cloudTime;
+      gu.uSunDir.value.copy(starBody.pos).sub(b.pos).normalize();
+      continue;
+    }
     e.planet.position.copy(b.pos).sub(_off);   // 定位到浮动原点空间(聚焦天体处为原点)
     e.planet.update(camera);
     if (e.ocean) {
@@ -842,6 +881,45 @@ fCol.addColor(tune, 'colSnow').name('雪').onFinishChange(applyDetailRebuild);
 fCol.close();
 
 // ----------------------------------------------------------------------------
+// 气态行星: 勾选后用"纬向气带 shader 球"替代地形 LOD(无山脉/海洋)。参数实时生效。
+// ----------------------------------------------------------------------------
+const fGas = gui.addFolder('气态行星');
+fGas.add(tune, 'gas').name('气态行星(替代地形)').onChange(() => { rebuildFocusDetail(); updateGuiForFocus(); });
+fGas.addColor(tune, 'colGasA').name('气带色 A').onChange(applyGasLive);
+fGas.addColor(tune, 'colGasB').name('气带色 B(亮)').onChange(applyGasLive);
+fGas.addColor(tune, 'colGasC').name('气带色 C(暗)').onChange(applyGasLive);
+fGas.add(tune, 'gasBands', 3, 40, 1).name('气带数').onChange(applyGasLive);
+fGas.add(tune, 'gasWarp', 0, 2).name('湍流扭曲').onChange(applyGasLive);
+fGas.add(tune, 'gasFlow', 0, 0.3).name('流动速度').onChange(applyGasLive);
+fGas.close();
+
+// 把气态参数写入气带 shader(颜色/气带数/流动等)
+function applyGasUniforms(gas, body, t) {
+  const u = gas.material.uniforms;
+  const a = t.colGasA, b = t.colGasB, c = t.colGasC;
+  u.uColA.value.setRGB(a[0], a[1], a[2]);
+  u.uColB.value.setRGB(b[0], b[1], b[2]);
+  u.uColC.value.setRGB(c[0], c[1], c[2]);
+  u.uBands.value = t.gasBands;
+  u.uWarp.value = t.gasWarp;
+  u.uFlow.value = t.gasFlow;
+  u.uSeed.value = ((t.seed || 0) % 100);   // 顶层种子 → 不同气态星纹路不同
+}
+// 气态参数实时生效(当前聚焦天体已是气态时直接更新其 uniforms, 无需重建)
+function applyGasLive() {
+  saveCfg(editingBody);
+  const b = focusBody();
+  const e = detailMap.get(b);
+  if (e && e.gas) applyGasUniforms(e.gas, b, tune);
+}
+// 切换气态开关: 移除当前近距表现, 下一帧 manageDetail 按新配置(气态/地形)重建
+function rebuildFocusDetail() {
+  saveCfg(editingBody);
+  const b = focusBody();
+  if (b && detailMap.has(b)) removeDetail(b);
+}
+
+// ----------------------------------------------------------------------------
 // 配置库: 把当前行星调好的参数存成命名预设, 一键套用到其它行星(保留各自种子 → 同风格不同地形);
 // 也能导出/导入 .json 文件。所有预设 + 各行星配置都存 localStorage, 关掉重开自动恢复(记忆功能)。
 // ----------------------------------------------------------------------------
@@ -934,7 +1012,7 @@ function importCfg() {
 function updateGuiForFocus() {
   const b = focusBody();
   const showTune = !!b && b.type !== 'star';
-  for (const f of [fLOD, fAtm, fCloud, fCol, fPre]) if (f) (showTune ? f.show() : f.hide());
+  for (const f of [fLOD, fAtm, fCloud, fCol, fGas, fPre]) if (f) (showTune ? f.show() : f.hide());
   if (radiusCtrl) (showTune ? radiusCtrl.show() : radiusCtrl.hide());
 }
 
@@ -1001,6 +1079,7 @@ function animate() {
   let cloudEntry = null, cloudD = Infinity;
   if (params.detailClouds) {
     for (const [body, e] of detailMap) {
+      if (e.gas) continue;                 // 气态行星不跑地形云 pass(气带 shader 自带表现)
       const c = cloudFor(body);
       if (!c.enabled) continue;
       const d = camDistTo(body);
@@ -1035,6 +1114,7 @@ function animate() {
   const atmoList = [];
   if (params.detailAtmo) {
     for (const [body, e] of detailMap) {
+      if (e.gas) continue;                 // 气态行星不跑地形大气 pass
       const a = atmFor(body);
       if (a.enabled === false) continue;
       const d = camDistTo(body);

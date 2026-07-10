@@ -738,3 +738,89 @@ export function createTransmittanceLUT() {
     },
   };
 }
+
+// 气态行星: 纬向气带 + 域扭曲湍流 + 缓慢流动 + 太阳方向明暗(夜面暗) + 边缘变暗(球体感)。
+// 单个 shader 球(无地形/海洋)。渲染进场景 RT(线性 HDR), 由末端大气 pass 统一 tonemap。
+// 每帧由 main.js 设 uTime / uSunDir; 颜色/气带数等由 applyGasUniforms 注入。
+export function createGasGiant() {
+  const uniforms = {
+    uTime: { value: 0 },
+    uSunDir: { value: new THREE.Vector3(1, 0, 0) },
+    uColA: { value: new THREE.Color(0.72, 0.62, 0.45) },   // 气带色 A
+    uColB: { value: new THREE.Color(0.90, 0.83, 0.68) },   // 气带色 B(亮带/区)
+    uColC: { value: new THREE.Color(0.55, 0.44, 0.34) },   // 气带色 C(暗带)
+    uBands: { value: 14.0 },   // 气带数(纬向条纹密度)
+    uWarp: { value: 0.5 },     // 湍流扭曲(条纹卷曲/漩涡)
+    uFlow: { value: 0.03 },    // 流动速度
+    uSeed: { value: 0.0 },     // 噪声域偏移(不同气态星长得不一样)
+    uBright: { value: 1.35 },  // 整体亮度补偿(抵消末端 tonemap 压暗)
+  };
+  const material = new THREE.ShaderMaterial({
+    uniforms,
+    vertexShader: /* glsl */`
+      varying vec3 vObjN;
+      varying vec3 vWorldN;
+      varying vec3 vWorldPos;
+      void main() {
+        vObjN = normalize(position);
+        vec4 wp = modelMatrix * vec4(position, 1.0);
+        vWorldPos = wp.xyz;
+        vWorldN = normalize(mat3(modelMatrix) * normal);
+        gl_Position = projectionMatrix * viewMatrix * wp;
+      }
+    `,
+    fragmentShader: /* glsl */`
+      precision highp float;
+      uniform float uTime, uBands, uWarp, uFlow, uSeed, uBright;
+      uniform vec3  uSunDir, uColA, uColB, uColC;
+      varying vec3 vObjN;
+      varying vec3 vWorldN;
+      varying vec3 vWorldPos;
+
+      float hash(vec3 p) {
+        p = fract(p * 0.3183099 + 0.1);
+        p *= 17.0;
+        return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+      }
+      float vnoise(vec3 x) {
+        vec3 i = floor(x); vec3 f = fract(x);
+        f = f * f * (3.0 - 2.0 * f);
+        return mix(mix(mix(hash(i + vec3(0,0,0)), hash(i + vec3(1,0,0)), f.x),
+                       mix(hash(i + vec3(0,1,0)), hash(i + vec3(1,1,0)), f.x), f.y),
+                   mix(mix(hash(i + vec3(0,0,1)), hash(i + vec3(1,0,1)), f.x),
+                       mix(hash(i + vec3(0,1,1)), hash(i + vec3(1,1,1)), f.x), f.y), f.z);
+      }
+      float fbm(vec3 p) {
+        float s = 0.0, a = 0.5;
+        for (int i = 0; i < 5; i++) { s += a * vnoise(p); p *= 2.03; a *= 0.5; }
+        return s;
+      }
+
+      void main() {
+        vec3 n = normalize(vObjN);
+        vec3 seed = vec3(uSeed);
+        // 湍流域(缓慢在经度方向平移 → 气带流动/卷曲)
+        vec3 sp = n * 2.2 + seed;
+        float turb  = fbm(sp * 1.6 + vec3(uTime * uFlow, 0.0, uTime * uFlow * 0.4));
+        float swirl = fbm(sp * 3.6 + vec3(0.0, uTime * uFlow * 0.7, 0.0));
+        // 被湍流扭曲的纬度 → 纬向气带
+        float lat = n.y + (turb - 0.5) * uWarp;
+        float band = lat * uBands;
+        float m = fract(band * 0.5);         // 半频循环, A-B-C 过渡更平滑
+        vec3 col = (m < 0.5)
+          ? mix(uColA, uColB, smoothstep(0.0, 1.0, m * 2.0))
+          : mix(uColB, uColC, smoothstep(0.0, 1.0, (m - 0.5) * 2.0));
+        col *= 0.82 + 0.36 * swirl;          // 漩涡细节明暗
+
+        // 太阳明暗(夜面暗, 软晨昏) + 边缘变暗(球体立体感)
+        vec3 N = normalize(vWorldN);
+        vec3 V = normalize(cameraPosition - vWorldPos);
+        float day  = smoothstep(-0.12, 0.18, dot(N, normalize(uSunDir)));
+        float limb = mix(0.55, 1.0, clamp(dot(N, V), 0.0, 1.0));
+        gl_FragColor = vec4(col * uBright * day * limb, 1.0);
+      }
+    `,
+  });
+  const mesh = new THREE.Mesh(new THREE.SphereGeometry(1, 96, 64), material);
+  return mesh;
+}
