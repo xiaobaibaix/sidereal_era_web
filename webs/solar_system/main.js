@@ -68,7 +68,9 @@ scene.background = new THREE.Color(0x03040a);
 const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.5, 20000);
 camera.position.set(0, 1600, 3800);
 
-const renderer = new THREE.WebGLRenderer({ antialias: true });
+// powerPreference: 'high-performance' — 在双 GPU 机器(独显+集显)上请求用独显,
+// 否则浏览器默认走集显省电。注意这只是"提示", 最终仍受系统图形设置/驱动控制。
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
 renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
 renderer.setSize(innerWidth, innerHeight);
 document.body.appendChild(renderer.domElement);

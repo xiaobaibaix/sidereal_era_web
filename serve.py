@@ -16,6 +16,7 @@ import json
 import os
 import re
 import sys
+import threading
 import urllib.parse
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -80,8 +81,19 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 if __name__ == "__main__":
     socketserver.TCPServer.allow_reuse_address = True
     os.makedirs(PRESETS, exist_ok=True)
-    with socketserver.TCPServer(("127.0.0.1", PORT), Handler) as httpd:
-        print(f"three_planet 开发服务器: http://localhost:{PORT}/  (presets 可写)")
-        print(f"  行星 App : http://localhost:{PORT}/webs/planet_system/")
-        print(f"  太阳系 App: http://localhost:{PORT}/webs/solar_system/")
-        httpd.serve_forever()
+    httpd = socketserver.TCPServer(("127.0.0.1", PORT), Handler)
+    print(f"three_planet 开发服务器: http://localhost:{PORT}/  (presets 可写)")
+    print(f"  行星 App : http://localhost:{PORT}/webs/planet_system/")
+    print(f"  太阳系 App: http://localhost:{PORT}/webs/solar_system/")
+
+    # Windows 上 serve_forever() 主线程会阻塞在 select(), Ctrl+C 打不断它(经典坑)。
+    # 把服务循环放到后台 daemon 线程, 让主线程停在可被信号中断的 Event.wait() 上,
+    # 这样收到 Ctrl+C 时能立刻抛出 KeyboardInterrupt 并优雅关闭。
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        threading.Event().wait()
+    except KeyboardInterrupt:
+        print("\n收到 Ctrl+C, 正在关闭…")
+    finally:
+        httpd.shutdown()      # 让 serve_forever 循环退出
+        httpd.server_close()  # 关闭监听 socket
