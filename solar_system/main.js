@@ -9,7 +9,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import GUI from 'lil-gui';
 import { Body, NBodySystem } from './nbody.js';
 import { Planet } from '../planet.js';       // 复用主项目的 LOD 地形行星(近距详细表现)
-import { createAtmospherePass } from '../effects.js';   // 复用深度感知大气(止于真实地表)
+import { createAtmospherePass, createCloudPass } from '../effects.js';   // 复用深度感知大气 + 体积云
 
 // ----------------------------------------------------------------------------
 // 星系配置(初始条件; 之后可纳入预设)
@@ -41,8 +41,9 @@ const params = {
   paused: false,
   orbits: true,
   showBelt: true,
-  detail: true,       // 近距切换到 LOD 地形行星
-  detailAtmo: true,   // 近距行星大气壳
+  detail: true,        // 近距 LOD 地形行星(常驻)
+  detailAtmo: true,    // 近距行星大气(总开关)
+  detailClouds: true,  // 近距行星体积云(总开关)
   focus: '恒星',
 };
 
@@ -114,6 +115,7 @@ const sceneRT = makeSceneRT(innerWidth * _spr, innerHeight * _spr);
 const rtPing = makeHDRColorRT(innerWidth * _spr, innerHeight * _spr);
 const rtPong = makeHDRColorRT(innerWidth * _spr, innerHeight * _spr);
 const atmoPass = createAtmospherePass();
+const cloudPass = createCloudPass();       // 体积云(插在 场景→大气 之间; 只给最近一颗启用云的行星跑)
 const OZONE_BASE = new THREE.Vector3(0.0035, 0.010, 0.00045);
 const bodyEdit = { radius: 20 };   // 聚焦天体半径(GUI 编辑用)
 // 大气可调参数(渲染循环每帧读取 → GUI 实时生效)
@@ -124,6 +126,16 @@ const atm = {
   densityFalloff: 6.0, mieFalloff: 16.0, sunIntensity: 22.0, exposure: 1.0,
   shadowSoftness: 0.6, twilight: 0.3, ozone: 1.0, dither: 0.5, steps: 16, lightSteps: 8, aces: true,
 };
+// 近距体积云(每天体独立; 存入 body.cfg.cloud)。云壳在地表上方 [bottomFrac, topFrac]×半径 之间。
+// 只给最近的一颗启用云的行星跑(体积 raymarch 很贵)。freq 会按半径归一(∝1/R)。
+const cloud = {
+  enabled: false,
+  coverage: 0.5, density: 1.2,
+  bottomFrac: 1.012, topFrac: 1.06,
+  freq: 0.06, windSpeed: 0.6,
+  silver: 1.0, powder: 0.6, cloudShadow: 0.7,
+  steps: 24, lightSteps: 6,
+};
 (function initAtmoStatics() {
   const u = atmoPass.uniforms;
   u.uPlanetCenter.value.set(0, 0, 0);
@@ -133,6 +145,8 @@ const atm = {
   u.uTransLUT.value = dummy;
 })();
 const _pv = new THREE.Matrix4();
+const _ivp = new THREE.Matrix4();       // 逆 view-proj(大气/云 pass 共用)
+const _camW = new THREE.Vector3();      // 相机世界坐标(共用)
 const _tintV = new THREE.Vector3();     // 大气色调临时向量(避免每帧分配)
 
 // 把某颗详细行星的大气参数写入大气 pass 的 uniforms(用它自己的渲染位置 + 半径 + atm 配置)。
@@ -155,6 +169,24 @@ function applyAtmoUniforms(u, body, planet, a) {
   u.uTwilight.value = a.twilight;
   u.uSteps.value = a.steps;
   u.uLightSteps.value = a.lightSteps;
+  u.uSunDir.value.copy(starBody.pos).sub(body.pos).normalize();
+}
+
+// 把某颗行星的云参数写入云 pass 的 uniforms(云壳半径按行星半径; 噪声频率 ∝1/R 归一)。
+function applyCloudUniforms(u, body, planet, c) {
+  const R = body.radius;
+  u.uPlanetCenter.value.copy(planet.position);
+  u.uBottom.value = R * c.bottomFrac;
+  u.uTop.value = R * c.topFrac;
+  u.uCoverage.value = c.coverage;
+  u.uDensity.value = c.density;
+  u.uFreq.value = c.freq * 100 / R;         // 主项目在 R=100 调的 0.06 → 按半径归一
+  u.uWindSpeed.value = c.windSpeed;
+  u.uSteps.value = c.steps;
+  u.uLightSteps.value = c.lightSteps;
+  u.uSilver.value = c.silver;
+  u.uPowder.value = c.powder;
+  u.uCloudShadow.value = c.cloudShadow;
   u.uSunDir.value.copy(starBody.pos).sub(body.pos).normalize();
 }
 
@@ -357,6 +389,7 @@ gui.add(params, 'orbits').name('轨道线(完整椭圆)');
 gui.add(params, 'showBelt').name('小行星带/环');
 gui.add(params, 'detail').name('近距地形(LOD, 多行星)');
 gui.add(params, 'detailAtmo').name('近距大气(总开关)');
+gui.add(params, 'detailClouds').name('近距云层(总开关)');
 let focusCtrl = gui.add(params, 'focus', ['恒星']).name('聚焦天体').onChange(onFocusChange);
 const radiusCtrl = gui.add(bodyEdit, 'radius', 2, 300).name('聚焦天体半径').onChange(applyBodyRadius);
 gui.add({ reset: rebuild }, 'reset').name('重置星系');
@@ -453,6 +486,7 @@ const BODY_CFG = {
       colColdWet: [0.20, 0.38, 0.30], colColdDry: [0.55, 0.55, 0.48], colRock: [0.48, 0.47, 0.48], colSnow: [0.97, 0.98, 1.0],
     },
     atm: { enabled: true, scale: 1.08, rayleigh: 1.0, mie: 1.0, tint: [1.0, 1.0, 1.0] },
+    cloud: { enabled: true, coverage: 0.5, density: 1.2 },
   },
   '行星2': {   // 沙漠 / 火星型: 无海洋, 崎岖多山, 铁锈色, 无气候配色
     tune: {
@@ -462,6 +496,7 @@ const BODY_CFG = {
       colRock: [0.52, 0.31, 0.23], colSnow: [0.90, 0.82, 0.75],
     },
     atm: { enabled: true, scale: 1.06, rayleigh: 0.6, mie: 1.4, tint: [1.0, 0.55, 0.30] },
+    cloud: { enabled: true, coverage: 0.28, density: 0.8, topFrac: 1.05 },
   },
   '行星3': {   // 丛林 / 海洋型: 更多海, 葱郁绿, 青色海
     tune: {
@@ -472,6 +507,7 @@ const BODY_CFG = {
       colColdWet: [0.12, 0.40, 0.28], colColdDry: [0.50, 0.55, 0.42], colRock: [0.45, 0.48, 0.42], colSnow: [0.95, 0.98, 0.98],
     },
     atm: { enabled: true, scale: 1.10, rayleigh: 1.3, mie: 0.9, tint: [0.7, 1.0, 0.9] },
+    cloud: { enabled: true, coverage: 0.62, density: 1.4 },
   },
   '卫星1a': {  // 岩石灰月: 无海, 密集陨坑感(高山脉频率), 灰
     tune: {
@@ -504,7 +540,13 @@ const BODY_CFG = {
 
 // ---- 每天体独立配置: GUI 编辑的始终是"当前聚焦天体"的 tune/atm; 切换聚焦时保存旧/载入新 ----
 let editingBody = null;
-function cfgSnapshot() { return { tune: JSON.parse(JSON.stringify(tune)), atm: JSON.parse(JSON.stringify(atm)) }; }
+function cfgSnapshot() {
+  return {
+    tune: JSON.parse(JSON.stringify(tune)),
+    atm: JSON.parse(JSON.stringify(atm)),
+    cloud: JSON.parse(JSON.stringify(cloud)),
+  };
+}
 const DEFAULT_CFG = cfgSnapshot();     // 启动默认(新天体从此开始)
 function cfgRestore(cfg) {
   for (const k in cfg.tune) {
@@ -512,6 +554,7 @@ function cfgRestore(cfg) {
     else tune[k] = cfg.tune[k];
   }
   for (const k in cfg.atm) atm[k] = cfg.atm[k];
+  for (const k in (cfg.cloud || {})) cloud[k] = cfg.cloud[k];
   gui.controllersRecursive().forEach((c) => c.updateDisplay());
 }
 function saveCfg(body) { if (body) body.cfg = cfgSnapshot(); }
@@ -522,16 +565,18 @@ function ensureCfg(body) {
     const cfg = JSON.parse(JSON.stringify(DEFAULT_CFG));
     const ov = BODY_CFG[body.name];
     if (ov) {
-      if (ov.tune) for (const k in ov.tune) cfg.tune[k] = Array.isArray(ov.tune[k]) ? ov.tune[k].slice() : ov.tune[k];
-      if (ov.atm)  for (const k in ov.atm)  cfg.atm[k]  = Array.isArray(ov.atm[k])  ? ov.atm[k].slice()  : ov.atm[k];
+      if (ov.tune)  for (const k in ov.tune)  cfg.tune[k]  = Array.isArray(ov.tune[k])  ? ov.tune[k].slice()  : ov.tune[k];
+      if (ov.atm)   for (const k in ov.atm)   cfg.atm[k]   = Array.isArray(ov.atm[k])   ? ov.atm[k].slice()   : ov.atm[k];
+      if (ov.cloud) for (const k in ov.cloud) cfg.cloud[k] = Array.isArray(ov.cloud[k]) ? ov.cloud[k].slice() : ov.cloud[k];
     }
     body.cfg = cfg;
   }
   return body.cfg;
 }
-// 取某天体生效的配置: 正在编辑(聚焦)的天体用 GUI 里的实时 tune/atm; 其余天体用各自 body.cfg。
-function tuneFor(body) { return (body === editingBody) ? tune : ensureCfg(body).tune; }
-function atmFor(body)  { return (body === editingBody) ? atm  : ensureCfg(body).atm; }
+// 取某天体生效的配置: 正在编辑(聚焦)的天体用 GUI 里的实时 tune/atm/cloud; 其余天体用各自 body.cfg。
+function tuneFor(body)  { return (body === editingBody) ? tune  : ensureCfg(body).tune; }
+function atmFor(body)   { return (body === editingBody) ? atm   : ensureCfg(body).atm; }
+function cloudFor(body) { return (body === editingBody) ? cloud : ensureCfg(body).cloud; }
 function syncFocusCfg(newBody) {
   if (!newBody) return;
   if (editingBody && editingBody !== newBody) saveCfg(editingBody);
@@ -666,6 +711,22 @@ fAtm.add(atm, 'steps', 4, 32, 1).name('视线步数');
 fAtm.add(atm, 'lightSteps', 2, 16, 1).name('太阳步数');
 fAtm.add(atm, 'aces').name('ACES(整屏)');
 
+// 近距体积云(每天体独立; 参数每帧读取 → 实时生效, 无需重建。只给最近一颗启用云的行星跑)
+const fCloud = gui.addFolder('云 (近距)');
+fCloud.add(cloud, 'enabled').name('启用云(本星球)');
+fCloud.add(cloud, 'coverage', 0, 1).name('覆盖率');
+fCloud.add(cloud, 'density', 0.1, 4).name('密度');
+fCloud.add(cloud, 'bottomFrac', 1.0, 1.1).name('云底 ×R');
+fCloud.add(cloud, 'topFrac', 1.01, 1.2).name('云顶 ×R');
+fCloud.add(cloud, 'freq', 0.01, 0.2).name('云块频率');
+fCloud.add(cloud, 'windSpeed', 0, 3).name('风速');
+fCloud.add(cloud, 'silver', 0, 2).name('银边');
+fCloud.add(cloud, 'powder', 0, 1).name('powder暗边');
+fCloud.add(cloud, 'cloudShadow', 0, 1).name('云影投地表');
+fCloud.add(cloud, 'steps', 8, 48, 1).name('视线步数');
+fCloud.add(cloud, 'lightSteps', 2, 12, 1).name('太阳步数');
+fCloud.close();
+
 // 地形调色板(改颜色重建当前近距行星)
 const fCol = gui.addFolder('地形颜色');
 fCol.addColor(tune, 'colOceanShallow').name('浅海').onFinishChange(applyDetailRebuild);
@@ -685,7 +746,7 @@ fCol.close();
 const hud = document.getElementById('hud');
 const clock = new THREE.Clock();
 const FIXED_DT = 0.02;            // 每物理步的模拟时间
-let accum = 0, e0 = null;
+let accum = 0, e0 = null, cloudTime = 0;
 
 addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight;
@@ -701,6 +762,7 @@ addEventListener('resize', () => {
 function animate() {
   requestAnimationFrame(animate);
   const dt = Math.min(clock.getDelta(), 0.05);
+  cloudTime += dt;   // 云飘动时间(不受暂停影响)
 
   if (!params.paused && params.timeScale > 0) {
     accum += dt * params.timeScale;
@@ -719,19 +781,47 @@ function animate() {
   renderer.render(scene, camera);
   renderer.setRenderTarget(null);
 
-  // 深度感知大气 pass: 每颗"启用大气"的详细行星各跑一次(ping-pong 累积), 只有最后一次做 tonemap。
+  // 管线: 场景 → (最近一颗启用云的行星: 云 pass) → 每颗启用大气的行星(ping-pong) → 屏幕(末端 tonemap)。
+  // 逆 view-proj / 相机世界坐标 大气和云都要, 先算一次。
+  _pv.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+  _ivp.copy(_pv).invert();
+  camera.getWorldPosition(_camW);
+
+  // ---- 云 pass: 只给最近的、启用云、且相机够近的一颗行星跑(体积 raymarch 很贵) ----
+  let cloudEntry = null, cloudD = Infinity;
+  if (params.detailClouds) {
+    for (const [body, e] of detailMap) {
+      const c = cloudFor(body);
+      if (!c.enabled) continue;
+      const d = camDistTo(body);
+      if (d < body.radius * ATMO_DIST && d < cloudD) { cloudD = d; cloudEntry = { body, planet: e.planet, c }; }
+    }
+  }
+  let srcTex = sceneRT.texture, srcRT = null;
+  if (cloudEntry) {
+    const cu = cloudPass.uniforms;
+    cu.tDiffuse.value = sceneRT.texture;
+    cu.tDepth.value = sceneRT.depthTexture;
+    cu.uInvViewProj.value.copy(_ivp);
+    cu.uCamPos.value.copy(_camW);
+    cu.uTime.value = cloudTime;
+    applyCloudUniforms(cu, cloudEntry.body, cloudEntry.planet, cloudEntry.c);
+    renderer.setRenderTarget(rtPing);
+    cloudPass.render(renderer);      // 输出线性 HDR(不 tonemap), 交给大气 pass
+    srcTex = rtPing.texture; srcRT = rtPing;
+  }
+
+  // ---- 深度感知大气 pass: 每颗"启用大气"的行星各跑一次(ping-pong 累积), 只有最后一次做 tonemap ----
   const u = atmoPass.uniforms;
   u.tDepth.value = sceneRT.depthTexture;
-  _pv.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
-  u.uInvViewProj.value.copy(_pv).invert();
-  camera.getWorldPosition(u.uCamPos.value);
+  u.uInvViewProj.value.copy(_ivp);
+  u.uCamPos.value.copy(_camW);
   // 整屏末端参数(曝光/tonemap/抖动 用聚焦天体设定)
   u.uExposure.value = atm.exposure;
   u.uTonemap.value = atm.aces ? 1 : 0;
   u.uDither.value = atm.dither;
 
-  // 收集要跑大气的行星: 启用大气 + 相机足够近(远处小圆点不值得全屏 raymarch), 取最近 MAX_ATMO 颗。
-  // (LOD 地形常驻显示, 但大气 pass 才是开销大头 → 只给近处的几颗跑。)
+  // 收集要跑大气的行星: 启用大气 + 相机足够近, 取最近 MAX_ATMO 颗。
   const atmoList = [];
   if (params.detailAtmo) {
     for (const [body, e] of detailMap) {
@@ -745,15 +835,16 @@ function animate() {
   }
 
   if (atmoList.length === 0) {
-    // 无大气: 直通 tonemap 到屏幕
+    // 无大气: 把当前源(场景或云输出)直通 tonemap 到屏幕
     u.uEnabled.value = 0.0;
     u.uToneOut.value = 1.0;
-    u.tDiffuse.value = sceneRT.texture;
+    u.tDiffuse.value = srcTex;
     renderer.setRenderTarget(null);
     atmoPass.render(renderer);
   } else {
-    // 逐行星合成; 中间 pass 输出线性 HDR(uToneOut=0), 最后一次 tonemap 落地屏幕
-    let src = sceneRT.texture;
+    // 逐行星合成; 中间 pass 输出线性 HDR(uToneOut=0), 最后一次 tonemap 落地屏幕。
+    // 每次写到"当前源不在"的那张 RT, 避免读写同一 RT。
+    let src = srcTex, curRT = srcRT;
     for (let i = 0; i < atmoList.length; i++) {
       const last = (i === atmoList.length - 1);
       applyAtmoUniforms(u, atmoList[i].body, atmoList[i].planet, atmoList[i].a);
@@ -763,10 +854,10 @@ function animate() {
         renderer.setRenderTarget(null);
         atmoPass.render(renderer);
       } else {
-        const dst = (i % 2 === 0) ? rtPing : rtPong;   // ping-pong: 不读写同一 RT
+        const dst = (curRT === rtPing) ? rtPong : rtPing;
         renderer.setRenderTarget(dst);
         atmoPass.render(renderer);
-        src = dst.texture;
+        src = dst.texture; curRT = dst;
       }
     }
   }

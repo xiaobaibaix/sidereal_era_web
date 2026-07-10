@@ -441,7 +441,9 @@ export function createCloudPass() {
         // 高度权重: 中间浓、上下柔和渐隐(范围放宽, 过渡更软)
         float heightGrad = smoothstep(0.0, 0.3, h) * (1.0 - smoothstep(0.45, 1.0, h));
 
-        vec3 sp = pos * uFreq + uWind * (uTime * uWindSpeed);
+        // 噪声锚定到行星中心(而非世界原点): 行星在渲染空间移动(如聚焦卫星时浮动原点随卫星公转
+        // 漂移)也不会让云"滑动/沸腾"。主项目行星在原点 → pos-uPlanetCenter==pos, 行为不变。
+        vec3 sp = (pos - uPlanetCenter) * uFreq + uWind * (uTime * uWindSpeed);
         float base;
         if (hi) {
           vec3 w = vec3(fbm(sp * 0.5 + 11.5, 2), fbm(sp * 0.5 + 47.2, 2), fbm(sp * 0.5 + 83.1, 2)) - 0.5;
