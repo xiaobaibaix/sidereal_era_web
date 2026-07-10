@@ -48,6 +48,7 @@ const params = {
   detail: true,        // 近距 LOD 地形行星(常驻)
   detailAtmo: true,    // 近距行星大气(总开关)
   detailClouds: true,  // 近距行星体积云(总开关)
+  wireframe: 'off',    // 线框模式: 'off' 关 / 'current' 仅当前聚焦行星 / 'all' 全部行星
   worldScale: 1,       // 全局尺度: 距离/半径×S, 质量×S³(轨道周期不变) → 试 1e6 米级
   character: false,    // 角色模式: 登陆当前聚焦的地形星球, 第三人称行走
   focus: '恒星',
@@ -443,6 +444,16 @@ gui.add(params, 'showBelt').name('小行星带/环');
 gui.add(params, 'detail').name('近距地形(LOD, 多行星)');
 gui.add(params, 'detailAtmo').name('近距大气(总开关)');
 gui.add(params, 'detailClouds').name('近距云层(总开关)');
+gui.add(params, 'wireframe', { '关闭': 'off', '当前行星': 'current', '全部行星': 'all' }).name('线框模式').onChange(applyWireframe);
+
+// 按线框模式给各详细行星开/关线框: off 全关 / current 仅当前聚焦 / all 全开。气态星无地形网格, 跳过。
+function applyWireframe() {
+  const mode = params.wireframe, fb = focusBody();
+  for (const [b, e] of detailMap) {
+    if (!e.planet) continue;
+    e.planet.setWireframe(mode === 'all' || (mode === 'current' && b === fb));
+  }
+}
 let focusCtrl = gui.add(params, 'focus', ['恒星']).name('聚焦天体').onChange(onFocusChange);
 const radiusCtrl = gui.add(bodyEdit, 'radius', 2, 300).name('聚焦天体半径').onChange(applyBodyRadius);
 gui.add({ reset: rebuild }, 'reset').name('重置星系');
@@ -502,6 +513,8 @@ function setFocus(body) {
   controls.target.set(0, 0, 0);
   controls.update();
   updateGuiForFocus();     // 恒星: 隐藏调参面板; 行星/卫星: 显示
+  if (params.wireframe === 'current') applyWireframe();
+  persistParams();
 }
 
 // 半径滑块与聚焦天体同步 / 应用
@@ -663,8 +676,12 @@ store.bodies = store.bodies || {};      // { 天体名: cfg }  记忆各行星�
 store.presets = store.presets || {};    // { 预设名: cfg }  跨行星复用的配置库
 function persistBody(body) { if (body && body.cfg) { store.bodies[body.name] = body.cfg; lsSave(); } }
 function persistFocused() { if (editingBody) { saveCfg(editingBody); persistBody(editingBody); } }
+// 顶层 Controls 参数也持久化, 免得每次重调。character 是运行态(避免启动即进角色)、不存; radius 是每天体瞬态、不存。
+const PERSIST_PARAMS = ['G', 'timeScale', 'softening', 'paused', 'orbits', 'showBelt', 'detail', 'detailAtmo', 'detailClouds', 'wireframe', 'worldScale', 'focus'];
+function persistParams() { const o = {}; for (const k of PERSIST_PARAMS) o[k] = params[k]; store.params = o; lsSave(); }
+function restoreParams() { if (store.params) for (const k of PERSIST_PARAMS) if (k in store.params) params[k] = store.params[k]; }
 let _persistTimer = 0;
-function persistSoon() { clearTimeout(_persistTimer); _persistTimer = setTimeout(persistFocused, 400); }
+function persistSoon() { clearTimeout(_persistTimer); _persistTimer = setTimeout(() => { persistFocused(); persistParams(); }, 400); }
 
 function cfgRestore(cfg) {
   for (const k in cfg.tune) {
@@ -709,7 +726,7 @@ function syncFocusCfg(newBody) {
   editingBody = newBody;
   loadCfg(newBody);
 }
-function onFocusChange() { if (charMode) exitCharacter(); const b = focusBody(); syncFocusCfg(b); syncBodyEdit(); updateGuiForFocus(); }
+function onFocusChange() { if (charMode) exitCharacter(); const b = focusBody(); syncFocusCfg(b); syncBodyEdit(); updateGuiForFocus(); if (params.wireframe === 'current') applyWireframe(); }
 
 function hashSeed(str) {
   let h = 2166136261;
@@ -794,6 +811,7 @@ function addDetail(body) {
   if (ocean) scene.add(ocean);
   const e = { planet, ocean };
   detailMap.set(body, e);
+  if (params.wireframe === 'all' || (params.wireframe === 'current' && body === focusBody())) planet.setWireframe(true);
   return e;
 }
 function removeDetail(body) {
@@ -1089,7 +1107,7 @@ function updateGuiForFocus() {
 
 // 任意 GUI 改动 → 防抖持久化当前行星配置; 关闭页面前再存一次(记忆功能的兜底)
 gui.onChange(persistSoon);
-addEventListener('beforeunload', persistFocused);
+addEventListener('beforeunload', () => { persistFocused(); persistParams(); });
 
 // ----------------------------------------------------------------------------
 // 主循环: 固定步长物理 + 浮动原点渲染
@@ -1245,5 +1263,8 @@ function animate() {
     hint;
 }
 
-rebuild();
+restoreParams();                 // 恢复上次的 Controls 参数(localStorage) → 无需每次重调
+rebuild();                       // 用恢复后的 G/软化/全局尺度/聚焦 重建星系
+gui.controllersRecursive().forEach((c) => c.updateDisplay());   // 同步所有控件显示为恢复值
+if (params.worldScale !== 1) frameFocus();   // 恢复了非默认尺度: 重新构图, 避免相机卡进放大后的星体
 animate();
