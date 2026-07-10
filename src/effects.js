@@ -8,6 +8,7 @@ export function createOcean() {
     uSunDir: { value: new THREE.Vector3(1, 0.6, 0.8).normalize() },
     uDeep: { value: new THREE.Color(0x0a1e3f) },
     uShallow: { value: new THREE.Color(0x2e78a8) },
+    uAmbient: { value: 0.2 },   // 夜面(背向太阳)海洋的基础亮度: 0=夜面全黑(无环境光), 默认0.2保持主项目原样
   };
   const material = new THREE.ShaderMaterial({
     uniforms,
@@ -27,6 +28,7 @@ export function createOcean() {
       uniform vec3 uSunDir;
       uniform vec3 uDeep;
       uniform vec3 uShallow;
+      uniform float uAmbient;
       varying vec3 vWorldNormal;
       varying vec3 vWorldPos;
       void main() {
@@ -36,9 +38,10 @@ export function createOcean() {
         float fres = pow(1.0 - max(dot(N, V), 0.0), 3.0);
         float diff = max(dot(N, L), 0.0);
         vec3 H = normalize(L + V);
-        float spec = pow(max(dot(N, H), 0.0), 120.0);
+        float spec = pow(max(dot(N, H), 0.0), 120.0) * step(0.0001, diff);   // 高光只在朝阳面
         vec3 col = mix(uDeep, uShallow, fres);
-        col = col * (0.2 + 0.8 * diff) + vec3(1.0, 0.96, 0.85) * spec * 0.9;
+        // 环境项 uAmbient..1: 白天(diff=1)峰值不变; 夜面降到 uAmbient(=0 时全黑, 不再被"环境光"提亮)
+        col = col * (uAmbient + (1.0 - uAmbient) * diff) + vec3(1.0, 0.96, 0.85) * spec * 0.9;
         float alpha = clamp(mix(0.72, 0.96, fres), 0.0, 1.0);
         gl_FragColor = vec4(col, alpha);
       }

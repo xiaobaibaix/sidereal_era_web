@@ -73,7 +73,7 @@ controls.dampingFactor = 0.08;
 controls.minDistance = 20;
 controls.maxDistance = 5e6;
 
-scene.add(new THREE.AmbientLight(0xffffff, 0.28));
+// 不加环境光: 只有太阳(点光源)照亮天体 → 背向太阳的一面是暗的(真实昼夜), 不再被环境光提亮。
 const sunLight = new THREE.PointLight(0xffffff, 3.5, 0, 0);   // decay=0: 全系统可见(P1 不追求光照真实)
 scene.add(sunLight);
 
@@ -680,6 +680,7 @@ function makeOcean(body) {
   const d = t.colOceanDeep, s = t.colOceanShallow;
   ocean.material.uniforms.uDeep.value.setRGB(d[0], d[1], d[2]);
   ocean.material.uniforms.uShallow.value.setRGB(s[0], s[1], s[2]);
+  ocean.material.uniforms.uAmbient.value = 0.0;   // 太阳系: 夜面海洋不加环境光, 背向太阳一侧变暗
   return ocean;
 }
 function disposeOcean(e) {
