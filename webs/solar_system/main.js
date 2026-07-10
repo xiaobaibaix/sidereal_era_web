@@ -395,7 +395,7 @@ function updateRender() {
 // ----------------------------------------------------------------------------
 const gui = new GUI();
 gui.add(params, 'G', 0.2, 8.0).name('引力常数 G').onFinishChange(rebuild);
-gui.add(params, 'timeScale', 0.0, 8.0).name('时间倍率');
+gui.add(params, 'timeScale', 0.0, 30.0, 0.1).name('时间流速(×倍)');
 gui.add(params, 'worldScale', { '×1 (演示)': 1, '×1e2': 100, '×1e3': 1000, '×1e4': 10000, '×1e5 (~1e6 米)': 100000 })
   .name('全局尺度(×S)').onChange(() => { rebuild(); frameFocus(); });
 gui.add(params, 'softening', 0.1, 20).name('软化(防奇点)').onFinishChange(() => { system.softening = params.softening * params.worldScale; });
@@ -428,6 +428,7 @@ function setFocus(body) {
   if (camera.position.lengthSq() > 1e-6) camera.position.setLength(d);
   controls.target.set(0, 0, 0);
   controls.update();
+  updateGuiForFocus();     // 恒星: 隐藏调参面板; 行星/卫星: 显示
 }
 
 // 半径滑块与聚焦天体同步 / 应用
@@ -620,7 +621,7 @@ function syncFocusCfg(newBody) {
   editingBody = newBody;
   loadCfg(newBody);
 }
-function onFocusChange() { const b = focusBody(); syncFocusCfg(b); syncBodyEdit(); }
+function onFocusChange() { const b = focusBody(); syncFocusCfg(b); syncBodyEdit(); updateGuiForFocus(); }
 
 function hashSeed(str) {
   let h = 2166136261;
@@ -928,6 +929,14 @@ function importCfg() {
   inp.click();
 }
 
+// 聚焦恒星时隐藏所有行星调参面板(恒星无需调参); 聚焦行星/卫星时显示。
+function updateGuiForFocus() {
+  const b = focusBody();
+  const showTune = !!b && b.type !== 'star';
+  for (const f of [fLOD, fAtm, fCloud, fCol, fPre]) if (f) (showTune ? f.show() : f.hide());
+  if (radiusCtrl) (showTune ? radiusCtrl.show() : radiusCtrl.hide());
+}
+
 // 任意 GUI 改动 → 防抖持久化当前行星配置; 关闭页面前再存一次(记忆功能的兜底)
 gui.onChange(persistSoon);
 addEventListener('beforeunload', persistFocused);
@@ -937,8 +946,9 @@ addEventListener('beforeunload', persistFocused);
 // ----------------------------------------------------------------------------
 const hud = document.getElementById('hud');
 const clock = new THREE.Clock();
-const FIXED_DT = 0.02;            // 每物理步的模拟时间
-let accum = 0, e0 = null, cloudTime = 0;
+const FIXED_DT = 0.02;            // 物理子步上限(单步最大模拟时间, 保证积分精度)
+const MAX_SUBSTEPS = 40;          // 每帧最多物理子步(极慢帧不追帧, 防螺旋)
+let e0 = null, cloudTime = 0;
 
 addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight;
@@ -957,10 +967,16 @@ function animate() {
   cloudTime += dt;   // 云飘动时间(不受暂停影响)
 
   if (!params.paused && params.timeScale > 0) {
-    accum += dt * params.timeScale;
+    // 半固定步长: 每帧恰好推进"这一帧的模拟时间"(dt×流速), 拆成不超过 FIXED_DT 的子步。
+    // 于是任意流速(尤其慢放)下每帧都平滑推进一点, 不再"攒够一整步才跳一下"的顿挫。
+    let remaining = dt * params.timeScale;
     let steps = 0;
-    while (accum >= FIXED_DT && steps < 12) { system.step(FIXED_DT); accum -= FIXED_DT; steps++; }
-    if (steps >= 12) accum = 0;   // 防止追帧螺旋
+    while (remaining > 1e-6 && steps < MAX_SUBSTEPS) {
+      const h = Math.min(FIXED_DT, remaining);
+      system.step(h);
+      remaining -= h;
+      steps++;
+    }
   }
 
   controls.update();
