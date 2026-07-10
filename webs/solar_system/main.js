@@ -184,7 +184,9 @@ function applyCloudUniforms(u, body, planet, c) {
   u.uBottom.value = R * c.bottomFrac;
   u.uTop.value = R * c.topFrac;
   u.uCoverage.value = c.coverage;
-  u.uDensity.value = c.density;
+  // 云消光 ∝ 密度 × 步长, 而步长 ∝ 半径 ∝ worldScale。除以 S 抵消 → 各尺度的云外观与 S=1 一致。
+  // (否则大尺度下光学深度爆炸: 自阴影 march 饱和归零 → 云只剩灰蓝环境光, 夜/背面泛灰。)
+  u.uDensity.value = c.density / params.worldScale;
   u.uFreq.value = c.freq * 100 / R;         // 主项目在 R=100 调的 0.06 → 按半径归一
   u.uWindSpeed.value = c.windSpeed;
   u.uSteps.value = c.steps;
@@ -394,7 +396,9 @@ function updateRender() {
 const gui = new GUI();
 gui.add(params, 'G', 0.2, 8.0).name('引力常数 G').onFinishChange(rebuild);
 gui.add(params, 'timeScale', 0.0, 8.0).name('时间倍率');
-gui.add(params, 'softening', 0.1, 20).name('软化(防奇点)').onFinishChange(() => { system.softening = params.softening; });
+gui.add(params, 'worldScale', { '×1 (演示)': 1, '×1e2': 100, '×1e3': 1000, '×1e4': 10000, '×1e5 (~1e6 米)': 100000 })
+  .name('全局尺度(×S)').onChange(() => { rebuild(); frameFocus(); });
+gui.add(params, 'softening', 0.1, 20).name('软化(防奇点)').onFinishChange(() => { system.softening = params.softening * params.worldScale; });
 gui.add(params, 'paused').name('暂停');
 gui.add(params, 'orbits').name('轨道线(完整椭圆)');
 gui.add(params, 'showBelt').name('小行星带/环');
@@ -729,6 +733,20 @@ function updateCameraRange() {
   controls.minDistance = fR * 1.02;              // 贴到星表附近
   controls.maxDistance = maxD * 6 + fR * 50;     // 能拉远看全场景
   if (starField) { starField.position.copy(camera.position); starField.scale.setScalar(far * 0.9); }
+}
+
+// 尺度或聚焦变化后, 把相机拉到聚焦天体外一个合适距离(半径×8), 避免相机卡在放大后的星体内部。
+// 关键: 先按新尺度放宽 controls 距离限制, 否则紧随的 controls.update() 会用旧尺度的 min/max 把相机
+// 夹回去(小尺度切大尺度时会被夹进星球内部)。下一帧 updateCameraRange() 会再精修 near/far/min/max。
+function frameFocus() {
+  const fR = focusBody().radius;
+  const d = fR * 8;
+  controls.minDistance = fR * 1.02;
+  controls.maxDistance = Math.max(controls.maxDistance, d * 4);
+  if (camera.position.lengthSq() > 1e-12) camera.position.setLength(d);
+  else camera.position.set(0, d * 0.4, d);
+  controls.target.set(0, 0, 0);
+  controls.update();
 }
 
 // 近距行星 LOD/地形 GUI(LOD 类实时生效; 结构/地形类重建当前近距行星)
