@@ -32,6 +32,67 @@ function pointInTri(p, a, b, c) {
 }
 
 const _testSphere = new THREE.Sphere();   // 剔除测试用的临时包围球(避免每帧分配)
+const _localCam = new THREE.Vector3();    // 相机在行星本地系的位置(支持行星不在原点)
+
+// ============================================================================
+// 共享 Worker 池: 所有 Planet 实例复用同一组 worker。
+// 之前每颗行星各自 spawn/terminate 一批 worker(每个 worker 都要独立 import terrain.js +
+// 从 CDN 拉 simplex-noise), 多行星场景下启动/切换极慢。改为进程级共享池后:
+//   - worker 只在首次用到时创建一次, 全局固定数量;
+//   - 新增/移除行星不再 spawn/terminate worker(消除卡顿与churn);
+//   - 主项目(单行星)行为等同以前。
+class WorkerPool {
+  constructor(count) {
+    this.count = count;
+    this.workers = [];
+    this.queue = [];            // 待派发 job
+    this.jobs = new Map();      // id → job(队列中 + 运行中)
+    this.nextId = 1;
+    for (let i = 0; i < count; i++) {
+      const w = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
+      w.busy = false;
+      w.onmessage = (e) => this._onDone(w, e.data);
+      this.workers.push(w);
+    }
+  }
+  submit(job) {                 // job: { msg, onDispatch, onDone, cancelled, state }
+    job.id = this.nextId++;
+    job.msg.id = job.id;
+    job.state = 'queued';
+    this.jobs.set(job.id, job);
+    this.queue.push(job);
+    this._pump();
+    return job.id;
+  }
+  _pump() {
+    for (const w of this.workers) {
+      while (!w.busy && this.queue.length > 0) {
+        const job = this.queue.shift();
+        if (job.cancelled) { this.jobs.delete(job.id); continue; }
+        w.busy = true;
+        job.state = 'inflight';
+        if (job.onDispatch) job.onDispatch();
+        w.postMessage(job.msg);
+      }
+    }
+  }
+  _onDone(w, data) {
+    w.busy = false;
+    const job = this.jobs.get(data.id);
+    this.jobs.delete(data.id);
+    if (job && job.onDone) job.onDone(data);
+    this._pump();
+  }
+}
+
+let _pool = null;
+function getPool() {
+  if (!_pool) {
+    const n = Math.max(2, Math.min((navigator.hardwareConcurrency || 4) - 1, 8));
+    _pool = new WorkerPool(n);
+  }
+  return _pool;
+}
 
 // ============================================================================
 export class Planet extends THREE.Group {
@@ -51,26 +112,14 @@ export class Planet extends THREE.Group {
     this._colorCb = (h, x, y, z) => this.colorFor(h, x, y, z);
 
     this._gen = 0;
-    this._queue = [];
-    this._pending = new Map();
-    this._nextId = 1;
+    this._pool = getPool();     // 共享 worker 池
+    this._queued = 0;           // 本行星在池队列中的 job 数(HUD)
+    this._inflight = 0;         // 本行星正在 worker 上的 job 数(HUD)
     this._camPos = [1e9, 1e9, 1e9];
     this._camMoved = true;   // 相机移动时才重算缝合步长(静止时跳过, 省开销)
 
-    this._initWorkers();
     this._buildNoise();
     this._buildRoots();
-  }
-
-  _initWorkers() {
-    const count = Math.max(2, Math.min((navigator.hardwareConcurrency || 4) - 1, 8));
-    this.workers = [];
-    for (let i = 0; i < count; i++) {
-      const w = new Worker(new URL('./worker.js', import.meta.url), { type: 'module' });
-      w.busy = false;
-      w.onmessage = (e) => this._onWorkerDone(w, e.data);
-      this.workers.push(w);
-    }
   }
 
   // 从 params 快照出地形相关字段(传给 worker + 构建主线程 terrain)
@@ -169,55 +218,53 @@ export class Planet extends THREE.Group {
     return this._arraysToMesh(a);
   }
 
-  // ---- Worker 请求调度(带缝合参数 + 重生成) ----
+  // ---- Worker 请求调度(共享池; 带缝合参数 + 重生成) ----
   requestMesh(node, strides, key) {
     if (node.pending) return;
     if (node.mesh && node._builtKey === key) return;
     node.pending = true; node._cancelled = false; node._reqStrides = strides; node._reqKey = key;
-    this._queue.push(node);
-    this._pump();
-  }
-
-  _pump() {
-    for (const w of this.workers) {
-      while (!w.busy && this._queue.length > 0) {
-        const node = this._queue.shift();
-        if (node._cancelled || (node.mesh && node._builtKey === node._reqKey)) { node.pending = false; continue; }
-        this._dispatch(w, node);
-      }
-    }
-  }
-
-  _dispatch(w, node) {
-    const id = this._nextId++;
-    node._id = id;
-    this._pending.set(id, node);
-    w.busy = true;
     const p = this.params;
-    w.postMessage({
-      id, gen: this._gen,
-      A: [node.A.x, node.A.y, node.A.z], B: [node.B.x, node.B.y, node.B.z], C: [node.C.x, node.C.y, node.C.z],
-      N: p.patchResolution, R: p.radius, maxHeight: p.maxHeight,
-      strides: node._reqStrides,
-      terrain: this._terrainParams(),
-    });
+    const job = {
+      msg: {
+        gen: this._gen,
+        A: [node.A.x, node.A.y, node.A.z], B: [node.B.x, node.B.y, node.B.z], C: [node.C.x, node.C.y, node.C.z],
+        N: p.patchResolution, R: p.radius, maxHeight: p.maxHeight,
+        strides: node._reqStrides,
+        terrain: this._terrainParams(),
+      },
+      cancelled: false,
+      onDispatch: () => { this._queued--; this._inflight++; },
+      onDone: (data) => {         // 只有派发过(inflight)的 job 才会收到 onDone
+        this._inflight--;
+        node._job = null;
+        if (!job.cancelled) this._onMesh(node, data);
+      },
+    };
+    node._job = job;
+    this._queued++;
+    this._pool.submit(job);
   }
 
-  _onWorkerDone(w, data) {
-    w.busy = false;
-    const node = this._pending.get(data.id);
-    this._pending.delete(data.id);
-    if (node && !node._cancelled && data.gen === this._gen) {
+  // 取消某节点尚未完成的 job(dispose/rebuild 时)。队列中的立即扣计数; 运行中的等 onDone 扣。
+  _cancelJob(node) {
+    const job = node._job;
+    if (!job || job.cancelled) return;
+    job.cancelled = true;
+    if (job.state === 'queued') this._queued--;   // 运行中: onDone 会扣 inflight
+    node._job = null;
+  }
+
+  _onMesh(node, data) {
+    if (!node._cancelled && data.gen === this._gen) {
       const newMesh = this._arraysToMesh(data);
       const wasVisible = node.mesh ? node.mesh.visible : false;
       if (node.mesh) this._disposeMesh(node.mesh);   // 重生成: 换掉旧网格
       newMesh.visible = wasVisible;
       node.mesh = newMesh;
       node._builtKey = node._reqKey;
-      node.pending = false;
       if (this._wire) this._ensureWire(newMesh);
     }
-    this._pump();
+    node.pending = false;
   }
 
   _count(node) {
@@ -227,22 +274,21 @@ export class Planet extends THREE.Group {
 
   update(camera) {
     camera.updateMatrixWorld();
-    const cp = camera.position;
+    // 相机在行星本地系的位置(行星在原点时 this.position=0, cp=camera.position, 主项目行为不变)
+    const cp = _localCam.copy(camera.position).sub(this.position);
     this._camMoved = (Math.abs(cp.x - this._camPos[0]) + Math.abs(cp.y - this._camPos[1]) + Math.abs(cp.z - this._camPos[2])) > 1e-3;
     this._camPos[0] = cp.x; this._camPos[1] = cp.y; this._camPos[2] = cp.z;
     const m = new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
     const frustum = new THREE.Frustum().setFromProjectionMatrix(m);
     this.stats.patches = 0; this.stats.triangles = 0;
-    for (const r of this.roots) r.selectLOD(camera.position, frustum, this);
-    this.stats.queued = this._queue.length;
-    let busy = 0; for (const w of this.workers) if (w.busy) busy++;
-    this.stats.inflight = busy;
+    for (const r of this.roots) r.selectLOD(cp, frustum, this);
+    this.stats.queued = this._queued;
+    this.stats.inflight = this._inflight;
   }
 
   rebuild() {
     this._gen++;
-    for (const r of this.roots) r.dispose(this);
-    this._queue.length = 0;
+    for (const r of this.roots) r.dispose(this);   // 取消未完成 job(gen 变化后旧结果也会被丢弃)
     this.clear();
     this._camMoved = true;
     this._buildNoise();
@@ -349,7 +395,8 @@ class QNode {
     // 近处(预细分球内)不受视锥限制, 始终按距离细分 —— 避免原地环视时背后需要现补细分。
     // 远处用带余量(margin)的视锥测试 —— 屏幕外预留一圈已细分好, 减少旋转时的 pop-in。
     if (d >= planet.params.nearRadius) {
-      _testSphere.center.copy(this.centerWorld);
+      // frustum 在世界系, centerWorld 是本地系 → 加 planet.position 转世界(原点时不变)
+      _testSphere.center.copy(this.centerWorld).add(planet.position);
       _testSphere.radius = this.bsphere.radius + d * planet.params.frustumMargin;
       if (!frustum.intersectsSphere(_testSphere)) { this._hideSubtree(); return true; }
     }
@@ -410,7 +457,7 @@ class QNode {
 
   dispose(planet) {
     if (this.mesh) { planet._disposeMesh(this.mesh); this.mesh = null; }
-    if (this.pending) { this._cancelled = true; this.pending = false; }
+    if (this.pending) { this._cancelled = true; this.pending = false; planet._cancelJob(this); }
     if (this.children) { for (const c of this.children) c.dispose(planet); this.children = null; }
   }
 }

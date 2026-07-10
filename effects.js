@@ -80,6 +80,7 @@ export function createAtmospherePass() {
     uMieG: { value: 0.76 },           // 米氏前向峰
     uSunIntensity: { value: 22.0 },
     uExposure: { value: 1.0 },
+    uToneOut: { value: 1.0 },         // 1=末端 tonemap+sRGB(单次/最后一次 pass); 0=输出线性HDR(多行星 ping-pong 中间 pass)
     uSteps: { value: 16 },            // 视线积分步数
     uLightSteps: { value: 8 },        // 太阳方向外散射步数
     uShadowSoftness: { value: 0.6 },  // 晨昏过渡带宽度
@@ -123,6 +124,7 @@ export function createAtmospherePass() {
       uniform float uMieG;
       uniform float uSunIntensity;
       uniform float uExposure;
+      uniform float uToneOut;
       uniform int   uSteps;
       uniform int   uLightSteps;
       uniform float uShadowSoftness;   // 晨昏过渡带宽度
@@ -157,6 +159,8 @@ export function createAtmospherePass() {
         vec3 m = (uTonemap == 1) ? acesFilm(c) : (c / (1.0 + c));  // ACES 或 Reinhard
         return linearToSRGB(m);
       }
+      // 输出: uToneOut=1 落地到屏幕(tonemap+sRGB); =0 输出线性 HDR(多行星 ping-pong 中间 pass, 留到最后一次再 tonemap)
+      vec3 outColor(vec3 c) { return (uToneOut > 0.5) ? tonemap(c) : c; }
 
       // 射线与球求交, 返回 (near, far); 未命中返回 near>far。rd 需归一化(a=1)。
       vec2 raySphere(vec3 ro, vec3 rd, vec3 ce, float r) {
@@ -218,7 +222,7 @@ export function createAtmospherePass() {
 
       void main() {
         vec3 sceneColor = texture2D(tDiffuse, vUv).rgb;   // 线性 HDR
-        if (uEnabled < 0.5) { gl_FragColor = vec4(tonemap(sceneColor), 1.0); return; }
+        if (uEnabled < 0.5) { gl_FragColor = vec4(outColor(sceneColor), 1.0); return; }
 
         // 从深度重建视线方向与场景距离
         vec2 ndc = vUv * 2.0 - 1.0;
@@ -237,13 +241,13 @@ export function createAtmospherePass() {
         vec2 atmo = raySphere(ro, rd, uPlanetCenter, uRatmo);
         float tNear = max(atmo.x, 0.0);
         float tFar  = atmo.y;
-        if (tFar <= tNear) { gl_FragColor = vec4(tonemap(sceneColor), 1.0); return; }
+        if (tFar <= tNear) { gl_FragColor = vec4(outColor(sceneColor), 1.0); return; }
 
         // 止于真实地表(深度)或海平面球(海洋不写深度, 用解析球兜底)
         tFar = min(tFar, sceneDist);
         vec2 gnd = raySphere(ro, rd, uPlanetCenter, uRground);
         if (gnd.x > 0.0 && gnd.y > gnd.x) tFar = min(tFar, gnd.x);
-        if (tFar <= tNear) { gl_FragColor = vec4(tonemap(sceneColor), 1.0); return; }
+        if (tFar <= tNear) { gl_FragColor = vec4(outColor(sceneColor), 1.0); return; }
 
         int N = uSteps;
         float step = (tFar - tNear) / float(N);
@@ -299,7 +303,7 @@ export function createAtmospherePass() {
         vec3 Tview = exp(-(uScatterR * odView.x + uScatterM * 1.1 * odView.y + uOzone * odView.z));
         vec3 color = sceneColor * Tview + inscatter;
 
-        gl_FragColor = vec4(tonemap(color), 1.0);   // 曝光 + ACES/Reinhard + sRGB
+        gl_FragColor = vec4(outColor(color), 1.0);   // 末端 tonemap(或多行星中间 pass 输出线性HDR)
       }
     `,
   });

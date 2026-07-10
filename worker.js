@@ -4,12 +4,17 @@
 import { buildPatchArrays } from './patchgeom.js';
 import { makeTerrain } from './terrain.js';
 
-// 按地形参数缓存 terrain, 避免每条消息重建噪声
-let _tkey = null, _terrain = null;
+// 按地形参数缓存 terrain(小型 LRU), 避免每条消息重建噪声。
+// 共享 worker 池会交错处理多颗行星的任务 → 需缓存多份, 否则每次切换行星都重建。
+const _cache = new Map();   // key(JSON) → terrain
 function getTerrain(tp) {
   const k = JSON.stringify(tp);
-  if (k !== _tkey) { _terrain = makeTerrain(tp); _tkey = k; }
-  return _terrain;
+  let t = _cache.get(k);
+  if (t) { _cache.delete(k); _cache.set(k, t); return t; }   // 命中: 提到最新
+  t = makeTerrain(tp);
+  _cache.set(k, t);
+  if (_cache.size > 6) _cache.delete(_cache.keys().next().value);   // 超限丢最旧
+  return t;
 }
 
 self.onmessage = (ev) => {

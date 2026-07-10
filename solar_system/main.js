@@ -100,13 +100,26 @@ function makeSceneRT(w, h) {
   rt.depthTexture.type = THREE.UnsignedIntType;
   return rt;
 }
+// 仅颜色的 HDR 半浮点 RT(多行星大气 ping-pong 中间缓冲; 无需深度, 大气 pass depthTest=false)
+function makeHDRColorRT(w, h) {
+  const rt = new THREE.WebGLRenderTarget(Math.max(1, w), Math.max(1, h), {
+    minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+    type: THREE.HalfFloatType, depthBuffer: false,
+  });
+  rt.texture.colorSpace = THREE.LinearSRGBColorSpace;
+  return rt;
+}
 const _spr = renderer.getPixelRatio();
 const sceneRT = makeSceneRT(innerWidth * _spr, innerHeight * _spr);
+const rtPing = makeHDRColorRT(innerWidth * _spr, innerHeight * _spr);
+const rtPong = makeHDRColorRT(innerWidth * _spr, innerHeight * _spr);
 const atmoPass = createAtmospherePass();
 const OZONE_BASE = new THREE.Vector3(0.0035, 0.010, 0.00045);
 const bodyEdit = { radius: 20 };   // 聚焦天体半径(GUI 编辑用)
 // 大气可调参数(渲染循环每帧读取 → GUI 实时生效)
 const atm = {
+  enabled: true,      // 本星球是否启用大气(每天体独立; 存入 body.cfg.atm)
+  tint: [1, 1, 1],    // 大气色调(乘到瑞利系数上; 0..1, 用来做暖色/冷色天空)
   scale: 1.08, rayleigh: 1.0, mie: 1.0, mieG: 0.76,
   densityFalloff: 6.0, mieFalloff: 16.0, sunIntensity: 22.0, exposure: 1.0,
   shadowSoftness: 0.6, twilight: 0.3, ozone: 1.0, dither: 0.5, steps: 16, lightSteps: 8, aces: true,
@@ -120,6 +133,30 @@ const atm = {
   u.uTransLUT.value = dummy;
 })();
 const _pv = new THREE.Matrix4();
+const _tintV = new THREE.Vector3();     // 大气色调临时向量(避免每帧分配)
+
+// 把某颗详细行星的大气参数写入大气 pass 的 uniforms(用它自己的渲染位置 + 半径 + atm 配置)。
+// 散射系数 ∝ 1/半径 → 不同尺度的行星大气厚度自动归一。
+function applyAtmoUniforms(u, body, planet, a) {
+  const R = body.radius;
+  u.uPlanetCenter.value.copy(planet.position);   // 渲染空间的行星中心(= body.pos - _off)
+  u.uEnabled.value = 1.0;
+  u.uRground.value = R;
+  u.uRatmo.value = R * a.scale;
+  const t = a.tint || [1, 1, 1];
+  u.uScatterR.value.copy(RAY_ATMO).multiplyScalar(8.0 / R * a.rayleigh).multiply(_tintV.set(t[0], t[1], t[2]));
+  u.uScatterM.value = 3.0 / R * a.mie;
+  u.uOzone.value.copy(OZONE_BASE).multiplyScalar(100.0 / R * a.ozone);
+  u.uMieG.value = a.mieG;
+  u.uDensityFalloff.value = a.densityFalloff;
+  u.uMieFalloff.value = a.mieFalloff;
+  u.uSunIntensity.value = a.sunIntensity;
+  u.uShadowSoftness.value = a.shadowSoftness;
+  u.uTwilight.value = a.twilight;
+  u.uSteps.value = a.steps;
+  u.uLightSteps.value = a.lightSteps;
+  u.uSunDir.value.copy(starBody.pos).sub(body.pos).normalize();
+}
 
 // ----------------------------------------------------------------------------
 // 系统构建
@@ -229,7 +266,7 @@ function buildMeshes() {
 }
 
 function rebuild() {
-  clearDetail();
+  clearAllDetail();
   disposeMeshes();
   buildSystem();
   buildParticles();
@@ -288,7 +325,7 @@ function updateRender() {
   _off.copy(focusBody().pos);
   for (const e of entries) {
     e.mesh.position.copy(e.body.pos).sub(_off);
-    e.mesh.visible = (e.body !== detailBody);   // 详细行星显示时隐藏对应简单球
+    e.mesh.visible = !detailMap.has(e.body);   // 详细行星显示时隐藏对应简单球
     if (e.line) e.line.visible = params.orbits && writeOrbit(e.body, e.line);
   }
   // 小行星带 / 环粒子(相对浮动原点)
@@ -318,25 +355,26 @@ gui.add(params, 'softening', 0.1, 20).name('软化(防奇点)').onFinishChange((
 gui.add(params, 'paused').name('暂停');
 gui.add(params, 'orbits').name('轨道线(完整椭圆)');
 gui.add(params, 'showBelt').name('小行星带/环');
-gui.add(params, 'detail').name('近距地形(LOD)');
-gui.add(params, 'detailAtmo').name('近距大气');
-let focusCtrl = gui.add(params, 'focus', ['恒星']).name('聚焦天体').onChange(syncBodyEdit);
+gui.add(params, 'detail').name('近距地形(LOD, 多行星)');
+gui.add(params, 'detailAtmo').name('近距大气(总开关)');
+let focusCtrl = gui.add(params, 'focus', ['恒星']).name('聚焦天体').onChange(onFocusChange);
 const radiusCtrl = gui.add(bodyEdit, 'radius', 2, 300).name('聚焦天体半径').onChange(applyBodyRadius);
 gui.add({ reset: rebuild }, 'reset').name('重置星系');
 gui.add({ recenter: () => { controls.target.set(0, 0, 0); } }, 'recenter').name('相机对准聚焦');
 
 function refreshFocusOptions() {
   const names = system.bodies.map((b) => b.name);
-  focusCtrl = focusCtrl.options(names).name('聚焦天体').onChange(syncBodyEdit);
+  focusCtrl = focusCtrl.options(names).name('聚焦天体').onChange(onFocusChange);
   if (!names.includes(params.focus)) params.focus = names[0];
+  editingBody = null;                 // 旧天体已失效, 不回存
   focusCtrl.setValue(params.focus);
-  syncBodyEdit();
+  onFocusChange();                    // 载入当前聚焦天体的配置
 }
 
 // 设置观察中心(聚焦天体), 相机自动对准并拉到合适距离
 function setFocus(body) {
   params.focus = body.name;
-  focusCtrl.setValue(body.name);
+  syncFocusCfg(body);     // 保存旧天体配置 + 载入该天体配置(并刷新所有 GUI 显示, 含聚焦下拉)
   syncBodyEdit();
   const d = THREE.MathUtils.clamp(body.radius * 8, controls.minDistance, controls.maxDistance);
   if (camera.position.lengthSq() > 1e-6) camera.position.setLength(d);
@@ -353,9 +391,10 @@ function syncBodyEdit() {
 function applyBodyRadius() {
   const b = focusBody(); if (!b) return;
   b.radius = bodyEdit.radius;
-  const e = entries.find((en) => en.body === b);
-  if (e) { e.mesh.geometry.dispose(); e.mesh.geometry = new THREE.SphereGeometry(b.radius, 32, 24); }
-  if (detailBody === b) setDetail(b);   // 重建近距地形以匹配新半径
+  const e0 = entries.find((en) => en.body === b);
+  if (e0) { e0.mesh.geometry.dispose(); e0.mesh.geometry = new THREE.SphereGeometry(b.radius, 32, 24); }
+  const e = detailMap.get(b);
+  if (e) { Object.assign(e.planet.params, planetParamsFor(b)); e.planet.rebuild(); }   // 重建近距地形以匹配新半径
 }
 
 // 点击天体切换观察中心(区分点击/拖动)
@@ -380,12 +419,19 @@ renderer.domElement.addEventListener('pointerup', (e) => {
 // ----------------------------------------------------------------------------
 // 近距详细表现: 靠近聚焦天体时, 用主项目的 LOD 地形行星替代简单球(在原点=浮动原点中心)
 // ----------------------------------------------------------------------------
-let detailPlanet = null, detailBody = null;
+// 多行星: body → { planet }。相机附近的若干颗天体各建一个详细 LOD 行星(每颗用自己的 cfg)。
+const detailMap = new Map();
+// 每个非恒星天体都常驻一个 LOD 行星: 远离时 LOD 自然降到最低细分(粗糙带地形色的球),
+// 不再切换成光滑简单球。大气 pass 才按距离限流(只给最近的几颗跑, 控制开销)。
+const ATMO_DIST = 60;        // 大气可见范围: 相机距 < 半径 × 此值才跑大气 pass
+const MAX_ATMO = 2;          // 同时最多跑几颗行星的大气 pass(每颗一次全屏 raymarch)
+const _tmpV = new THREE.Vector3();
 
-// 近距行星的共享 LOD/地形调参(所有近距行星共用; 地形种子仍按天体名区分)
+// 近距行星的默认 LOD/地形调参(新天体从此拷贝一份到 body.cfg; 地形种子按天体名区分)。
+// GUI 编辑的始终是"当前聚焦天体"的这份 tune, 切换聚焦时保存旧/载入新。
 const tune = {
   maxLevel: 8, splitFactor: 2.5, patchResolution: 16, frustumMargin: 0.15,
-  nearRadiusFrac: 0.5, maxHeightFrac: 0.03,
+  nearRadiusFrac: 0.5, maxHeightFrac: 0.03, seaLevel: 0.0,
   continentFreq: 1.2, continentOctaves: 5, mountainFreq: 3.0, mountainStrength: 0.6,
   warpStrength: 0.2, plateStrength: 0.5, useClimate: true,
   // 地形调色板([r,g,b] 0..1, lil-gui addColor 原地编辑)
@@ -395,71 +441,193 @@ const tune = {
   colRock: [0.50, 0.50, 0.52], colSnow: [0.97, 0.97, 1.0],
 };
 
+// 每颗天体的初始配置(按名字覆盖 DEFAULT_CFG 里对应的键)。让不同星球一眼就不一样:
+// 地球型 / 沙漠火星型 / 丛林海洋型 + 岩石月 / 冰月 / 尘土月。用户仍可在 GUI 里各自继续调。
+const BODY_CFG = {
+  '行星1': {   // 地球型: 海陆分明, 气候配色
+    tune: {
+      seaLevel: 0.03, maxHeightFrac: 0.03, continentFreq: 1.2, mountainFreq: 3.0, mountainStrength: 0.6,
+      warpStrength: 0.25, plateStrength: 0.6, useClimate: true,
+      colOceanShallow: [0.20, 0.50, 0.66], colOceanDeep: [0.02, 0.10, 0.28],
+      colBeach: [0.85, 0.80, 0.58], colWet: [0.12, 0.45, 0.15], colDry: [0.76, 0.70, 0.42],
+      colColdWet: [0.20, 0.38, 0.30], colColdDry: [0.55, 0.55, 0.48], colRock: [0.48, 0.47, 0.48], colSnow: [0.97, 0.98, 1.0],
+    },
+    atm: { enabled: true, scale: 1.08, rayleigh: 1.0, mie: 1.0, tint: [1.0, 1.0, 1.0] },
+  },
+  '行星2': {   // 沙漠 / 火星型: 无海洋, 崎岖多山, 铁锈色, 无气候配色
+    tune: {
+      seaLevel: -0.6, maxHeightFrac: 0.05, continentFreq: 0.9, mountainFreq: 4.5, mountainStrength: 0.95,
+      warpStrength: 0.35, plateStrength: 0.85, useClimate: false,
+      colBeach: [0.75, 0.52, 0.33], colWet: [0.70, 0.42, 0.26], colDry: [0.66, 0.40, 0.24],
+      colRock: [0.52, 0.31, 0.23], colSnow: [0.90, 0.82, 0.75],
+    },
+    atm: { enabled: true, scale: 1.06, rayleigh: 0.6, mie: 1.4, tint: [1.0, 0.55, 0.30] },
+  },
+  '行星3': {   // 丛林 / 海洋型: 更多海, 葱郁绿, 青色海
+    tune: {
+      seaLevel: 0.10, maxHeightFrac: 0.025, continentFreq: 1.5, mountainFreq: 2.5, mountainStrength: 0.5,
+      warpStrength: 0.30, plateStrength: 0.4, useClimate: true,
+      colOceanShallow: [0.14, 0.55, 0.58], colOceanDeep: [0.02, 0.16, 0.28],
+      colBeach: [0.85, 0.83, 0.60], colWet: [0.05, 0.50, 0.12], colDry: [0.45, 0.55, 0.20],
+      colColdWet: [0.12, 0.40, 0.28], colColdDry: [0.50, 0.55, 0.42], colRock: [0.45, 0.48, 0.42], colSnow: [0.95, 0.98, 0.98],
+    },
+    atm: { enabled: true, scale: 1.10, rayleigh: 1.3, mie: 0.9, tint: [0.7, 1.0, 0.9] },
+  },
+  '卫星1a': {  // 岩石灰月: 无海, 密集陨坑感(高山脉频率), 灰
+    tune: {
+      seaLevel: -1.0, maxHeightFrac: 0.06, continentFreq: 2.0, mountainFreq: 6.5, mountainStrength: 1.0,
+      warpStrength: 0.15, plateStrength: 0.9, useClimate: false,
+      colBeach: [0.42, 0.42, 0.44], colWet: [0.46, 0.46, 0.48], colDry: [0.50, 0.50, 0.52],
+      colRock: [0.34, 0.34, 0.36], colSnow: [0.70, 0.70, 0.72],
+    },
+    atm: { enabled: false },
+  },
+  '卫星2a': {  // 冰月: 平滑, 冰蓝白
+    tune: {
+      seaLevel: -0.2, maxHeightFrac: 0.02, continentFreq: 1.0, mountainFreq: 3.5, mountainStrength: 0.3,
+      warpStrength: 0.10, plateStrength: 0.3, useClimate: false,
+      colBeach: [0.78, 0.84, 0.90], colWet: [0.72, 0.80, 0.88], colDry: [0.80, 0.85, 0.90],
+      colRock: [0.60, 0.68, 0.78], colSnow: [0.96, 0.98, 1.0],
+    },
+    atm: { enabled: false },
+  },
+  '卫星2b': {  // 尘土月: 无海, 土褐
+    tune: {
+      seaLevel: -1.0, maxHeightFrac: 0.05, continentFreq: 1.6, mountainFreq: 5.0, mountainStrength: 0.8,
+      warpStrength: 0.20, plateStrength: 0.7, useClimate: false,
+      colBeach: [0.60, 0.52, 0.40], colWet: [0.55, 0.48, 0.36], colDry: [0.62, 0.55, 0.42],
+      colRock: [0.44, 0.38, 0.30], colSnow: [0.75, 0.72, 0.64],
+    },
+    atm: { enabled: false },
+  },
+};
+
+// ---- 每天体独立配置: GUI 编辑的始终是"当前聚焦天体"的 tune/atm; 切换聚焦时保存旧/载入新 ----
+let editingBody = null;
+function cfgSnapshot() { return { tune: JSON.parse(JSON.stringify(tune)), atm: JSON.parse(JSON.stringify(atm)) }; }
+const DEFAULT_CFG = cfgSnapshot();     // 启动默认(新天体从此开始)
+function cfgRestore(cfg) {
+  for (const k in cfg.tune) {
+    if (Array.isArray(tune[k])) { tune[k].length = 0; tune[k].push(...cfg.tune[k]); }  // 原地改, 保留数组引用(GUI addColor 绑定)
+    else tune[k] = cfg.tune[k];
+  }
+  for (const k in cfg.atm) atm[k] = cfg.atm[k];
+  gui.controllersRecursive().forEach((c) => c.updateDisplay());
+}
+function saveCfg(body) { if (body) body.cfg = cfgSnapshot(); }
+function loadCfg(body) { ensureCfg(body); cfgRestore(body.cfg); }
+// 首次访问某天体时, 从 DEFAULT_CFG 拷一份, 再叠加 BODY_CFG[名字] 的预设覆盖(不同星球初始就不一样)
+function ensureCfg(body) {
+  if (!body.cfg) {
+    const cfg = JSON.parse(JSON.stringify(DEFAULT_CFG));
+    const ov = BODY_CFG[body.name];
+    if (ov) {
+      if (ov.tune) for (const k in ov.tune) cfg.tune[k] = Array.isArray(ov.tune[k]) ? ov.tune[k].slice() : ov.tune[k];
+      if (ov.atm)  for (const k in ov.atm)  cfg.atm[k]  = Array.isArray(ov.atm[k])  ? ov.atm[k].slice()  : ov.atm[k];
+    }
+    body.cfg = cfg;
+  }
+  return body.cfg;
+}
+// 取某天体生效的配置: 正在编辑(聚焦)的天体用 GUI 里的实时 tune/atm; 其余天体用各自 body.cfg。
+function tuneFor(body) { return (body === editingBody) ? tune : ensureCfg(body).tune; }
+function atmFor(body)  { return (body === editingBody) ? atm  : ensureCfg(body).atm; }
+function syncFocusCfg(newBody) {
+  if (!newBody) return;
+  if (editingBody && editingBody !== newBody) saveCfg(editingBody);
+  editingBody = newBody;
+  loadCfg(newBody);
+}
+function onFocusChange() { const b = focusBody(); syncFocusCfg(b); syncBodyEdit(); }
+
 function hashSeed(str) {
   let h = 2166136261;
   for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }
   return (h >>> 0) % 99999;
 }
 function planetParamsFor(body) {
+  const t = tuneFor(body);          // 每颗行星用自己的配置(聚焦天体用 GUI 实时值)
   const s = hashSeed(body.name);
   return {
-    radius: body.radius, maxHeight: body.radius * tune.maxHeightFrac, seaLevel: 0.0,
-    patchResolution: tune.patchResolution, maxLevel: tune.maxLevel, splitFactor: tune.splitFactor,
-    nearRadius: body.radius * tune.nearRadiusFrac, frustumMargin: tune.frustumMargin,
-    continentSeed: s, continentFreq: tune.continentFreq, continentOctaves: tune.continentOctaves,
+    radius: body.radius, maxHeight: body.radius * t.maxHeightFrac, seaLevel: t.seaLevel,
+    patchResolution: t.patchResolution, maxLevel: t.maxLevel, splitFactor: t.splitFactor,
+    nearRadius: body.radius * t.nearRadiusFrac, frustumMargin: t.frustumMargin,
+    continentSeed: s, continentFreq: t.continentFreq, continentOctaves: t.continentOctaves,
     continentGain: 0.5, continentLacunarity: 2.0,
-    mountainSeed: s + 11, mountainFreq: tune.mountainFreq, mountainOctaves: 5, mountainStrength: tune.mountainStrength,
-    warpSeed: s + 23, warpStrength: tune.warpStrength, warpFreq: 1.0,
-    plateSeed: s + 37, plateFreq: 1.6, plateStrength: tune.plateStrength,
-    moistureSeed: s + 51, moistureFreq: 1.2, useClimate: tune.useClimate, climateAltRange: 1.0,
-    colOceanShallow: tune.colOceanShallow, colOceanDeep: tune.colOceanDeep,
-    colBeach: tune.colBeach, colDry: tune.colDry, colWet: tune.colWet,
-    colColdDry: tune.colColdDry, colColdWet: tune.colColdWet,
-    colRock: tune.colRock, colSnow: tune.colSnow,
+    mountainSeed: s + 11, mountainFreq: t.mountainFreq, mountainOctaves: 5, mountainStrength: t.mountainStrength,
+    warpSeed: s + 23, warpStrength: t.warpStrength, warpFreq: 1.0,
+    plateSeed: s + 37, plateFreq: 1.6, plateStrength: t.plateStrength,
+    moistureSeed: s + 51, moistureFreq: 1.2, useClimate: t.useClimate, climateAltRange: 1.0,
+    colOceanShallow: t.colOceanShallow, colOceanDeep: t.colOceanDeep,
+    colBeach: t.colBeach, colDry: t.colDry, colWet: t.colWet,
+    colColdDry: t.colColdDry, colColdWet: t.colColdWet,
+    colRock: t.colRock, colSnow: t.colSnow,
   };
 }
-// LOD 类参数: 写入当前近距行星, 实时生效(无需重建)
+// LOD 类参数: 写入当前聚焦行星的详细网格, 实时生效(无需重建)。GUI 编辑的是聚焦天体。
 function applyLODLive() {
-  if (!detailPlanet || !detailBody) return;
-  const p = detailPlanet.params;
+  saveCfg(editingBody);              // 把 GUI 改动持久化进聚焦天体的 cfg
+  const b = focusBody();
+  const e = detailMap.get(b);
+  if (!e) return;
+  const p = e.planet.params;
   p.maxLevel = tune.maxLevel; p.splitFactor = tune.splitFactor; p.frustumMargin = tune.frustumMargin;
-  p.nearRadius = detailBody.radius * tune.nearRadiusFrac;
+  p.nearRadius = b.radius * tune.nearRadiusFrac;
 }
-// 结构/地形类参数: 需要重建当前近距行星
+// 结构/地形类参数: 重建聚焦行星的详细网格
 function applyDetailRebuild() {
-  if (!detailPlanet || !detailBody) return;
-  Object.assign(detailPlanet.params, planetParamsFor(detailBody));
-  detailPlanet.rebuild();
+  saveCfg(editingBody);
+  const b = focusBody();
+  const e = detailMap.get(b);
+  if (!e) return;
+  Object.assign(e.planet.params, planetParamsFor(b));
+  e.planet.rebuild();
 }
-function setDetail(body) {
-  clearDetail();
-  detailPlanet = new Planet(planetParamsFor(body));
-  scene.add(detailPlanet);       // 位于原点 = 浮动原点中心(聚焦天体处)
-  detailBody = body;
+
+// ---- 多行星详细网格的建立/销毁 ----
+function addDetail(body) {
+  ensureCfg(body);
+  const planet = new Planet(planetParamsFor(body));
+  scene.add(planet);
+  const e = { planet };
+  detailMap.set(body, e);
+  return e;
 }
-function clearDetail() {
-  if (detailPlanet) {
-    for (const r of detailPlanet.roots) r.dispose(detailPlanet);
-    detailPlanet.clear();
-    for (const w of detailPlanet.workers) w.terminate();
-    scene.remove(detailPlanet);
-    detailPlanet = null;
-  }
-  detailBody = null;
+function removeDetail(body) {
+  const e = detailMap.get(body);
+  if (!e) return;
+  for (const r of e.planet.roots) r.dispose(e.planet);   // 取消未完成 job + 释放网格
+  e.planet.clear();
+  scene.remove(e.planet);                                 // worker 是共享池, 不 terminate
+  detailMap.delete(body);
 }
-// 距离阈值带迟滞, 避免临界抖动
+function clearAllDetail() { for (const b of [...detailMap.keys()]) removeDetail(b); }
+
+// 相机到某天体渲染位(body.pos - _off)的距离
+function camDistTo(body) { return camera.position.distanceTo(_tmpV.copy(body.pos).sub(_off)); }
+
+// 每帧维护"常驻"的 LOD 行星集合:
+//   - 每个非恒星天体都始终有一颗 LOD 行星(远离时 LOD 自然降到最低细分, 不切简单球);
+//   - 每帧最多新建 1 颗(就近优先), 把建根的同步开销摊平到多帧, 避免启动卡顿;
+//   - 不做距离淘汰(远处的 LOD 行星只是停在最低细分, 开销很小)。
 function manageDetail() {
-  if (!params.detail) { if (detailBody) clearDetail(); return; }
-  const f = focusBody();
-  const dist = camera.position.length();     // 浮动原点下 = 相机到聚焦天体距离
-  const R = f.radius;
-  const canDetail = f.type !== 'star';
-  if (canDetail && dist < R * 24) {
-    if (detailBody !== f) setDetail(f);
-  } else if (detailBody && (dist > R * 34 || detailBody !== f || !canDetail)) {
-    clearDetail();
+  _off.copy(focusBody().pos);   // 浮动原点偏移(在 updateRender 之前先算好, 供详细行星定位)
+  if (!params.detail) { if (detailMap.size) clearAllDetail(); return; }
+
+  // 就近补建缺失的 LOD 行星(每帧一颗)
+  let best = null, bestd = Infinity;
+  for (const b of system.bodies) {
+    if (b.type === 'star' || detailMap.has(b)) continue;
+    const d = camDistTo(b);
+    if (d < bestd) { best = b; bestd = d; }
   }
-  if (detailPlanet) detailPlanet.update(camera);
+  if (best) addDetail(best);
+
+  // 更新所有 LOD 行星位置 + LOD(远处自然停在最低细分)
+  for (const [b, e] of detailMap) {
+    e.planet.position.copy(b.pos).sub(_off);   // 定位到浮动原点空间(聚焦天体处为原点)
+    e.planet.update(camera);
+  }
 }
 
 // 近距行星 LOD/地形 GUI(LOD 类实时生效; 结构/地形类重建当前近距行星)
@@ -470,6 +638,7 @@ fLOD.add(tune, 'frustumMargin', 0, 0.5).name('视锥余量').onChange(applyLODLi
 fLOD.add(tune, 'nearRadiusFrac', 0, 2).name('预细分半径 ×R').onChange(applyLODLive);
 fLOD.add(tune, 'patchResolution', [4, 8, 16, 32]).name('patch 分辨率').onChange(applyDetailRebuild);
 fLOD.add(tune, 'maxHeightFrac', 0, 0.2).name('地形起伏 ×R').onFinishChange(applyDetailRebuild);
+fLOD.add(tune, 'seaLevel', -1, 0.5).name('海平面').onFinishChange(applyDetailRebuild);
 fLOD.add(tune, 'continentFreq', 0.2, 4).name('大陆频率').onFinishChange(applyDetailRebuild);
 fLOD.add(tune, 'continentOctaves', 1, 8, 1).name('大陆八度').onFinishChange(applyDetailRebuild);
 fLOD.add(tune, 'mountainFreq', 0.5, 8).name('山脉频率').onFinishChange(applyDetailRebuild);
@@ -478,8 +647,10 @@ fLOD.add(tune, 'warpStrength', 0, 0.6).name('域扭曲').onFinishChange(applyDet
 fLOD.add(tune, 'plateStrength', 0, 1.2).name('板块带').onFinishChange(applyDetailRebuild);
 fLOD.add(tune, 'useClimate').name('气候配色').onChange(applyDetailRebuild);
 
-// 近距行星大气(实时生效)
+// 近距行星大气(实时生效; 每天体独立开关+参数, 编辑的是当前聚焦天体)
 const fAtm = gui.addFolder('大气 (近距)');
+fAtm.add(atm, 'enabled').name('启用大气(本星球)');
+fAtm.addColor(atm, 'tint').name('大气色调');
 fAtm.add(atm, 'scale', 1.02, 1.4).name('大气顶比例');
 fAtm.add(atm, 'rayleigh', 0, 3).name('瑞利强度');
 fAtm.add(atm, 'mie', 0, 3).name('米氏强度');
@@ -521,7 +692,10 @@ addEventListener('resize', () => {
   camera.updateProjectionMatrix();
   renderer.setSize(innerWidth, innerHeight);
   const pr = renderer.getPixelRatio();
-  sceneRT.setSize(Math.floor(innerWidth * pr), Math.floor(innerHeight * pr));
+  const rw = Math.floor(innerWidth * pr), rh = Math.floor(innerHeight * pr);
+  sceneRT.setSize(rw, rh);
+  rtPing.setSize(rw, rh);
+  rtPong.setSize(rw, rh);
 });
 
 function animate() {
@@ -545,38 +719,57 @@ function animate() {
   renderer.render(scene, camera);
   renderer.setRenderTarget(null);
 
-  // 深度感知大气 pass → 屏幕(近距行星有大气时启用; 否则仅 tonemap 直通)
+  // 深度感知大气 pass: 每颗"启用大气"的详细行星各跑一次(ping-pong 累积), 只有最后一次做 tonemap。
   const u = atmoPass.uniforms;
-  u.tDiffuse.value = sceneRT.texture;
   u.tDepth.value = sceneRT.depthTexture;
   _pv.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
   u.uInvViewProj.value.copy(_pv).invert();
   camera.getWorldPosition(u.uCamPos.value);
-  // 影响整屏(含 uEnabled=0 的直通 tonemap)
+  // 整屏末端参数(曝光/tonemap/抖动 用聚焦天体设定)
   u.uExposure.value = atm.exposure;
   u.uTonemap.value = atm.aces ? 1 : 0;
   u.uDither.value = atm.dither;
-  if (detailPlanet && detailBody && params.detailAtmo) {
-    const R = detailBody.radius;
-    u.uEnabled.value = 1.0;
-    u.uRground.value = R;
-    u.uRatmo.value = R * atm.scale;
-    u.uScatterR.value.copy(RAY_ATMO).multiplyScalar(8.0 / R * atm.rayleigh);   // ∝1/半径
-    u.uScatterM.value = 3.0 / R * atm.mie;
-    u.uOzone.value.copy(OZONE_BASE).multiplyScalar(100.0 / R * atm.ozone);
-    u.uMieG.value = atm.mieG;
-    u.uDensityFalloff.value = atm.densityFalloff;
-    u.uMieFalloff.value = atm.mieFalloff;
-    u.uSunIntensity.value = atm.sunIntensity;
-    u.uShadowSoftness.value = atm.shadowSoftness;
-    u.uTwilight.value = atm.twilight;
-    u.uSteps.value = atm.steps;
-    u.uLightSteps.value = atm.lightSteps;
-    u.uSunDir.value.copy(starBody.pos).sub(detailBody.pos).normalize();
-  } else {
-    u.uEnabled.value = 0.0;
+
+  // 收集要跑大气的行星: 启用大气 + 相机足够近(远处小圆点不值得全屏 raymarch), 取最近 MAX_ATMO 颗。
+  // (LOD 地形常驻显示, 但大气 pass 才是开销大头 → 只给近处的几颗跑。)
+  const atmoList = [];
+  if (params.detailAtmo) {
+    for (const [body, e] of detailMap) {
+      const a = atmFor(body);
+      if (a.enabled === false) continue;
+      const d = camDistTo(body);
+      if (d < body.radius * ATMO_DIST) atmoList.push({ body, planet: e.planet, a, d });
+    }
+    atmoList.sort((x, y) => x.d - y.d);
+    if (atmoList.length > MAX_ATMO) atmoList.length = MAX_ATMO;
   }
-  atmoPass.render(renderer);
+
+  if (atmoList.length === 0) {
+    // 无大气: 直通 tonemap 到屏幕
+    u.uEnabled.value = 0.0;
+    u.uToneOut.value = 1.0;
+    u.tDiffuse.value = sceneRT.texture;
+    renderer.setRenderTarget(null);
+    atmoPass.render(renderer);
+  } else {
+    // 逐行星合成; 中间 pass 输出线性 HDR(uToneOut=0), 最后一次 tonemap 落地屏幕
+    let src = sceneRT.texture;
+    for (let i = 0; i < atmoList.length; i++) {
+      const last = (i === atmoList.length - 1);
+      applyAtmoUniforms(u, atmoList[i].body, atmoList[i].planet, atmoList[i].a);
+      u.tDiffuse.value = src;
+      u.uToneOut.value = last ? 1.0 : 0.0;
+      if (last) {
+        renderer.setRenderTarget(null);
+        atmoPass.render(renderer);
+      } else {
+        const dst = (i % 2 === 0) ? rtPing : rtPong;   // ping-pong: 不读写同一 RT
+        renderer.setRenderTarget(dst);
+        atmoPass.render(renderer);
+        src = dst.texture;
+      }
+    }
+  }
 
   const e = system.energy();
   if (e0 === null) e0 = e.total;
