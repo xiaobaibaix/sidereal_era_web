@@ -8,8 +8,8 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import GUI from 'lil-gui';
 import { Body, NBodySystem } from './nbody.js';
-import { Planet } from '../planet.js';       // 复用主项目的 LOD 地形行星(近距详细表现)
-import { createAtmospherePass, createCloudPass, createOcean } from '../effects.js';   // 复用深度感知大气 + 体积云 + 海洋
+import { Planet } from '../../src/planet.js';       // 复用主项目的 LOD 地形行星(近距详细表现)
+import { createAtmospherePass, createCloudPass, createOcean } from '../../src/effects.js';   // 复用深度感知大气 + 体积云 + 海洋 海洋
 
 // ----------------------------------------------------------------------------
 // 星系配置(初始条件; 之后可纳入预设)
@@ -44,6 +44,7 @@ const params = {
   detail: true,        // 近距 LOD 地形行星(常驻)
   detailAtmo: true,    // 近距行星大气(总开关)
   detailClouds: true,  // 近距行星体积云(总开关)
+  worldScale: 1,       // 全局尺度: 距离/半径×S, 质量×S³(轨道周期不变) → 试 1e6 米级
   focus: '恒星',
 };
 
@@ -55,8 +56,9 @@ const ORBIT_SEG = 192;   // 每条轨道椭圆的采样段数
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x03040a);
 
-// 标准深度(不用对数深度): 本尺度下 near/far 比 ~4e4, 精度足够, 且兼容深度感知大气 pass。
-// (未来真实大尺度 1e6+ 时再引入分层深度/对数重建。)
+// 标准深度 + 每帧动态 near/far(见 updateCameraRange): 浮动原点把聚焦天体放到原点, 相机绕它转,
+// 透视深度精度天然集中在近平面 → 聚焦行星表面精度极好, 远处天体(小圆点)精度差但无感。
+// 这样无需改任何 shader(大气/云/海洋 pass 用 camera.projectionMatrix, 自动跟随)即可支持 1e6 米级。
 const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.5, 20000);
 camera.position.set(0, 1600, 3800);
 
@@ -75,16 +77,19 @@ scene.add(new THREE.AmbientLight(0xffffff, 0.28));
 const sunLight = new THREE.PointLight(0xffffff, 3.5, 0, 0);   // decay=0: 全系统可见(P1 不追求光照真实)
 scene.add(sunLight);
 
-// 星空背景(在远平面内, 固定屏幕像素大小)
+// 星空背景(单位球; 每帧跟随相机并缩放到 far 附近 → 任意尺度下都像无限远的天幕, 固定屏幕像素大小)
+let starField;
 (function stars() {
   const g = new THREE.BufferGeometry();
   const n = 2000, p = new Float32Array(n * 3);
   for (let i = 0; i < n; i++) {
-    const v = new THREE.Vector3().randomDirection().multiplyScalar(15000);
+    const v = new THREE.Vector3().randomDirection();   // 单位球面
     p[i * 3] = v.x; p[i * 3 + 1] = v.y; p[i * 3 + 2] = v.z;
   }
   g.setAttribute('position', new THREE.BufferAttribute(p, 3));
-  scene.add(new THREE.Points(g, new THREE.PointsMaterial({ color: 0x8899aa, size: 1.8, sizeAttenuation: false })));
+  starField = new THREE.Points(g, new THREE.PointsMaterial({ color: 0x8899aa, size: 1.8, sizeAttenuation: false }));
+  starField.frustumCulled = false;
+  scene.add(starField);
 })();
 
 // ----------------------------------------------------------------------------
@@ -198,22 +203,25 @@ const _off = new THREE.Vector3();      // 浮动原点偏移(聚焦天体位置)
 const _AX = new THREE.Vector3(1, 0, 0);
 
 function buildSystem() {
-  system = new NBodySystem({ G: params.G, softening: params.softening });
+  // 全局尺度: 距离/半径 ×S, 质量 ×S³。这样 v=√(GM/r) ∝ S, 角速度 ω=v/r 不变 → 轨道周期与视觉不变,
+  // 纯粹是把整个宇宙"放大", 用来验证渲染管线(深度/浮点)在 1e6 米级下是否成立。软化长度 ×S。
+  const S = params.worldScale, S3 = S * S * S;
+  system = new NBodySystem({ G: params.G, softening: params.softening * S });
   starBody = system.add(new Body({
-    name: CONFIG.star.name, mass: CONFIG.star.mass, radius: CONFIG.star.radius,
+    name: CONFIG.star.name, mass: CONFIG.star.mass * S3, radius: CONFIG.star.radius * S,
     color: CONFIG.star.color, type: 'star',
   }));
   for (const p of CONFIG.planets) {
     const planet = system.addOrbiting(starBody, {
-      mass: p.mass, radius: p.radius, dist: p.dist, phase: p.phase,
+      mass: p.mass * S3, radius: p.radius * S, dist: p.dist * S, phase: p.phase,
       inclination: p.incl, color: p.color, name: p.name, type: 'planet',
     });
-    // 行星的希尔半径(与 G 无关): a·(m_p / 3·m_star)^(1/3)
-    const hill = p.dist * Math.cbrt(p.mass / (3 * CONFIG.star.mass));
+    // 行星的希尔半径(质量比不变 → cbrt 不变; dist×S → hill×S): a·(m_p / 3·m_star)^(1/3)
+    const hill = p.dist * S * Math.cbrt(p.mass / (3 * CONFIG.star.mass));
     for (const m of p.moons) {
-      const dist = Math.max(m.hillFrac * hill, p.radius * 2.0);   // 稳定区内, 且不埋进行星
+      const dist = Math.max(m.hillFrac * hill, p.radius * S * 2.0);   // 稳定区内, 且不埋进行星
       system.addOrbiting(planet, {
-        mass: m.mass, radius: m.radius, dist, phase: m.phase,
+        mass: m.mass * S3, radius: m.radius * S, dist, phase: m.phase,
         inclination: m.incl, color: m.color, name: m.name, type: 'moon',
       });
     }
@@ -223,22 +231,25 @@ function buildSystem() {
 
 // 小行星带(绕恒星) + 行星环(绕某行星), 都是测试粒子。zeroMomentum 之后再加(不参与动量)。
 function buildParticles() {
+  const S = params.worldScale;   // 半径随全局尺度; 速度用已缩放的 system.G·mass/r, 自动匹配
   const bc = CONFIG.belt;
+  const bInner = bc.inner * S, bOuter = bc.outer * S, bThick = bc.thickness * S;
   for (let i = 0; i < bc.count; i++) {
-    const r = bc.inner + Math.random() * (bc.outer - bc.inner);
+    const r = bInner + Math.random() * (bOuter - bInner);
     const ph = Math.random() * Math.PI * 2;
-    const pos = new THREE.Vector3(Math.cos(ph) * r, (Math.random() - 0.5) * bc.thickness, Math.sin(ph) * r).add(starBody.pos);
+    const pos = new THREE.Vector3(Math.cos(ph) * r, (Math.random() - 0.5) * bThick, Math.sin(ph) * r).add(starBody.pos);
     const vmag = Math.sqrt(system.G * starBody.mass / r) * (0.98 + Math.random() * 0.04);
     const vel = new THREE.Vector3(-Math.sin(ph), 0, Math.cos(ph)).multiplyScalar(vmag).add(starBody.vel);
     system.addParticle(pos, vel);
   }
   const rc = CONFIG.ring;
+  const rInner = rc.inner * S, rOuter = rc.outer * S, rThick = rc.thickness * S;
   const planet = system.bodies.find((b) => b.name === rc.planet);
   if (planet) {
     for (let i = 0; i < rc.count; i++) {
-      const r = rc.inner + Math.random() * (rc.outer - rc.inner);
+      const r = rInner + Math.random() * (rOuter - rInner);
       const ph = Math.random() * Math.PI * 2;
-      const pos = new THREE.Vector3(Math.cos(ph) * r, (Math.random() - 0.5) * rc.thickness, Math.sin(ph) * r)
+      const pos = new THREE.Vector3(Math.cos(ph) * r, (Math.random() - 0.5) * rThick, Math.sin(ph) * r)
         .applyAxisAngle(_AX, rc.tilt).add(planet.pos);
       const vmag = Math.sqrt(system.G * planet.mass / r);
       const vel = new THREE.Vector3(-Math.sin(ph), 0, Math.cos(ph)).applyAxisAngle(_AX, rc.tilt)
@@ -702,6 +713,24 @@ function manageDetail() {
   }
 }
 
+// 每帧动态相机 near/far + 距离限制 + 星空跟随。聚焦天体在渲染原点, 相机绕它转。
+// near 卡在聚焦行星前面(透视深度精度集中在近平面 → 聚焦星表精度好); far 覆盖到最远天体。
+function updateCameraRange() {
+  const fR = focusBody().radius;
+  const camDist = camera.position.length();      // 相机到聚焦中心(原点)
+  let maxD = fR * 3;                              // 场景最远天体到聚焦中心(渲染空间)
+  for (const b of system.bodies) {
+    const d = _tmpV.copy(b.pos).sub(_off).length();
+    if (d > maxD) maxD = d;
+  }
+  const far = camDist + maxD * 1.5 + fR * 10;
+  const near = Math.max((camDist - fR) * 0.3, fR * 1e-4, far * 1e-7);   // 比值上限 ~1e7
+  camera.near = near; camera.far = far; camera.updateProjectionMatrix();
+  controls.minDistance = fR * 1.02;              // 贴到星表附近
+  controls.maxDistance = maxD * 6 + fR * 50;     // 能拉远看全场景
+  if (starField) { starField.position.copy(camera.position); starField.scale.setScalar(far * 0.9); }
+}
+
 // 近距行星 LOD/地形 GUI(LOD 类实时生效; 结构/地形类重建当前近距行星)
 const fLOD = gui.addFolder('近距行星 (LOD/地形)');
 fLOD.add(tune, 'maxLevel', 0, 12, 1).name('最大层数').onChange(applyLODLive);
@@ -802,6 +831,7 @@ function animate() {
   controls.update();
   manageDetail();
   updateRender();
+  updateCameraRange();   // 动态 near/far(在场景渲染前设好投影)
 
   // 场景 → HDR RT(带深度)
   renderer.setRenderTarget(sceneRT);

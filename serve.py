@@ -82,4 +82,6 @@ if __name__ == "__main__":
     os.makedirs(PRESETS, exist_ok=True)
     with socketserver.TCPServer(("127.0.0.1", PORT), Handler) as httpd:
         print(f"three_planet 开发服务器: http://localhost:{PORT}/  (presets 可写)")
+        print(f"  行星 App : http://localhost:{PORT}/webs/planet_system/")
+        print(f"  太阳系 App: http://localhost:{PORT}/webs/solar_system/")
         httpd.serve_forever()

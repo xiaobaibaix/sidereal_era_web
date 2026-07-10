@@ -7,8 +7,8 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
 import GUI from 'lil-gui';
-import { Planet } from './planet.js';
-import { createOcean, createAtmospherePass, createCloudPass, createGodrayPass, createTransmittanceLUT } from './effects.js';
+import { Planet } from '../../src/planet.js';
+import { createOcean, createAtmospherePass, createCloudPass, createGodrayPass, createTransmittanceLUT } from '../../src/effects.js';
 import { PlanetWalker } from './character.js';
 
 // ----------------------------------------------------------------------------
@@ -590,8 +590,8 @@ function loadParams() {
 }
 function resetParams() { applyParams(DEFAULTS); saveParams(); }
 
-// 项目内置预设文件(可提交到 git, 跟着项目走)
-const PRESET_URL = './presets/default.json';
+// 项目内置预设文件(可提交到 git, 跟着项目走)。用服务器根绝对路径(/presets/), 因页面已挪到 webs/ 下, 相对路径会算错。
+const PRESET_URL = '/presets/default.json';
 async function loadProjectPreset() {
   try {
     const res = await fetch(PRESET_URL, { cache: 'no-store' });
@@ -646,7 +646,7 @@ async function refreshPresetList() {
 }
 async function loadProjectNamed(name) {
   try {
-    const res = await fetch('./presets/' + encodeURIComponent(name) + '.json', { cache: 'no-store' });
+    const res = await fetch('/presets/' + encodeURIComponent(name) + '.json', { cache: 'no-store' });
     if (res.ok) { applyParams(await res.json()); saveParams(); }
   } catch (e) { /* ignore */ }
 }
