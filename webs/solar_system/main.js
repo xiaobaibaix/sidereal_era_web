@@ -478,6 +478,7 @@ const _tmpV = new THREE.Vector3();
 // 近距行星的默认 LOD/地形调参(新天体从此拷贝一份到 body.cfg; 地形种子按天体名区分)。
 // GUI 编辑的始终是"当前聚焦天体"的这份 tune, 切换聚焦时保存旧/载入新。
 const tune = {
+  seed: 1337,               // 顶层种子: 驱动大陆/山脉/域扭曲/板块/湿度全部子种子。复用配置后只改这个即可换地形。
   maxLevel: 8, splitFactor: 2.5, patchResolution: 16, frustumMargin: 0.15,
   nearRadiusFrac: 0.5, maxHeightFrac: 0.03, seaLevel: 0.0, oceanEnabled: true,
   continentFreq: 1.2, continentOctaves: 5, mountainFreq: 3.0, mountainStrength: 0.6,
@@ -563,6 +564,19 @@ function cfgSnapshot() {
   };
 }
 const DEFAULT_CFG = cfgSnapshot();     // 启动默认(新天体从此开始)
+
+// ---- 持久化(localStorage): 记住每颗天体调好的配置 + 命名预设库, 跨刷新/重启保留(记忆功能) ----
+const LS_KEY = 'solar.cfg.v1';
+function lsLoad() { try { return JSON.parse(localStorage.getItem(LS_KEY)) || {}; } catch (e) { return {}; } }
+function lsSave() { try { localStorage.setItem(LS_KEY, JSON.stringify(store)); } catch (e) { /* 隐私模式等: 忽略 */ } }
+const store = lsLoad();
+store.bodies = store.bodies || {};      // { 天体名: cfg }  记忆各行星调好的参数(ensureCfg 优先读它)
+store.presets = store.presets || {};    // { 预设名: cfg }  跨行星复用的配置库
+function persistBody(body) { if (body && body.cfg) { store.bodies[body.name] = body.cfg; lsSave(); } }
+function persistFocused() { if (editingBody) { saveCfg(editingBody); persistBody(editingBody); } }
+let _persistTimer = 0;
+function persistSoon() { clearTimeout(_persistTimer); _persistTimer = setTimeout(persistFocused, 400); }
+
 function cfgRestore(cfg) {
   for (const k in cfg.tune) {
     if (Array.isArray(tune[k])) { tune[k].length = 0; tune[k].push(...cfg.tune[k]); }  // 原地改, 保留数组引用(GUI addColor 绑定)
@@ -574,17 +588,25 @@ function cfgRestore(cfg) {
 }
 function saveCfg(body) { if (body) body.cfg = cfgSnapshot(); }
 function loadCfg(body) { ensureCfg(body); cfgRestore(body.cfg); }
-// 首次访问某天体时, 从 DEFAULT_CFG 拷一份, 再叠加 BODY_CFG[名字] 的预设覆盖(不同星球初始就不一样)
+// 取某天体配置: 优先用 localStorage 记忆的(上次调好的); 否则从 DEFAULT_CFG 拷一份再叠加
+// BODY_CFG[名字] 预设覆盖(不同星球初始就不一样)。顶层种子: 预设未指定则按天体名散列。
 function ensureCfg(body) {
   if (!body.cfg) {
-    const cfg = JSON.parse(JSON.stringify(DEFAULT_CFG));
-    const ov = BODY_CFG[body.name];
-    if (ov) {
-      if (ov.tune)  for (const k in ov.tune)  cfg.tune[k]  = Array.isArray(ov.tune[k])  ? ov.tune[k].slice()  : ov.tune[k];
-      if (ov.atm)   for (const k in ov.atm)   cfg.atm[k]   = Array.isArray(ov.atm[k])   ? ov.atm[k].slice()   : ov.atm[k];
-      if (ov.cloud) for (const k in ov.cloud) cfg.cloud[k] = Array.isArray(ov.cloud[k]) ? ov.cloud[k].slice() : ov.cloud[k];
+    if (store.bodies[body.name]) {
+      const cfg = JSON.parse(JSON.stringify(store.bodies[body.name]));   // 记忆: 跨重建/刷新保留手动调参
+      if (cfg.tune.seed == null) cfg.tune.seed = hashSeed(body.name);    // 老数据兜底
+      body.cfg = cfg;
+    } else {
+      const cfg = JSON.parse(JSON.stringify(DEFAULT_CFG));
+      const ov = BODY_CFG[body.name];
+      if (ov) {
+        if (ov.tune)  for (const k in ov.tune)  cfg.tune[k]  = Array.isArray(ov.tune[k])  ? ov.tune[k].slice()  : ov.tune[k];
+        if (ov.atm)   for (const k in ov.atm)   cfg.atm[k]   = Array.isArray(ov.atm[k])   ? ov.atm[k].slice()   : ov.atm[k];
+        if (ov.cloud) for (const k in ov.cloud) cfg.cloud[k] = Array.isArray(ov.cloud[k]) ? ov.cloud[k].slice() : ov.cloud[k];
+      }
+      if (!(ov && ov.tune && ov.tune.seed != null)) cfg.tune.seed = hashSeed(body.name);   // 各行星默认种子不同
+      body.cfg = cfg;
     }
-    body.cfg = cfg;
   }
   return body.cfg;
 }
@@ -594,7 +616,7 @@ function atmFor(body)   { return (body === editingBody) ? atm   : ensureCfg(body
 function cloudFor(body) { return (body === editingBody) ? cloud : ensureCfg(body).cloud; }
 function syncFocusCfg(newBody) {
   if (!newBody) return;
-  if (editingBody && editingBody !== newBody) saveCfg(editingBody);
+  if (editingBody && editingBody !== newBody) { saveCfg(editingBody); persistBody(editingBody); }  // 切换时把旧天体存盘
   editingBody = newBody;
   loadCfg(newBody);
 }
@@ -607,7 +629,7 @@ function hashSeed(str) {
 }
 function planetParamsFor(body) {
   const t = tuneFor(body);          // 每颗行星用自己的配置(聚焦天体用 GUI 实时值)
-  const s = hashSeed(body.name);
+  const s = (t.seed != null ? t.seed : hashSeed(body.name)) | 0;   // 顶层种子(GUI 可调 / 复用配置后改这个即可换地形)
   return {
     radius: body.radius, maxHeight: body.radius * t.maxHeightFrac, seaLevel: t.seaLevel,
     patchResolution: t.patchResolution, maxLevel: t.maxLevel, splitFactor: t.splitFactor,
@@ -751,6 +773,8 @@ function frameFocus() {
 
 // 近距行星 LOD/地形 GUI(LOD 类实时生效; 结构/地形类重建当前近距行星)
 const fLOD = gui.addFolder('近距行星 (LOD/地形)');
+const seedCtrl = fLOD.add(tune, 'seed', 0, 99999, 1).name('顶层种子').onFinishChange(applyDetailRebuild);
+fLOD.add({ rnd: () => { tune.seed = Math.floor(Math.random() * 100000); seedCtrl.updateDisplay(); applyDetailRebuild(); } }, 'rnd').name('🎲 随机种子');
 fLOD.add(tune, 'maxLevel', 0, 12, 1).name('最大层数').onChange(applyLODLive);
 fLOD.add(tune, 'splitFactor', 1, 5).name('细分激进度').onChange(applyLODLive);
 fLOD.add(tune, 'frustumMargin', 0, 0.5).name('视锥余量').onChange(applyLODLive);
@@ -814,6 +838,99 @@ fCol.addColor(tune, 'colColdDry').name('苔原').onFinishChange(applyDetailRebui
 fCol.addColor(tune, 'colRock').name('岩石/高山').onFinishChange(applyDetailRebuild);
 fCol.addColor(tune, 'colSnow').name('雪').onFinishChange(applyDetailRebuild);
 fCol.close();
+
+// ----------------------------------------------------------------------------
+// 配置库: 把当前行星调好的参数存成命名预设, 一键套用到其它行星(保留各自种子 → 同风格不同地形);
+// 也能导出/导入 .json 文件。所有预设 + 各行星配置都存 localStorage, 关掉重开自动恢复(记忆功能)。
+// ----------------------------------------------------------------------------
+const presetState = { name: '', selected: '' };
+let presetCtrl = null;
+const fPre = gui.addFolder('配置库 (跨行星复用)');
+fPre.add(presetState, 'name').name('预设名');
+fPre.add({ f: () => savePreset() }, 'f').name('▸ 保存当前行星为预设');
+refreshPresetDropdown();
+fPre.add({ f: () => deletePreset() }, 'f').name('删除选中预设');
+fPre.add({ f: () => exportCfg() }, 'f').name('导出当前配置(下载 .json)');
+fPre.add({ f: () => importCfg() }, 'f').name('导入配置(上传 → 当前行星)');
+
+function refreshPresetDropdown() {
+  const names = Object.keys(store.presets);
+  const opts = names.length ? names : ['(无)'];
+  presetCtrl = presetCtrl ? presetCtrl.options(opts) : fPre.add(presetState, 'selected', opts);
+  presetCtrl.name('加载预设 → 当前行星').onChange((v) => { if (v && v !== '(无)') applyPreset(v); });
+  presetCtrl.updateDisplay();
+}
+// 保存当前聚焦行星的配置为命名预设(写 localStorage, 跨重启保留)
+function savePreset() {
+  const name = (presetState.name || '').trim();
+  if (!name) { alert('请先在“预设名”里填个名字'); return; }
+  if (!editingBody) { alert('请先聚焦一颗行星再保存'); return; }
+  saveCfg(editingBody);
+  store.presets[name] = JSON.parse(JSON.stringify(editingBody.cfg));
+  lsSave();
+  presetState.selected = name;
+  refreshPresetDropdown();
+}
+// 套用某预设到当前聚焦行星: 复制 tune/atm/cloud, 但保留本行星原有种子 → 同风格、不同地形。
+function applyPreset(name) {
+  const preset = store.presets[name];
+  const b = focusBody();
+  if (!preset || !b) return;
+  const cfg = JSON.parse(JSON.stringify(preset));
+  if (!cfg.tune) { alert('预设格式无效'); return; }
+  const keepSeed = (b.cfg && b.cfg.tune.seed != null) ? b.cfg.tune.seed : hashSeed(b.name);
+  cfg.tune.seed = keepSeed;      // 关键: 不覆盖本行星种子(否则地形和源行星一模一样)
+  b.cfg = cfg;
+  editingBody = b;
+  cfgRestore(cfg);               // 写进实时 tune/atm/cloud + 刷新 GUI 显示
+  persistBody(b);
+  applyDetailRebuild();          // 重建近距行星使之生效
+}
+function deletePreset() {
+  const n = presetState.selected;
+  if (n && store.presets[n]) { delete store.presets[n]; lsSave(); presetState.selected = ''; refreshPresetDropdown(); }
+}
+// 导出当前聚焦行星配置为 .json 文件(备份 / 分享 / 提交进 git)
+function exportCfg() {
+  if (editingBody) saveCfg(editingBody);
+  const cfg = editingBody ? editingBody.cfg : cfgSnapshot();
+  const blob = new Blob([JSON.stringify(cfg, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = (params.focus || 'planet') + '-config.json';
+  a.click();
+  URL.revokeObjectURL(url);
+}
+// 从 .json 文件导入配置到当前聚焦行星(同样保留本行星种子)
+function importCfg() {
+  const inp = document.createElement('input');
+  inp.type = 'file'; inp.accept = 'application/json,.json';
+  inp.onchange = () => {
+    const f = inp.files && inp.files[0];
+    if (!f) return;
+    const r = new FileReader();
+    r.onload = () => {
+      try {
+        const cfg = JSON.parse(r.result);
+        const b = focusBody();
+        if (!b || !cfg.tune) throw new Error('配置缺少 tune 字段');
+        const keepSeed = (b.cfg && b.cfg.tune.seed != null) ? b.cfg.tune.seed : hashSeed(b.name);
+        cfg.tune.seed = keepSeed;
+        b.cfg = cfg;
+        editingBody = b;
+        cfgRestore(cfg);
+        persistBody(b);
+        applyDetailRebuild();
+      } catch (e) { alert('配置解析失败: ' + e.message); }
+    };
+    r.readAsText(f);
+  };
+  inp.click();
+}
+
+// 任意 GUI 改动 → 防抖持久化当前行星配置; 关闭页面前再存一次(记忆功能的兜底)
+gui.onChange(persistSoon);
+addEventListener('beforeunload', persistFocused);
 
 // ----------------------------------------------------------------------------
 // 主循环: 固定步长物理 + 浮动原点渲染

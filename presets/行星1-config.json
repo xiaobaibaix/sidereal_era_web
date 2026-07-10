@@ -1,0 +1,102 @@
+{
+  "tune": {
+    "seed": 70741,
+    "maxLevel": 8,
+    "splitFactor": 2.5,
+    "patchResolution": 16,
+    "frustumMargin": 0.15,
+    "nearRadiusFrac": 0.5,
+    "maxHeightFrac": 0.03,
+    "seaLevel": 0.03,
+    "oceanEnabled": true,
+    "continentFreq": 1.2,
+    "continentOctaves": 5,
+    "mountainFreq": 3,
+    "mountainStrength": 0.1,
+    "warpStrength": 0.25,
+    "plateStrength": 0.6,
+    "useClimate": true,
+    "colOceanShallow": [
+      0.2,
+      0.5,
+      0.66
+    ],
+    "colOceanDeep": [
+      0.02,
+      0.1,
+      0.28
+    ],
+    "colBeach": [
+      0.85,
+      0.8,
+      0.58
+    ],
+    "colDry": [
+      0.76,
+      0.7,
+      0.42
+    ],
+    "colWet": [
+      0.12,
+      0.45,
+      0.15
+    ],
+    "colColdDry": [
+      0.55,
+      0.55,
+      0.48
+    ],
+    "colColdWet": [
+      0.2,
+      0.38,
+      0.3
+    ],
+    "colRock": [
+      0.48,
+      0.47,
+      0.48
+    ],
+    "colSnow": [
+      0.97,
+      0.98,
+      1
+    ]
+  },
+  "atm": {
+    "enabled": true,
+    "tint": [
+      1,
+      1,
+      1
+    ],
+    "scale": 1.08,
+    "rayleigh": 1,
+    "mie": 1,
+    "mieG": 0.76,
+    "densityFalloff": 6,
+    "mieFalloff": 16,
+    "sunIntensity": 22,
+    "exposure": 1,
+    "shadowSoftness": 0.6,
+    "twilight": 0.3,
+    "ozone": 1,
+    "dither": 0.5,
+    "steps": 16,
+    "lightSteps": 8,
+    "aces": true
+  },
+  "cloud": {
+    "enabled": true,
+    "coverage": 0.5,
+    "density": 1.2,
+    "bottomFrac": 1.012,
+    "topFrac": 1.06,
+    "freq": 0.06,
+    "windSpeed": 0.1,
+    "silver": 1,
+    "powder": 0.6,
+    "cloudShadow": 0.7,
+    "steps": 24,
+    "lightSteps": 6
+  }
+}
