@@ -9,7 +9,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import GUI from 'lil-gui';
 import { Body, NBodySystem } from './nbody.js';
 import { Planet } from '../planet.js';       // 复用主项目的 LOD 地形行星(近距详细表现)
-import { createAtmospherePass, createCloudPass } from '../effects.js';   // 复用深度感知大气 + 体积云
+import { createAtmospherePass, createCloudPass, createOcean } from '../effects.js';   // 复用深度感知大气 + 体积云 + 海洋
 
 // ----------------------------------------------------------------------------
 // 星系配置(初始条件; 之后可纳入预设)
@@ -464,7 +464,7 @@ const _tmpV = new THREE.Vector3();
 // GUI 编辑的始终是"当前聚焦天体"的这份 tune, 切换聚焦时保存旧/载入新。
 const tune = {
   maxLevel: 8, splitFactor: 2.5, patchResolution: 16, frustumMargin: 0.15,
-  nearRadiusFrac: 0.5, maxHeightFrac: 0.03, seaLevel: 0.0,
+  nearRadiusFrac: 0.5, maxHeightFrac: 0.03, seaLevel: 0.0, oceanEnabled: true,
   continentFreq: 1.2, continentOctaves: 5, mountainFreq: 3.0, mountainStrength: 0.6,
   warpStrength: 0.2, plateStrength: 0.5, useClimate: true,
   // 地形调色板([r,g,b] 0..1, lil-gui addColor 原地编辑)
@@ -491,7 +491,7 @@ const BODY_CFG = {
   '行星2': {   // 沙漠 / 火星型: 无海洋, 崎岖多山, 铁锈色, 无气候配色
     tune: {
       seaLevel: -0.6, maxHeightFrac: 0.05, continentFreq: 0.9, mountainFreq: 4.5, mountainStrength: 0.95,
-      warpStrength: 0.35, plateStrength: 0.85, useClimate: false,
+      warpStrength: 0.35, plateStrength: 0.85, useClimate: false, oceanEnabled: false,
       colBeach: [0.75, 0.52, 0.33], colWet: [0.70, 0.42, 0.26], colDry: [0.66, 0.40, 0.24],
       colRock: [0.52, 0.31, 0.23], colSnow: [0.90, 0.82, 0.75],
     },
@@ -512,7 +512,7 @@ const BODY_CFG = {
   '卫星1a': {  // 岩石灰月: 无海, 密集陨坑感(高山脉频率), 灰
     tune: {
       seaLevel: -1.0, maxHeightFrac: 0.06, continentFreq: 2.0, mountainFreq: 6.5, mountainStrength: 1.0,
-      warpStrength: 0.15, plateStrength: 0.9, useClimate: false,
+      warpStrength: 0.15, plateStrength: 0.9, useClimate: false, oceanEnabled: false,
       colBeach: [0.42, 0.42, 0.44], colWet: [0.46, 0.46, 0.48], colDry: [0.50, 0.50, 0.52],
       colRock: [0.34, 0.34, 0.36], colSnow: [0.70, 0.70, 0.72],
     },
@@ -521,7 +521,7 @@ const BODY_CFG = {
   '卫星2a': {  // 冰月: 平滑, 冰蓝白
     tune: {
       seaLevel: -0.2, maxHeightFrac: 0.02, continentFreq: 1.0, mountainFreq: 3.5, mountainStrength: 0.3,
-      warpStrength: 0.10, plateStrength: 0.3, useClimate: false,
+      warpStrength: 0.10, plateStrength: 0.3, useClimate: false, oceanEnabled: false,
       colBeach: [0.78, 0.84, 0.90], colWet: [0.72, 0.80, 0.88], colDry: [0.80, 0.85, 0.90],
       colRock: [0.60, 0.68, 0.78], colSnow: [0.96, 0.98, 1.0],
     },
@@ -530,7 +530,7 @@ const BODY_CFG = {
   '卫星2b': {  // 尘土月: 无海, 土褐
     tune: {
       seaLevel: -1.0, maxHeightFrac: 0.05, continentFreq: 1.6, mountainFreq: 5.0, mountainStrength: 0.8,
-      warpStrength: 0.20, plateStrength: 0.7, useClimate: false,
+      warpStrength: 0.20, plateStrength: 0.7, useClimate: false, oceanEnabled: false,
       colBeach: [0.60, 0.52, 0.40], colWet: [0.55, 0.48, 0.36], colDry: [0.62, 0.55, 0.42],
       colRock: [0.44, 0.38, 0.30], colSnow: [0.75, 0.72, 0.64],
     },
@@ -627,6 +627,25 @@ function applyDetailRebuild() {
   if (!e) return;
   Object.assign(e.planet.params, planetParamsFor(b));
   e.planet.rebuild();
+  disposeOcean(e);                       // 海洋(颜色/半径/开关可能都变了)重建
+  e.ocean = makeOcean(b);
+  if (e.ocean) { e.ocean.position.copy(e.planet.position); scene.add(e.ocean); }
+}
+
+// 有水的天体建一个半透明海洋球(半径=海平面处; 颜色取该天体的地形海洋色)。无水返回 null。
+function makeOcean(body) {
+  const t = tuneFor(body);
+  if (!t.oceanEnabled) return null;
+  const ocean = createOcean();
+  ocean.frustumCulled = false;
+  ocean.scale.setScalar(body.radius * (1 + t.seaLevel * t.maxHeightFrac));   // 海平面半径
+  const d = t.colOceanDeep, s = t.colOceanShallow;
+  ocean.material.uniforms.uDeep.value.setRGB(d[0], d[1], d[2]);
+  ocean.material.uniforms.uShallow.value.setRGB(s[0], s[1], s[2]);
+  return ocean;
+}
+function disposeOcean(e) {
+  if (e && e.ocean) { scene.remove(e.ocean); e.ocean.geometry.dispose(); e.ocean.material.dispose(); e.ocean = null; }
 }
 
 // ---- 多行星详细网格的建立/销毁 ----
@@ -634,7 +653,9 @@ function addDetail(body) {
   ensureCfg(body);
   const planet = new Planet(planetParamsFor(body));
   scene.add(planet);
-  const e = { planet };
+  const ocean = makeOcean(body);       // 海洋是独立 mesh 加到 scene(不做 Planet 子节点, 因 rebuild 会 clear)
+  if (ocean) scene.add(ocean);
+  const e = { planet, ocean };
   detailMap.set(body, e);
   return e;
 }
@@ -644,6 +665,7 @@ function removeDetail(body) {
   for (const r of e.planet.roots) r.dispose(e.planet);   // 取消未完成 job + 释放网格
   e.planet.clear();
   scene.remove(e.planet);                                 // worker 是共享池, 不 terminate
+  disposeOcean(e);
   detailMap.delete(body);
 }
 function clearAllDetail() { for (const b of [...detailMap.keys()]) removeDetail(b); }
@@ -668,10 +690,15 @@ function manageDetail() {
   }
   if (best) addDetail(best);
 
-  // 更新所有 LOD 行星位置 + LOD(远处自然停在最低细分)
+  // 更新所有 LOD 行星位置 + LOD(远处自然停在最低细分); 海洋跟随并按距离显隐
   for (const [b, e] of detailMap) {
     e.planet.position.copy(b.pos).sub(_off);   // 定位到浮动原点空间(聚焦天体处为原点)
     e.planet.update(camera);
+    if (e.ocean) {
+      e.ocean.position.copy(e.planet.position);
+      e.ocean.visible = camDistTo(b) < b.radius * ATMO_DIST;   // 近距才画水面(远处地形海洋色兜底)
+      e.ocean.material.uniforms.uSunDir.value.copy(starBody.pos).sub(b.pos).normalize();
+    }
   }
 }
 
@@ -684,6 +711,7 @@ fLOD.add(tune, 'nearRadiusFrac', 0, 2).name('预细分半径 ×R').onChange(appl
 fLOD.add(tune, 'patchResolution', [4, 8, 16, 32]).name('patch 分辨率').onChange(applyDetailRebuild);
 fLOD.add(tune, 'maxHeightFrac', 0, 0.2).name('地形起伏 ×R').onFinishChange(applyDetailRebuild);
 fLOD.add(tune, 'seaLevel', -1, 0.5).name('海平面').onFinishChange(applyDetailRebuild);
+fLOD.add(tune, 'oceanEnabled').name('海洋(水面)').onChange(applyDetailRebuild);
 fLOD.add(tune, 'continentFreq', 0.2, 4).name('大陆频率').onFinishChange(applyDetailRebuild);
 fLOD.add(tune, 'continentOctaves', 1, 8, 1).name('大陆八度').onFinishChange(applyDetailRebuild);
 fLOD.add(tune, 'mountainFreq', 0.5, 8).name('山脉频率').onFinishChange(applyDetailRebuild);
