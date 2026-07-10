@@ -9,6 +9,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import GUI from 'lil-gui';
 import { Body, NBodySystem } from './nbody.js';
 import { Planet } from '../../src/planet.js';       // 复用主项目的 LOD 地形行星(近距详细表现)
+import { PlanetWalker } from '../planet_system/character.js';   // 复用主项目的登陆行星角色控制器
 import { createAtmospherePass, createCloudPass, createOcean, createGasGiant } from '../../src/effects.js';   // 复用深度感知大气 + 体积云 + 海洋 海洋
 
 // ----------------------------------------------------------------------------
@@ -48,6 +49,7 @@ const params = {
   detailAtmo: true,    // 近距行星大气(总开关)
   detailClouds: true,  // 近距行星体积云(总开关)
   worldScale: 1,       // 全局尺度: 距离/半径×S, 质量×S³(轨道周期不变) → 试 1e6 米级
+  character: false,    // 角色模式: 登陆当前聚焦的地形星球, 第三人称行走
   focus: '恒星',
 };
 
@@ -75,6 +77,11 @@ controls.enableDamping = true;
 controls.dampingFactor = 0.08;
 controls.minDistance = 20;
 controls.maxDistance = 5e6;
+
+// 角色模式(登陆聚焦星球): 复用主项目的 PlanetWalker。角色模式下用角色相机接管渲染 + LOD。
+let walker = null;      // 懒创建: 首次进入时绑定当前聚焦行星的 LOD 地形
+let charMode = false;
+function renderCam() { return (charMode && walker) ? walker.camera : camera; }
 
 // 不加环境光: 只有太阳(点光源)照亮天体 → 背向太阳的一面是暗的(真实昼夜), 不再被环境光提亮。
 const sunLight = new THREE.PointLight(0xffffff, 3.5, 0, 0);   // decay=0: 全系统可见(P1 不追求光照真实)
@@ -440,6 +447,41 @@ let focusCtrl = gui.add(params, 'focus', ['恒星']).name('聚焦天体').onChan
 const radiusCtrl = gui.add(bodyEdit, 'radius', 2, 300).name('聚焦天体半径').onChange(applyBodyRadius);
 gui.add({ reset: rebuild }, 'reset').name('重置星系');
 gui.add({ recenter: () => { controls.target.set(0, 0, 0); } }, 'recenter').name('相机对准聚焦');
+const characterCtrl = gui.add(params, 'character').name('角色模式(登陆聚焦星球)').onChange(setCharacter);
+
+// 进入/退出角色模式。角色登陆"当前聚焦"的地形行星/卫星(恒星/气态不可登陆)。
+function setCharacter(on) {
+  if (on) {
+    const b = focusBody();
+    let e = b && detailMap.get(b);
+    if (b && !e && b.type !== 'star' && !tuneFor(b).gas) e = addDetail(b);   // 需要时立即建地形
+    if (!b || b.type === 'star' || tuneFor(b).gas || !e || !e.planet) {
+      params.character = false; characterCtrl.updateDisplay();
+      alert('请先聚焦一颗地形行星/卫星(非恒星、非气态), 再进入角色模式');
+      return;
+    }
+    if (!walker) { walker = new PlanetWalker(e.planet, renderer.domElement); scene.add(walker.mesh); }
+    else walker.planet = e.planet;
+    walker.pitchMin = -1.3; walker.pitchMax = 1.45;   // 全范围俯仰: 可仰头看天/俯瞰
+    charMode = true;
+    controls.enabled = false;
+    walker.enable(camera.position.clone().normalize());   // 在轨道相机对着的地表处出生
+    walker.setActive(true);
+    walker.camera.aspect = innerWidth / innerHeight;
+    walker.camera.updateProjectionMatrix();
+  } else {
+    charMode = false;
+    if (walker) { walker.setActive(false); walker.disable(); }
+    controls.enabled = true;
+  }
+}
+// 供其它地方(如切换聚焦)安全退出角色模式并同步 GUI 开关
+function exitCharacter() {
+  if (!charMode) return;
+  params.character = false;
+  if (typeof characterCtrl !== 'undefined' && characterCtrl) characterCtrl.updateDisplay();
+  setCharacter(false);
+}
 
 function refreshFocusOptions() {
   const names = system.bodies.map((b) => b.name);
@@ -486,6 +528,7 @@ const _pointer = new THREE.Vector2();
 let _downXY = null;
 renderer.domElement.addEventListener('pointerdown', (e) => { _downXY = { x: e.clientX, y: e.clientY }; });
 renderer.domElement.addEventListener('pointerup', (e) => {
+  if (charMode) return;                 // 角色模式: 点击用于锁定视角, 不切换聚焦
   if (!_downXY) return;
   const moved = Math.hypot(e.clientX - _downXY.x, e.clientY - _downXY.y);
   _downXY = null;
@@ -666,7 +709,7 @@ function syncFocusCfg(newBody) {
   editingBody = newBody;
   loadCfg(newBody);
 }
-function onFocusChange() { const b = focusBody(); syncFocusCfg(b); syncBodyEdit(); updateGuiForFocus(); }
+function onFocusChange() { if (charMode) exitCharacter(); const b = focusBody(); syncFocusCfg(b); syncBodyEdit(); updateGuiForFocus(); }
 
 function hashSeed(str) {
   let h = 2166136261;
@@ -770,7 +813,7 @@ function removeDetail(body) {
 function clearAllDetail() { for (const b of [...detailMap.keys()]) removeDetail(b); }
 
 // 相机到某天体渲染位(body.pos - _off)的距离
-function camDistTo(body) { return camera.position.distanceTo(_tmpV.copy(body.pos).sub(_off)); }
+function camDistTo(body) { return renderCam().position.distanceTo(_tmpV.copy(body.pos).sub(_off)); }
 
 // 每帧维护"常驻"的 LOD 行星集合:
 //   - 每个非恒星天体都始终有一颗 LOD 行星(远离时 LOD 自然降到最低细分, 不切简单球);
@@ -799,7 +842,7 @@ function manageDetail() {
       continue;
     }
     e.planet.position.copy(b.pos).sub(_off);   // 定位到浮动原点空间(聚焦天体处为原点)
-    e.planet.update(camera);
+    e.planet.update(renderCam());
     if (e.ocean) {
       e.ocean.position.copy(e.planet.position);
       e.ocean.visible = camDistTo(b) < b.radius * ATMO_DIST;   // 近距才画水面(远处地形海洋色兜底)
@@ -1060,6 +1103,7 @@ let e0 = null, cloudTime = 0;
 addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight;
   camera.updateProjectionMatrix();
+  if (walker) { walker.camera.aspect = innerWidth / innerHeight; walker.camera.updateProjectionMatrix(); }
   renderer.setSize(innerWidth, innerHeight);
   const pr = renderer.getPixelRatio();
   const rw = Math.floor(innerWidth * pr), rh = Math.floor(innerHeight * pr);
@@ -1086,22 +1130,31 @@ function animate() {
     }
   }
 
-  controls.update();
+  if (charMode) walker.update(dt);   // 角色: WASD/鼠标驱动, 相机由 walker 管理
+  else controls.update();
   manageDetail();
   updateRender();
-  updateCameraRange();   // 动态 near/far(在场景渲染前设好投影)
+  if (charMode) {
+    // 角色模式: walker 自管相机 near/far; 星空只需跟随角色相机
+    walker.camera.getWorldPosition(_tmpV);
+    starField.position.copy(_tmpV);
+    starField.scale.setScalar(walker.camera.far * 0.9);
+  } else {
+    updateCameraRange();   // 动态 near/far(在场景渲染前设好投影)
+  }
 
-  // 场景 → HDR RT(带深度)
+  // 场景 → HDR RT(带深度)。角色模式下用角色相机渲染整条管线。
+  const rcam = renderCam();
   renderer.setRenderTarget(sceneRT);
   renderer.clear();
-  renderer.render(scene, camera);
+  renderer.render(scene, rcam);
   renderer.setRenderTarget(null);
 
   // 管线: 场景 → (最近一颗启用云的行星: 云 pass) → 每颗启用大气的行星(ping-pong) → 屏幕(末端 tonemap)。
   // 逆 view-proj / 相机世界坐标 大气和云都要, 先算一次。
-  _pv.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
+  _pv.multiplyMatrices(rcam.projectionMatrix, rcam.matrixWorldInverse);
   _ivp.copy(_pv).invert();
-  camera.getWorldPosition(_camW);
+  rcam.getWorldPosition(_camW);
 
   // ---- 云 pass: 只给最近的、启用云、且相机够近的一颗行星跑(体积 raymarch 很贵) ----
   let cloudEntry = null, cloudD = Infinity;
@@ -1183,10 +1236,13 @@ function animate() {
   const e = system.energy();
   if (e0 === null) e0 = e.total;
   const drift = e0 !== 0 ? ((e.total - e0) / Math.abs(e0) * 100) : 0;
+  const hint = charMode
+    ? `角色: ${params.focus} · 点击锁定视角 · WASD 移动 · 空格跳 · 鼠标看 · ESC 释放(取消勾选退出)`
+    : `聚焦: ${params.focus} · 点击天体切换观察中心 · 拖动旋转 · 滚轮缩放`;
   hud.innerHTML =
     `天体: ${system.bodies.length} · G=${params.G.toFixed(2)} · t=${system.time.toFixed(0)}<br>` +
     `总能量: ${e.total.toExponential(3)} · 漂移: ${drift.toFixed(3)}%(越小越稳)<br>` +
-    `聚焦: ${params.focus} · 点击天体切换观察中心 · 拖动旋转 · 滚轮缩放`;
+    hint;
 }
 
 rebuild();

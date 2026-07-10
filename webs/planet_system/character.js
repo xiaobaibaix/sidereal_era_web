@@ -21,6 +21,8 @@ export class PlanetWalker {
     this.feetOffset = 2.0;    // 胶囊中心到脚底(= 胶囊半高)
     this.camDist = 14;
     this.camHeight = 6;
+    this.pitchMin = -0.2;     // 俯仰下限(越负越能仰头看天; 太接近 -π/2 相机会翻转)
+    this.pitchMax = 1.35;     // 俯仰上限(越大越俯瞰; 太接近 +π/2 相机会翻转)
 
     // 状态
     this.position = new THREE.Vector3(0, planet.params.radius + 5, 0);
@@ -111,7 +113,7 @@ export class PlanetWalker {
     // 鼠标: yaw 绕 up 旋转 forward, pitch 调相机仰角(仅激活时)
     if (this.active) {
       if (this._dYaw) { this.forward.applyAxisAngle(this._n, this._dYaw); this._dYaw = 0; }
-      this.pitch = Math.max(-0.2, Math.min(1.35, this.pitch + this._dPitch)); this._dPitch = 0;
+      this.pitch = Math.max(this.pitchMin, Math.min(this.pitchMax, this.pitch + this._dPitch)); this._dPitch = 0;
     } else { this._dYaw = 0; this._dPitch = 0; }
 
     // forward 重新投影到切平面
