@@ -204,6 +204,8 @@ function applyCloudUniforms(u, body, planet, c) {
 // 系统构建
 // ----------------------------------------------------------------------------
 let system, entries, starBody, particlePoints = null;
+let beltCount = 0;                     // 前 beltCount 个粒子是小行星带(绕恒星), 其余是行星环(绕 ringPlanet)
+let ringPlanet = null;                 // 行星环所绕的行星(用于计算环粒子相对该行星的昼夜)
 const _off = new THREE.Vector3();      // 浮动原点偏移(聚焦天体位置)
 const _AX = new THREE.Vector3(1, 0, 0);
 
@@ -247,9 +249,11 @@ function buildParticles() {
     const vel = new THREE.Vector3(-Math.sin(ph), 0, Math.cos(ph)).multiplyScalar(vmag).add(starBody.vel);
     system.addParticle(pos, vel);
   }
+  beltCount = system.particles.length;   // 之前加入的都是小行星带(绕恒星)
   const rc = CONFIG.ring;
   const rInner = rc.inner * S, rOuter = rc.outer * S, rThick = rc.thickness * S;
   const planet = system.bodies.find((b) => b.name === rc.planet);
+  ringPlanet = planet || null;
   if (planet) {
     for (let i = 0; i < rc.count; i++) {
       const r = rInner + Math.random() * (rOuter - rInner);
@@ -277,10 +281,12 @@ function disposeMeshes() {
 }
 
 function buildParticleMesh() {
+  const n = system.particles.length;
   const geo = new THREE.BufferGeometry();
-  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(system.particles.length * 3), 3));
+  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(n * 3), 3));
+  geo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(n * 3), 3));   // 每帧按昼夜写入
   particlePoints = new THREE.Points(geo, new THREE.PointsMaterial({
-    color: 0x9aa2b2, size: 3.2, sizeAttenuation: true, transparent: true, opacity: 0.9,
+    size: 3.2, sizeAttenuation: true, transparent: true, opacity: 0.9, vertexColors: true,
   }));
   particlePoints.frustumCulled = false;
   scene.add(particlePoints);
@@ -379,12 +385,34 @@ function updateRender() {
   // 小行星带 / 环粒子(相对浮动原点)
   if (particlePoints) {
     if (params.showBelt) {
-      const arr = particlePoints.geometry.attributes.position.array;
+      const posArr = particlePoints.geometry.attributes.position.array;
+      const colArr = particlePoints.geometry.attributes.color.array;
       const P = system.particles;
+      // 基础色 ~0x9aa2b2; 夜面压到 DARK(近黑)。环粒子(绕行星)按"相对该行星的太阳方向"昼夜着色;
+      // 带粒子(绕恒星, 光源在环中心)始终受光 → lit=1。
+      const BR = 0.604, BG = 0.635, BB = 0.698, DARK = 0.0;   // 背阳侧完全变黑(在阴影中的环片段消失)
+      const hasRing = !!ringPlanet;
+      let sux = 0, suy = 0, suz = 0;
+      if (hasRing) {
+        const dx = starBody.pos.x - ringPlanet.pos.x, dy = starBody.pos.y - ringPlanet.pos.y, dz = starBody.pos.z - ringPlanet.pos.z;
+        const dl = Math.hypot(dx, dy, dz) || 1;
+        sux = dx / dl; suy = dy / dl; suz = dz / dl;   // 行星 → 恒星 单位向量
+      }
       for (let i = 0; i < P.length; i++) {
-        arr[i * 3] = P[i].pos.x - _off.x; arr[i * 3 + 1] = P[i].pos.y - _off.y; arr[i * 3 + 2] = P[i].pos.z - _off.z;
+        const px = P[i].pos.x, py = P[i].pos.y, pz = P[i].pos.z;
+        posArr[i * 3] = px - _off.x; posArr[i * 3 + 1] = py - _off.y; posArr[i * 3 + 2] = pz - _off.z;
+        let lit = 1.0;
+        if (hasRing && i >= beltCount) {
+          const ox = px - ringPlanet.pos.x, oy = py - ringPlanet.pos.y, oz = pz - ringPlanet.pos.z;
+          const ol = Math.hypot(ox, oy, oz) || 1;
+          const d = (ox * sux + oy * suy + oz * suz) / ol;   // 粒子方位相对太阳: 1=朝阳, -1=背阳
+          const t = Math.min(1, Math.max(0, (d + 0.2) / 0.4));
+          lit = DARK + (1 - DARK) * (t * t * (3 - 2 * t));   // smoothstep(-0.2,0.2): 背阳半环变暗
+        }
+        colArr[i * 3] = BR * lit; colArr[i * 3 + 1] = BG * lit; colArr[i * 3 + 2] = BB * lit;
       }
       particlePoints.geometry.attributes.position.needsUpdate = true;
+      particlePoints.geometry.attributes.color.needsUpdate = true;
       particlePoints.visible = true;
     } else {
       particlePoints.visible = false;
