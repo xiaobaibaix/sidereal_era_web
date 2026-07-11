@@ -93,6 +93,26 @@ export function createAtmospherePass() {
     uUseLUT: { value: 1.0 },          // 1=查表加速, 0=实时 raymarch(回退)
     uOzone: { value: new THREE.Vector3(0.007, 0.02, 0.0009) }, // 臭氧吸收(绿>红>蓝)
     uDither: { value: 1.0 },          // raymarch 抖动强度(去 banding)
+
+    // —— 体积云(与大气在同一 raymarch 内统一积分, 避免两层硬切产生的分界线)——
+    uCloudsOn: { value: 0.0 },        // 1=在同一积分里叠加云(统一介质); 0=纯大气(与旧版逐字节一致)
+    uCloudSteps: { value: 24 },       // 云壳内细步数(壳外用粗步, 既保云细节又不浪费步数在空大气上)
+    uBottom: { value: 101.0 },        // 云层底半径
+    uTop: { value: 106.0 },           // 云层顶半径
+    uCoverage: { value: 0.5 },        // 覆盖率(越大云越多)
+    uCloudDensity: { value: 1.2 },    // 云密度(消光强度)
+    uFreq: { value: 0.06 },           // 噪声频率(越大云越碎)
+    uWarp: { value: 0.5 },            // 域扭曲强度(飘逸感)
+    uWind: { value: new THREE.Vector3(1, 0, 0.3) }, // 风向
+    uWindSpeed: { value: 0.6 },       // 飘动速度
+    uCloudLightSteps: { value: 6 },   // 云向太阳自阴影步数
+    uAbsorb: { value: 1.0 },          // 云光照吸收(自阴影强度)
+    uSunColor: { value: new THREE.Vector3(1.7, 1.6, 1.5) }, // 云受阳光颜色(HDR)
+    uAmbient: { value: new THREE.Vector3(0.28, 0.34, 0.45) }, // 天空环境光
+    uSilver: { value: 1.0 },          // 银边(前向散射相位)强度
+    uPowder: { value: 0.6 },          // powder 暗边强度(0=关)
+    uCloudShadow: { value: 0.7 },     // 云影投到地表强度(0=关)
+    uTime: { value: 0 },              // 云飘动时间
   };
 
   const material = new THREE.ShaderMaterial({
@@ -137,6 +157,26 @@ export function createAtmospherePass() {
       uniform float uDither;           // raymarch 起点抖动强度(去 banding)
       uniform sampler2D uTransLUT;     // 透射率 LUT
       uniform float uUseLUT;           // 1=查表, 0=实时 raymarch
+
+      // 云(与大气统一积分)
+      uniform float uCloudsOn;
+      uniform int   uCloudSteps;
+      uniform float uBottom;
+      uniform float uTop;
+      uniform float uCoverage;
+      uniform float uCloudDensity;
+      uniform float uFreq;
+      uniform float uWarp;
+      uniform vec3  uWind;
+      uniform float uWindSpeed;
+      uniform int   uCloudLightSteps;
+      uniform float uAbsorb;
+      uniform vec3  uSunColor;
+      uniform vec3  uAmbient;
+      uniform float uSilver;
+      uniform float uPowder;
+      uniform float uCloudShadow;
+      uniform float uTime;
 
       const float PI = 3.14159265359;
 
@@ -223,6 +263,96 @@ export function createAtmospherePass() {
         return smoothstep(-soft, soft, sinElev + dip);
       }
 
+      // ===== 体积云辅助(与大气在同一 raymarch 内积分)=====
+      // Henyey-Greenstein 相位; 双叶(前向峰=银边 + 一点后向)近似米氏
+      float hg(float mu, float g) {
+        float g2 = g * g;
+        return (1.0 - g2) / (4.0 * PI * pow(max(1.0 + g2 - 2.0 * g * mu, 1e-4), 1.5));
+      }
+      float cloudPhase(float mu) {
+        return mix(hg(mu, 0.8), hg(mu, -0.5), 0.5);
+      }
+
+      float hash3(vec3 p) {
+        p = fract(p * 0.3183099 + 0.1);
+        p *= 17.0;
+        return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+      }
+      float vnoise(vec3 x) {
+        vec3 i = floor(x); vec3 f = fract(x);
+        f = f * f * (3.0 - 2.0 * f);
+        return mix(mix(mix(hash3(i + vec3(0,0,0)), hash3(i + vec3(1,0,0)), f.x),
+                       mix(hash3(i + vec3(0,1,0)), hash3(i + vec3(1,1,0)), f.x), f.y),
+                   mix(mix(hash3(i + vec3(0,0,1)), hash3(i + vec3(1,0,1)), f.x),
+                       mix(hash3(i + vec3(0,1,1)), hash3(i + vec3(1,1,1)), f.x), f.y), f.z);
+      }
+      float fbm(vec3 p, int oct) {
+        float s = 0.0, a = 0.5;
+        for (int i = 0; i < 5; i++) { if (i >= oct) break; s += a * vnoise(p); p *= 2.02; a *= 0.5; }
+        return s;
+      }
+
+      // 云密度: 高度梯度(上下边缘渐隐) × 覆盖阈值化的 fbm。
+      // hi=true 为视线采样(带域扭曲 + 4 octave, 高细节); false 为光照采样(便宜: 无扭曲 + 3 octave)。
+      float cloudDensity(vec3 pos, bool hi) {
+        float r = length(pos - uPlanetCenter);
+        float thick = max(uTop - uBottom, 1e-4);
+        float h = (r - uBottom) / thick;                       // 0=云底, 1=云顶
+        if (h < -1.3 || h > 1.2) return 0.0;                   // 云底以下留长尾巴渐隐(陡段藏在地面下)
+        // 底面渐隐【陡段挪到地面以下】: smoothstep(-1.2,0.6,h) 的最陡点在 h≈-0.3(即地表以下, 被行星遮住),
+        // 可见范围(h≥-0.2)内密度变化很平 → 云底切线处不再有集中亮度跳变。
+        // 让云在暖色大气辉光里慢慢浮现/消散, 而不是在云底球面处整齐冒出来 → 边界被混合掉。
+        float heightGrad = smoothstep(-1.2, 0.6, h) * (1.0 - smoothstep(0.6, 1.2, h));
+        vec3 sp = (pos - uPlanetCenter) * uFreq + uWind * (uTime * uWindSpeed);
+        float base;
+        if (hi) {
+          vec3 w = vec3(fbm(sp * 0.5 + 11.5, 2), fbm(sp * 0.5 + 47.2, 2), fbm(sp * 0.5 + 83.1, 2)) - 0.5;
+          base = fbm(sp + uWarp * w, 4);
+        } else {
+          base = fbm(sp, 3);
+        }
+        float thr = 1.0 - uCoverage;
+        return smoothstep(thr, thr + 0.4, base * heightGrad);  // 阈值过渡加宽(0.18→0.4): 云边缘更软
+      }
+
+      // 云向太阳的自阴影(Beer): 沿 sunDir 累积密度(用便宜密度)
+      float lightMarch(vec3 pos) {
+        float st = (uTop - uBottom) / float(uCloudLightSteps);
+        float sum = 0.0;
+        vec3 q = pos;
+        for (int i = 0; i < 12; i++) {
+          if (i >= uCloudLightSteps) break;
+          q += uSunDir * st;
+          sum += cloudDensity(q, false) * st;
+        }
+        return exp(-sum * uCloudDensity * uAbsorb);
+      }
+
+      // 昼夜: 采样点当地地平上太阳仰角(软过渡)
+      float dayFactor(vec3 pos) {
+        vec3 up = normalize(pos - uPlanetCenter);
+        return smoothstep(-0.12, 0.12, dot(up, uSunDir));
+      }
+
+      // 地表点的云影: 从地面点沿太阳方向穿过云层累积密度 → 透射率(1=无遮, 0=全影)
+      float cloudShadow(vec3 gp) {
+        vec2 o = raySphere(gp, uSunDir, uPlanetCenter, uTop);
+        vec2 inr = raySphere(gp, uSunDir, uPlanetCenter, uBottom);
+        float s0 = max(inr.y, 0.0);   // 穿出云底球 = 进入云层
+        float s1 = o.y;               // 穿出云顶球
+        if (s1 <= s0) return 1.0;
+        int N = uCloudLightSteps;
+        float st = (s1 - s0) / float(N);
+        float sum = 0.0;
+        vec3 q = gp + uSunDir * (s0 + st * 0.5);
+        for (int i = 0; i < 12; i++) {
+          if (i >= N) break;
+          sum += cloudDensity(q, false) * st;
+          q += uSunDir * st;
+        }
+        return exp(-sum * uCloudDensity * uAbsorb);
+      }
+
       void main() {
         vec3 sceneColor = texture2D(tDiffuse, vUv).rgb;   // 线性 HDR
         if (uEnabled < 0.5) { gl_FragColor = vec4(outColor(sceneColor), 1.0); return; }
@@ -235,9 +365,13 @@ export function createAtmospherePass() {
 
         float depth = texture2D(tDepth, vUv).x;
         float sceneDist = 1e20;
+        vec3 hitPos = ro;
+        bool hitGround = false;
         if (depth < 1.0) {
           vec4 hp = uInvViewProj * vec4(ndc, depth * 2.0 - 1.0, 1.0);
-          sceneDist = distance(hp.xyz / hp.w, uCamPos);
+          hitPos = hp.xyz / hp.w;
+          sceneDist = distance(hitPos, uCamPos);
+          hitGround = true;
         }
 
         // 视线在大气壳内的区间
@@ -252,25 +386,82 @@ export function createAtmospherePass() {
         if (gnd.x > 0.0 && gnd.y > gnd.x) tFar = min(tFar, gnd.x);
         if (tFar <= tNear) { gl_FragColor = vec4(outColor(sceneColor), 1.0); return; }
 
-        int N = uSteps;
-        float step = (tFar - tNear) / float(N);
-        vec3 odView = vec3(0.0);
-        vec3 sumR = vec3(0.0);
-        vec3 sumM = vec3(0.0);
+        // 背景 = 场景色(行星/海洋)。命中地表时把云影投上去(仅白天侧)。
+        vec3 background = sceneColor;
+        if (uCloudsOn > 0.5 && uCloudShadow > 0.0 && hitGround &&
+            length(hitPos - uPlanetCenter) < uTop) {
+          float day = dayFactor(hitPos);
+          if (day > 0.01) {
+            float sh = cloudShadow(hitPos);
+            background *= mix(1.0, sh, uCloudShadow * day);
+          }
+        }
+
+        // 统一步长(非自适应): 自适应会在球壳边界(uBottom/uTop)切换粗/细步, 那条球面切线上
+        // 大气被不同密度地采样 → 颜色跳变(就是边界线)。云开时整段用足够细的【统一】步长,
+        // 任何半径上都没有采样跳变 → 不会有球面切线产生的线; 配合 cloudDensity 的长尾渐隐
+        // (云底以下也有渐变密度, 填满原空心), 云底被自然混合掉。
+        float span = tFar - tNear;
+        int Nmarch = (uCloudsOn > 0.5) ? max(uSteps, uCloudSteps * 2) : uSteps;
+        float stepU = span / float(Nmarch);
 
         // 起点抖动: 打散低步数产生的同心圆条带
         float jitter = mix(0.5, hash12(gl_FragCoord.xy), uDither);
-        vec3 p = ro + rd * (tNear + step * jitter);
-        for (int i = 0; i < 64; i++) {
-          if (i >= N) break;
-          vec3 dens = densityAt(p) * step;
-          odView += dens;
+        float t = tNear + stepU * jitter;
 
+        // 相位(每像素常量)
+        float mu = dot(rd, uSunDir);
+        float phaseR = 3.0 / (16.0 * PI) * (1.0 + mu * mu);
+        float g = uMieG, g2 = g * g;
+        float phaseM = 3.0 / (8.0 * PI)
+                     * ((1.0 - g2) * (1.0 + mu * mu))
+                     / ((2.0 + g2) * pow(1.0 + g2 - 2.0 * g * mu, 1.5));
+        bool clouds = uCloudsOn > 0.5;
+        // 云相位: 0.4 基底保证背光侧也有照明, 再叠前向银边
+        float cphase = clouds ? (0.4 + uSilver * cloudPhase(mu)) : 0.0;
+        bool useLUT = uUseLUT > 0.5;
+
+        // 统一 front-to-back 合成: T=剩余透射(分通道), L=累计内散射(已含前向透射)。
+        // 大气与云在【同一条视线积分】里一起采样 → 云只是连续大气里更密的一团,
+        // 不再有分层分界线; 深度顺序(云前/云内/云后的大气)也天然正确。
+        vec3 T = vec3(1.0);
+        vec3 L = vec3(0.0);
+        for (int i = 0; i < 512; i++) {
+          if (t >= tFar) break;
+          // 每步微抖动打散同心环(低幅, 不破坏能量守恒)
+          float jit = (hash12(gl_FragCoord.xy + vec2(float(i) * 7.31, float(i) * 3.17)) - 0.5) * stepU * 0.25 * uDither;
+          vec3 p = ro + rd * (t + jit);
+          float r = length(p - uPlanetCenter);
+          float ds = min(stepU, tFar - t);                          // 统一步长, 不越过终点(地表)
+
+          // —— 大气: 密度(R,M,O)×ds → 本步消光 sigA + 内散射源 srcA ——
+          vec3 dens = densityAt(p) * ds;                             // 本步光学深度贡献
+          vec3 sigA = uScatterR * dens.x + uOzone * dens.z
+                    + vec3(uScatterM * 1.1 * dens.y);                // 本步大气消光(分通道)
+
+          // —— 云: 壳外早退(便宜); 壳内才算自阴影 + 受光 ——
+          float sigC = 0.0;                                          // 本步云消光
+          vec3 srcC = vec3(0.0);                                     // 本步云源
+          if (clouds) {
+            float dcl = cloudDensity(p, true);
+            if (dcl > 0.0) {
+              float sun = lightMarch(p);                            // 向太阳透射率(Beer 自阴影)
+              float sunUp = dot(normalize(p - uPlanetCenter), uSunDir);
+              float day = smoothstep(-0.12, 0.12, sunUp);           // 直射昼夜(窄)
+              float amb = smoothstep(-0.4, 0.15, sunUp);            // 环境光昼夜(宽, 含暮光)
+              float powder = mix(1.0, 1.0 - exp(-dcl * uCloudDensity * 2.0), uPowder);
+              vec3 lit = uSunColor * (sun * day * cphase * powder) + uAmbient * amb;
+              sigC = dcl * uCloudDensity * ds;
+              srcC = sigC * lit;
+            }
+          }
+
+          // —— 大气内散射源: 太阳→p 透射(LUT/回退) × 行星软遮挡 × 散射×相位×密度 ——
+          vec3 srcA = vec3(0.0);
           float shadow = planetShadow(p, uSunDir);
           if (shadow > 0.0) {
-            // 太阳方向光学深度: 查 LUT(球对称精确, 省内循环) 或回退实时 march
             vec3 odSun;
-            if (uUseLUT > 0.5) {
+            if (useLUT) {
               float rr = length(p - uPlanetCenter);
               float mus = dot(normalize(p - uPlanetCenter), uSunDir);
               vec2 luv = vec2(mus * 0.5 + 0.5,
@@ -279,32 +470,28 @@ export function createAtmospherePass() {
             } else {
               odSun = opticalDepthToSun(p, uSunDir);
             }
-            // 消光 = 瑞利 + 米氏(散射×1.1) + 臭氧(纯吸收)
-            vec3 tau = uScatterR * (odView.x + odSun.x)
-                     + uScatterM * 1.1 * (odView.y + odSun.y)
-                     + uOzone * (odView.z + odSun.z);
-            vec3 T = exp(-tau) * shadow;   // 软遮挡: 晨昏线平滑过渡
-            sumR += dens.x * T;
-            sumM += dens.y * T;
+            vec3 Tsun = exp(-(uScatterR * odSun.x + vec3(uScatterM * 1.1) * odSun.y
+                              + uOzone * odSun.z)) * shadow;
+            srcA = uSunIntensity * Tsun
+                 * (uScatterR * phaseR * dens.x + vec3(uScatterM * phaseM) * dens.y);
           }
-          p += rd * step;
+
+          // —— 合成本步: 大气与云共用同一消光/源, front-to-back ——
+          vec3 sigT = sigA + vec3(sigC);
+          vec3 src  = srcA + srcC;
+          if (dot(sigT, sigT) > 1e-12) {
+            vec3 dT = exp(-sigT);                                   // 本步透射
+            vec3 integ = src * (1.0 - dT) / max(sigT, vec3(1e-7));  // ∫src·exp(-sigT·t)dt(本步)
+            L += T * integ;
+            T *= dT;
+            // 不在此早退: 否则近侧云一旦较厚就跳过远侧云壳, 又变成"看不到后半球的云"。
+            // 统一步长已用 t>=tFar 限定总步数, 这里让它走完整段, 远侧云得以积分出来。
+          }
+          t += ds;
         }
 
-        // 相位函数
-        float mu = dot(rd, uSunDir);
-        float phaseR = 3.0 / (16.0 * PI) * (1.0 + mu * mu);
-        float g = uMieG, g2 = g * g;
-        float phaseM = 3.0 / (8.0 * PI)
-                     * ((1.0 - g2) * (1.0 + mu * mu))
-                     / ((2.0 + g2) * pow(1.0 + g2 - 2.0 * g * mu, 1.5));
-
-        // 线性 HDR 内散射(不在这里 tonemap, 留到末端统一处理)
-        vec3 inscatter = uSunIntensity *
-            (sumR * uScatterR * phaseR + sumM * uScatterM * phaseM);
-
-        // aerial perspective: 地表颜色被视线透射率衰减(含臭氧), 再叠加内散射(全在线性 HDR 空间)
-        vec3 Tview = exp(-(uScatterR * odView.x + uScatterM * 1.1 * odView.y + uOzone * odView.z));
-        vec3 color = sceneColor * Tview + inscatter;
+        // 背景(地表)被整段介质衰减 + 累计内散射(全在线性 HDR 空间)
+        vec3 color = background * T + L;
 
         gl_FragColor = vec4(outColor(color), 1.0);   // 末端 tonemap(或多行星中间 pass 输出线性HDR)
       }
@@ -439,10 +626,11 @@ export function createCloudPass() {
       // hi=true 为视线采样(带域扭曲 + 4 octave, 高细节); false 为光照采样(便宜: 无扭曲 + 3 octave)。
       float cloudDensity(vec3 pos, bool hi) {
         float r = length(pos - uPlanetCenter);
-        float h = (r - uBottom) / max(uTop - uBottom, 1e-4);   // 0..1
-        if (h < 0.0 || h > 1.0) return 0.0;
-        // 高度权重: 中间浓、上下柔和渐隐(范围放宽, 过渡更软)
-        float heightGrad = smoothstep(0.0, 0.3, h) * (1.0 - smoothstep(0.45, 1.0, h));
+        float thick = max(uTop - uBottom, 1e-4);
+        float h = (r - uBottom) / thick;                       // 0=云底, 1=云顶
+        if (h < -1.3 || h > 1.2) return 0.0;                   // 与大气 pass 一致: 云底留长尾巴渐隐
+        // 高度权重: 与大气 pass 统一, 上下大范围软渐隐
+        float heightGrad = smoothstep(-1.2, 0.6, h) * (1.0 - smoothstep(0.6, 1.2, h));
 
         // 噪声锚定到行星中心(而非世界原点): 行星在渲染空间移动(如聚焦卫星时浮动原点随卫星公转
         // 漂移)也不会让云"滑动/沸腾"。主项目行星在原点 → pos-uPlanetCenter==pos, 行为不变。
@@ -456,7 +644,7 @@ export function createCloudPass() {
         }
         // 关键: 先把噪声乘上高度权重再阈值化 → 云顶/云底被噪声啃成参差形状, 不再是平切的球面
         float thr = 1.0 - uCoverage;
-        return smoothstep(thr, thr + 0.18, base * heightGrad);
+        return smoothstep(thr, thr + 0.4, base * heightGrad);  // 与大气 pass 一致: 阈值过渡加宽
       }
 
       // 向太阳的自阴影(Beer): 沿 sunDir 累积密度(用便宜密度)
@@ -524,12 +712,12 @@ export function createCloudPass() {
         // 视线与云壳区间 = 外壳内部 - 内壳内部
         vec2 outer = raySphere(ro, rd, uPlanetCenter, uTop);
         vec2 inner = raySphere(ro, rd, uPlanetCenter, uBottom);
-        // 命中区间(取外壳内、内壳外的两段中靠前那段)
+        // 命中区间: 取外壳内整段(含近侧云壳 + 空心 + 远侧云壳)。
+        // 不再在近侧内壳硬停 —— 否则远侧云壳永远不积分, 云层就像个不透明的空壳,
+        // 后半球的云看不到(就是用户观察到的那条切线)。空心区 cloudDensity≈0, 走过去很便宜。
         float t0 = max(outer.x, 0.0);
         float t1 = outer.y;
         if (t1 <= t0) { gl_FragColor = vec4(sceneColor, 1.0); return; }
-        // 若内壳被命中, 视线穿过空心区: 只积到内壳近交点(近段云)
-        if (inner.x > t0 && inner.x < t1) t1 = inner.x;
         // 相机在内壳里(地表附近)向上看: 从内壳远交点开始
         if (inner.x < 0.0 && inner.y > 0.0) t0 = max(t0, inner.y);
         t1 = min(t1, sceneDist);

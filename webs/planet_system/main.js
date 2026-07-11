@@ -8,7 +8,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
 import GUI from 'lil-gui';
 import { Planet } from '../../src/planet.js';
-import { createOcean, createAtmospherePass, createCloudPass, createGodrayPass, createTransmittanceLUT } from '../../src/effects.js';
+import { createOcean, createAtmospherePass, createGodrayPass, createTransmittanceLUT } from '../../src/effects.js';
 import { PlanetWalker } from './character.js';
 
 // ----------------------------------------------------------------------------
@@ -60,7 +60,7 @@ const params = {
   cloudFreq: 0.06,          // 噪声频率(越大越碎)
   cloudWarp: 0.5,           // 域扭曲(飘逸)
   cloudWindSpeed: 0.6,      // 飘动速度
-  cloudSteps: 24,           // 视线步数
+  cloudSteps: 24,           // 云壳内细步数(视线穿过云层时的采样密度; 越高云越细腻越耗)
   cloudLightSteps: 6,       // 太阳方向步数
   cloudAbsorb: 1.0,         // 自阴影强度
   cloudSilver: 1.0,         // 银边(前向散射)强度
@@ -292,7 +292,8 @@ function makeSceneRT(w, h) {
   rt.depthTexture.type = THREE.UnsignedIntType;
   return rt;
 }
-// 云 pass 的中转 RT(HalfFloat 线性, 无深度): 场景→rtScene→云→rtCloud→大气→屏幕
+// 大气/God rays 的中转 RT(HalfFloat 线性, 无深度): 场景→rtScene→大气(含云)→rtLit→God rays→屏幕
+// 注: 云不再单独成 pass, 而是与大气在同一条 raymarch 里统一积分(uCloudsOn=1)。
 function makeColorRT(w, h) {
   const rt = new THREE.WebGLRenderTarget(Math.max(1, w), Math.max(1, h), {
     minFilter: THREE.LinearFilter,
@@ -304,7 +305,6 @@ function makeColorRT(w, h) {
   return rt;
 }
 
-const cloudPass = createCloudPass();
 const godrayPass = createGodrayPass();
 const transLUT = createTransmittanceLUT();
 // 透射率 LUT 目标(x=太阳天顶余弦, y=高度), 大气参数变化时重烘
@@ -317,8 +317,6 @@ atmoPass.uniforms.uTransLUT.value = lutRT.texture;
 const _pr = renderer.getPixelRatio();
 const rtMain = makeSceneRT(innerWidth * _pr, innerHeight * _pr);
 const rtInset = makeSceneRT(1, 1);   // 尺寸随小窗动态调整
-const rtCloudMain = makeColorRT(innerWidth * _pr, innerHeight * _pr);
-const rtCloudInset = makeColorRT(1, 1);
 const rtLitMain = makeColorRT(innerWidth * _pr, innerHeight * _pr);   // 大气输出(供 God rays)
 const rtLitInset = makeColorRT(1, 1);
 const _sunProj = new THREE.Vector3(), _camFwd = new THREE.Vector3();
@@ -330,7 +328,6 @@ function resizeSceneRTs() {
   const pr = renderer.getPixelRatio();
   const w = Math.floor(innerWidth * pr), h = Math.floor(innerHeight * pr);
   rtMain.setSize(w, h);
-  rtCloudMain.setSize(w, h);
   rtLitMain.setSize(w, h);
 }
 resizeSceneRTs();
@@ -375,21 +372,24 @@ function layoutEffects() {
   lu.uMieFalloff.value = params.atmoMieFalloff;
   transLUT.render(renderer, lutRT);
 
-  // 云层 uniforms
-  const c = cloudPass.uniforms;
-  c.uBottom.value = params.radius * params.cloudBottom;
-  c.uTop.value = params.radius * params.cloudTop;
-  c.uCoverage.value = params.cloudCoverage;
-  c.uDensity.value = params.cloudDensity;
-  c.uFreq.value = params.cloudFreq / params.radius * 100.0;   // 频率随半径归一(基准 radius=100)
-  c.uWarp.value = params.cloudWarp;
-  c.uWindSpeed.value = params.cloudWindSpeed;
-  c.uSteps.value = params.cloudSteps;
-  c.uLightSteps.value = params.cloudLightSteps;
-  c.uAbsorb.value = params.cloudAbsorb;
-  c.uSilver.value = params.cloudSilver;
-  c.uPowder.value = params.cloudPowder;
-  c.uCloudShadow.value = params.cloudShadow;
+  // 云层 uniforms(与大气统一积分: uCloudsOn=1 时大气 pass 在同一 raymarch 里叠云,
+  // 不再单独跑云 pass, 消除“云底硬切大气”的分界线)
+  u.uCloudsOn.value = params.showClouds ? 1.0 : 0.0;
+  u.uBottom.value = params.radius * params.cloudBottom;
+  u.uTop.value = params.radius * params.cloudTop;
+  u.uCoverage.value = params.cloudCoverage;
+  u.uCloudDensity.value = params.cloudDensity;
+  u.uFreq.value = params.cloudFreq / params.radius * 100.0;   // 频率随半径归一(基准 radius=100)
+  u.uWarp.value = params.cloudWarp;
+  u.uWindSpeed.value = params.cloudWindSpeed;
+  u.uCloudLightSteps.value = params.cloudLightSteps;
+  u.uAbsorb.value = params.cloudAbsorb;
+  u.uSilver.value = params.cloudSilver;
+  u.uPowder.value = params.cloudPowder;
+  u.uCloudShadow.value = params.cloudShadow;
+  // 步数: 大气段用 atmoSteps(粗步); 云壳段用 cloudSteps(细步, 保云细节)。二者在同一条 march 里连续积分。
+  u.uSteps.value = params.atmoSteps;
+  u.uCloudSteps.value = params.cloudSteps;
 
   // God rays uniforms
   const g = godrayPass.uniforms;
@@ -411,8 +411,7 @@ function updateSun() {
   ).normalize();
   sun.position.copy(dir);
   ocean.material.uniforms.uSunDir.value.copy(dir);
-  atmoPass.uniforms.uSunDir.value.copy(dir);
-  cloudPass.uniforms.uSunDir.value.copy(dir);
+  atmoPass.uniforms.uSunDir.value.copy(dir);   // 云已并入大气 pass, 共用此方向
 }
 updateSun();
 
@@ -500,7 +499,7 @@ fAtmo.add(params, 'atmoDither', 0.0, 1.0).name('抖动去带').onChange(layoutEf
 fAtmo.add(params, 'atmoLUT').name('LUT 加速').onChange(layoutEffects);
 
 const fCloud = gui.addFolder('体积云');
-fCloud.add(params, 'showClouds').name('云层开关');
+fCloud.add(params, 'showClouds').name('云层开关').onChange(layoutEffects);
 fCloud.add(params, 'cloudCoverage', 0.0, 1.0).name('覆盖率').onChange(layoutEffects);
 fCloud.add(params, 'cloudDensity', 0.1, 4.0).name('密度').onChange(layoutEffects);
 fCloud.add(params, 'cloudFreq', 0.01, 0.2).name('噪声频率').onChange(layoutEffects);
@@ -509,7 +508,7 @@ fCloud.add(params, 'cloudWindSpeed', 0.0, 3.0).name('飘动速度').onChange(lay
 fCloud.add(params, 'cloudBottom', 1.0, 1.1).name('云底比例').onChange(layoutEffects);
 fCloud.add(params, 'cloudTop', 1.02, 1.2).name('云顶比例').onChange(layoutEffects);
 fCloud.add(params, 'cloudAbsorb', 0.2, 3.0).name('自阴影强度').onChange(layoutEffects);
-fCloud.add(params, 'cloudSteps', 8, 48, 1).name('视线步数').onChange(layoutEffects);
+fCloud.add(params, 'cloudSteps', 8, 48, 1).name('云层步数').onChange(layoutEffects);
 fCloud.add(params, 'cloudLightSteps', 2, 12, 1).name('光照步数').onChange(layoutEffects);
 fCloud.add(params, 'cloudSilver', 0.0, 3.0).name('银边(前向散射)').onChange(layoutEffects);
 fCloud.add(params, 'cloudPowder', 0.0, 1.0).name('powder 暗边').onChange(layoutEffects);
@@ -721,8 +720,8 @@ function updateSpectator(dt) {
   }
 }
 
-// 渲染一个视口: 场景 → RT(带深度) →(可选)体积云 →(可选)大气→rtLit→God rays → 屏幕。
-function renderView(cam, rt, rtCloud, rtLit, vpX, vpY, vpW, vpH, scissor) {
+// 渲染一个视口: 场景 → RT(带深度) →(可选)大气(云已并入同一 raymarch 统一积分)→rtLit→God rays → 屏幕。
+function renderView(cam, rt, rtLit, vpX, vpY, vpW, vpH, scissor) {
   // 1) 场景(行星 + 海洋)渲染到 RT。绑定 RT 后 three 会自动用整张 RT 作为视口。
   renderer.setScissorTest(false);
   renderer.setRenderTarget(rt);
@@ -730,28 +729,14 @@ function renderView(cam, rt, rtCloud, rtLit, vpX, vpY, vpW, vpH, scissor) {
   renderer.render(scene, cam);   // 这一步会刷新 cam.matrixWorldInverse
   renderer.setRenderTarget(null);
 
-  // 相机矩阵(云/大气 pass 共用)
+  // 相机矩阵(大气 pass 共用)
   _pv.multiplyMatrices(cam.projectionMatrix, cam.matrixWorldInverse);
   _invVP.copy(_pv).invert();
   cam.getWorldPosition(_camPos);
 
-  // 2) 体积云 pass: 场景 → rtCloud(线性 HDR)。关时直接用场景 RT。
-  let srcTex = rt.texture;
-  if (params.showClouds) {
-    const cu = cloudPass.uniforms;
-    cu.tDiffuse.value = rt.texture;
-    cu.tDepth.value = rt.depthTexture;
-    cu.uInvViewProj.value.copy(_invVP);
-    cu.uCamPos.value.copy(_camPos);
-    renderer.setRenderTarget(rtCloud);
-    cloudPass.render(renderer);
-    renderer.setRenderTarget(null);
-    srcTex = rtCloud.texture;
-  }
-
-  // 3) 大气 pass。开 God rays 时先渲染到 rtLit(整张), 否则直接到屏幕视口。
+  // 2) 大气 pass(云由 uCloudsOn 控制, 已并入同一条 raymarch)。开 God rays 时先渲染到 rtLit(整张), 否则直接到屏幕视口。
   const u = atmoPass.uniforms;
-  u.tDiffuse.value = srcTex;
+  u.tDiffuse.value = rt.texture;
   u.tDepth.value = rt.depthTexture;
   u.uInvViewProj.value.copy(_invVP);
   u.uCamPos.value.copy(_camPos);
@@ -806,17 +791,17 @@ function renderViews() {
   const w = innerWidth, h = innerHeight;
 
   // 主画面(全屏)
-  renderView(mainCam(), rtMain, rtCloudMain, rtLitMain, 0, 0, w, h, false);
+  renderView(mainCam(), rtMain, rtLitMain, 0, 0, w, h, false);
 
   // 小窗(左上角): 独立视口 + 独立 RT(尺寸随小窗)
   if (params.showInset) {
     const iw = Math.max(1, Math.floor(insetW * pr));
     const ih = Math.max(1, Math.floor(insetH * pr));
     if (rtInset.width !== iw || rtInset.height !== ih) {
-      rtInset.setSize(iw, ih); rtCloudInset.setSize(iw, ih); rtLitInset.setSize(iw, ih);
+      rtInset.setSize(iw, ih); rtLitInset.setSize(iw, ih);
     }
     const x = INSET_MARGIN, y = h - insetH - INSET_MARGIN;
-    renderView(insetCam(), rtInset, rtCloudInset, rtLitInset, x, y, insetW, insetH, true);
+    renderView(insetCam(), rtInset, rtLitInset, x, y, insetW, insetH, true);
   }
 }
 
@@ -836,7 +821,7 @@ function animate() {
   else if (main === spectatorCamera) updateSpectator(dt);
   if (characterMode) walker.update(dt);           // 角色始终更新(输入由 active 门控)
 
-  cloudPass.uniforms.uTime.value = clock.elapsedTime;   // 云飘动
+  atmoPass.uniforms.uTime.value = clock.elapsedTime;   // 云飘动(云已并入大气 pass)
   updateClips();                                  // 动态近/远面, 消除 z-fighting
   planet.update(lodCam());                        // LOD 由主体相机(轨道/角色)驱动
   renderViews();
