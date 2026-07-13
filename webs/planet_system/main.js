@@ -50,6 +50,7 @@ const params = {
   atmoOzone: 0.02,          // 臭氧吸收强度(0=关, 日落品红/天空更纯净蓝)
   atmoDither: 0.5,          // raymarch 抖动强度(去同心圆 banding; 太高会变颗粒噪点)
   atmoLUT: true,            // 透射率 LUT 加速(省太阳方向内循环; 关=实时 raymarch)
+  atmoResolutionScale: 0.5, // 大气+云 pass 渲染比例(0.5=半分辨率, 体积云/大气是软效果, 半分辨率几乎无损, 帧率 ~3-4x)
 
   // 体积云(全屏 raymarch pass)
   showClouds: true,
@@ -317,10 +318,36 @@ const lutRT = new THREE.WebGLRenderTarget(256, 64, {
 });
 lutRT.texture.colorSpace = THREE.LinearSRGBColorSpace;
 atmoPass.uniforms.uTransLUT.value = lutRT.texture;
+
+// 升采样 blit pass: 半分辨率 rtLit → 全屏视口(双线性插值, 体积云/大气是软效果几乎无损)
+const blitPass = (() => {
+  const u = { tLit: { value: null } };
+  const mat = new THREE.ShaderMaterial({
+    uniforms: u,
+    depthTest: false, depthWrite: false,
+    vertexShader: /* glsl */`
+      varying vec2 vUv;
+      void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }
+    `,
+    fragmentShader: /* glsl */`
+      precision highp float;
+      varying vec2 vUv;
+      uniform sampler2D tLit;
+      void main() { gl_FragColor = texture2D(tLit, vUv); }
+    `,
+  });
+  const s = new THREE.Scene();
+  const c = new THREE.Camera();
+  const q = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), mat);
+  q.frustumCulled = false;
+  s.add(q);
+  return { uniforms: u, material: mat, render(renderer) { renderer.render(s, c); } };
+})();
+
 const _pr = renderer.getPixelRatio();
 const rtMain = makeSceneRT(innerWidth * _pr, innerHeight * _pr);
 const rtInset = makeSceneRT(1, 1);   // 尺寸随小窗动态调整
-const rtLitMain = makeColorRT(innerWidth * _pr, innerHeight * _pr);   // 大气输出(供 God rays)
+const rtLitMain = makeColorRT(1, 1);   // 大气输出(分辨率随 atmoResolutionScale 缩放, 在 resizeSceneRTs 设置)
 const rtLitInset = makeColorRT(1, 1);
 const _sunProj = new THREE.Vector3(), _camFwd = new THREE.Vector3();
 const _pv = new THREE.Matrix4();
@@ -331,7 +358,10 @@ function resizeSceneRTs() {
   const pr = renderer.getPixelRatio();
   const w = Math.floor(innerWidth * pr), h = Math.floor(innerHeight * pr);
   rtMain.setSize(w, h);
-  rtLitMain.setSize(w, h);
+  // 大气+云 pass 渲染分辨率(半分辨率时像素数 1/4, 软视觉效果几乎无损)
+  const sw = Math.max(1, Math.floor(w * params.atmoResolutionScale));
+  const sh = Math.max(1, Math.floor(h * params.atmoResolutionScale));
+  rtLitMain.setSize(sw, sh);
 }
 resizeSceneRTs();
 
@@ -500,6 +530,7 @@ fAtmo.add(params, 'atmoACES').name('ACES 电影色调').onChange(layoutEffects);
 fAtmo.add(params, 'atmoOzone', 0.0, 0.1).name('臭氧(日落品红)').onChange(layoutEffects);
 fAtmo.add(params, 'atmoDither', 0.0, 1.0).name('抖动去带').onChange(layoutEffects);
 fAtmo.add(params, 'atmoLUT').name('LUT 加速').onChange(layoutEffects);
+fAtmo.add(params, 'atmoResolutionScale', 0.25, 1.0, 0.05).name('大气渲染比例(性能↑)').onChange(resizeSceneRTs);
 
 const fCloud = gui.addFolder('体积云');
 fCloud.add(params, 'showClouds').name('云层开关').onChange(layoutEffects);
@@ -729,9 +760,9 @@ function updateSpectator(dt) {
   }
 }
 
-// 渲染一个视口: 场景 → RT(带深度) →(可选)大气(云已并入同一 raymarch 统一积分)→rtLit→God rays → 屏幕。
+// 渲染一个视口: 场景 → RT(带深度) →(可选)大气(云已并入同一 raymarch 统一积分)→rtLit→God rays/blit→屏幕。
 function renderView(cam, rt, rtLit, vpX, vpY, vpW, vpH, scissor) {
-  // 1) 场景(行星 + 海洋)渲染到 RT。绑定 RT 后 three 会自动用整张 RT 作为视口。
+  // 1) 场景(行星 + 海洋)渲染到 RT(全分辨率, 带深度)。绑定 RT 后 three 自动用整张 RT 作视口。
   renderer.setScissorTest(false);
   renderer.setRenderTarget(rt);
   renderer.clear();
@@ -743,7 +774,8 @@ function renderView(cam, rt, rtLit, vpX, vpY, vpW, vpH, scissor) {
   _invVP.copy(_pv).invert();
   cam.getWorldPosition(_camPos);
 
-  // 2) 大气 pass(云由 uCloudsOn 控制, 已并入同一条 raymarch)。开 God rays 时先渲染到 rtLit(整张), 否则直接到屏幕视口。
+  // 2) 大气 pass(云由 uCloudsOn 控制, 已并入同一条 raymarch)。无论是否开 God rays,
+  //    都先渲染到 rtLit(半分辨率以加速; rtLit 尺寸已在 resizeSceneRTs 中按 atmoResolutionScale 缩放)。
   const u = atmoPass.uniforms;
   u.tDiffuse.value = rt.texture;
   u.tDepth.value = rt.depthTexture;
@@ -751,30 +783,28 @@ function renderView(cam, rt, rtLit, vpX, vpY, vpW, vpH, scissor) {
   u.uCamPos.value.copy(_camPos);
   u.uEnabled.value = params.showAtmosphere ? 1.0 : 0.0;
 
-  if (params.showGodrays) {
-    renderer.setRenderTarget(rtLit);
-    atmoPass.render(renderer);
-    renderer.setRenderTarget(null);
+  renderer.setRenderTarget(rtLit);
+  atmoPass.render(renderer);
+  renderer.setRenderTarget(null);
 
-    // 4) God rays 到屏幕视口
+  renderer.setViewport(vpX, vpY, vpW, vpH);
+  if (scissor) { renderer.setScissorTest(true); renderer.setScissor(vpX, vpY, vpW, vpH); }
+
+  if (params.showGodrays) {
+    // God rays 自然把半分辨率 rtLit 上采样到屏幕(光束效果本身就是大幅模糊, 半分辨率几乎无损)
     const g = godrayPass.uniforms;
     g.tLit.value = rtLit.texture;
-    // 太阳屏幕位置 + 可见度(视线朝太阳夹角)
     _sunProj.copy(sun.position).multiplyScalar(1e7).project(cam);
     g.uSunUV.value.set(_sunProj.x * 0.5 + 0.5, _sunProj.y * 0.5 + 0.5);
     cam.getWorldDirection(_camFwd);
     g.uSunVis.value = THREE.MathUtils.smoothstep(_camFwd.dot(sun.position), 0.0, 0.35);
-
-    renderer.setViewport(vpX, vpY, vpW, vpH);
-    if (scissor) { renderer.setScissorTest(true); renderer.setScissor(vpX, vpY, vpW, vpH); }
     godrayPass.render(renderer);
-    renderer.setScissorTest(false);
   } else {
-    renderer.setViewport(vpX, vpY, vpW, vpH);
-    if (scissor) { renderer.setScissorTest(true); renderer.setScissor(vpX, vpY, vpW, vpH); }
-    atmoPass.render(renderer);
-    renderer.setScissorTest(false);
+    // 直接双线性上采样 rtLit 到屏幕视口(体积云/大气是软效果, 半分辨率视觉上几乎无差别)
+    blitPass.uniforms.tLit.value = rtLit.texture;
+    blitPass.render(renderer);
   }
+  renderer.setScissorTest(false);
 }
 
 // 动态近/远裁剪面: 相机离行星越远, 近平面抬得越高 → far/near 比变小, 深度精度大幅提升,
@@ -807,7 +837,12 @@ function renderViews() {
     const iw = Math.max(1, Math.floor(insetW * pr));
     const ih = Math.max(1, Math.floor(insetH * pr));
     if (rtInset.width !== iw || rtInset.height !== ih) {
-      rtInset.setSize(iw, ih); rtLitInset.setSize(iw, ih);
+      rtInset.setSize(iw, ih);
+    }
+    const sw = Math.max(1, Math.floor(iw * params.atmoResolutionScale));
+    const sh = Math.max(1, Math.floor(ih * params.atmoResolutionScale));
+    if (rtLitInset.width !== sw || rtLitInset.height !== sh) {
+      rtLitInset.setSize(sw, sh);
     }
     const x = INSET_MARGIN, y = h - insetH - INSET_MARGIN;
     renderView(insetCam(), rtInset, rtLitInset, x, y, insetW, insetH, true);

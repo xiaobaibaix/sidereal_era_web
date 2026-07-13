@@ -48,6 +48,7 @@ const params = {
   detail: true,        // 近距 LOD 地形行星(常驻)
   detailAtmo: true,    // 近距行星大气(总开关)
   detailClouds: true,  // 近距行星体积云(总开关)
+  atmoResolutionScale: 0.5,  // 大气+云 pass 渲染比例(0.5=半分辨率, 体积云/大气是软效果, 几乎无损, 帧率 ~3-4x)
   wireframe: 'off',    // 线框模式: 'off' 关 / 'current' 仅当前聚焦行星 / 'all' 全部行星
   worldScale: 1,       // 全局尺度: 距离/半径×S, 质量×S³(轨道周期不变) → 试 1e6 米级
   character: false,    // 角色模式: 登陆当前聚焦的地形星球, 第三人称行走
@@ -130,10 +131,32 @@ function makeHDRColorRT(w, h) {
 }
 const _spr = renderer.getPixelRatio();
 const sceneRT = makeSceneRT(innerWidth * _spr, innerHeight * _spr);
-const rtPing = makeHDRColorRT(innerWidth * _spr, innerHeight * _spr);
-const rtPong = makeHDRColorRT(innerWidth * _spr, innerHeight * _spr);
+// 大气/云 pass 中转 RT: 按 atmoResolutionScale 缩放(半分辨率时像素数 1/4, 软视觉效果几乎无损)
+function atmoScale() { return Math.max(0.1, Math.min(1.0, params.atmoResolutionScale)); }
+function atmoRTSize(w, h) {
+  const s = atmoScale();
+  return [Math.max(1, Math.floor(w * s)), Math.max(1, Math.floor(h * s))];
+}
+const _asz0 = atmoRTSize(innerWidth * _spr, innerHeight * _spr);
+const rtPing = makeHDRColorRT(_asz0[0], _asz0[1]);
+const rtPong = makeHDRColorRT(_asz0[0], _asz0[1]);
+const rtOut = makeHDRColorRT(_asz0[0], _asz0[1]);   // 末端大气 pass 输出(tonemap 后), 供 blit 升采样到屏幕
 const atmoPass = createAtmospherePass();
 const cloudPass = createCloudPass();       // 体积云(插在 场景→大气 之间; 只给最近一颗启用云的行星跑)
+// 升采样 blit pass: 半分辨率 rtOut → 全屏(双线性, 体积云/大气是软效果几乎无损)
+const blitPass = (() => {
+  const u = { tLit: { value: null } };
+  const mat = new THREE.ShaderMaterial({
+    uniforms: u,
+    depthTest: false, depthWrite: false,
+    vertexShader: /* glsl */`varying vec2 vUv; void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`,
+    fragmentShader: /* glsl */`precision highp float; varying vec2 vUv; uniform sampler2D tLit;
+      void main() { gl_FragColor = texture2D(tLit, vUv); }`,
+  });
+  const s = new THREE.Scene(); const c = new THREE.Camera();
+  const q = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), mat); q.frustumCulled = false; s.add(q);
+  return { uniforms: u, material: mat, render(renderer) { renderer.render(s, c); } };
+})();
 const OZONE_BASE = new THREE.Vector3(0.0035, 0.010, 0.00045);
 const bodyEdit = { radius: 20 };   // 聚焦天体半径(GUI 编辑用)
 // 大气可调参数(渲染循环每帧读取 → GUI 实时生效)
@@ -947,6 +970,7 @@ fAtm.add(atm, 'dither', 0, 1).name('抖动去带');
 fAtm.add(atm, 'steps', 4, 32, 1).name('视线步数');
 fAtm.add(atm, 'lightSteps', 2, 16, 1).name('太阳步数');
 fAtm.add(atm, 'aces').name('ACES(整屏)');
+fAtm.add(params, 'atmoResolutionScale', 0.25, 1.0, 0.05).name('大气渲染比例(性能↑)').onChange(resizeAtmoRTs);
 
 // 近距体积云(每天体独立; 参数每帧读取 → 实时生效, 无需重建。只给最近一颗启用云的行星跑)
 const fCloud = gui.addFolder('云 (近距)');
@@ -1137,9 +1161,20 @@ addEventListener('resize', () => {
   const pr = renderer.getPixelRatio();
   const rw = Math.floor(innerWidth * pr), rh = Math.floor(innerHeight * pr);
   sceneRT.setSize(rw, rh);
-  rtPing.setSize(rw, rh);
-  rtPong.setSize(rw, rh);
+  const [aw, ah] = atmoRTSize(rw, rh);
+  rtPing.setSize(aw, ah);
+  rtPong.setSize(aw, ah);
+  rtOut.setSize(aw, ah);
 });
+
+function resizeAtmoRTs() {
+  const pr = renderer.getPixelRatio();
+  const rw = Math.floor(innerWidth * pr), rh = Math.floor(innerHeight * pr);
+  const [aw, ah] = atmoRTSize(rw, rh);
+  rtPing.setSize(aw, ah);
+  rtPong.setSize(aw, ah);
+  rtOut.setSize(aw, ah);
+}
 
 function animate() {
   requestAnimationFrame(animate);
@@ -1235,14 +1270,17 @@ function animate() {
   }
 
   if (atmoList.length === 0) {
-    // 无大气: 把当前源(场景或云输出)直通 tonemap 到屏幕
+    // 无大气: 把当前源(场景或云输出)直通 tonemap 到 rtOut, 然后 blit 到屏幕
     u.uEnabled.value = 0.0;
     u.uToneOut.value = 1.0;
     u.tDiffuse.value = srcTex;
-    renderer.setRenderTarget(null);
+    renderer.setRenderTarget(rtOut);
     atmoPass.render(renderer);
+    renderer.setRenderTarget(null);
+    blitPass.uniforms.tLit.value = rtOut.texture;
+    blitPass.render(renderer);
   } else {
-    // 逐行星合成; 中间 pass 输出线性 HDR(uToneOut=0), 最后一次 tonemap 落地屏幕。
+    // 逐行星合成; 中间 pass 输出线性 HDR(uToneOut=0), 最后一次 tonemap 落地 rtOut, 再 blit 到屏幕。
     // 每次写到"当前源不在"的那张 RT, 避免读写同一 RT。
     let src = srcTex, curRT = srcRT;
     for (let i = 0; i < atmoList.length; i++) {
@@ -1251,8 +1289,11 @@ function animate() {
       u.tDiffuse.value = src;
       u.uToneOut.value = last ? 1.0 : 0.0;
       if (last) {
-        renderer.setRenderTarget(null);
+        renderer.setRenderTarget(rtOut);
         atmoPass.render(renderer);
+        renderer.setRenderTarget(null);
+        blitPass.uniforms.tLit.value = rtOut.texture;
+        blitPass.render(renderer);
       } else {
         const dst = (curRT === rtPing) ? rtPong : rtPing;
         renderer.setRenderTarget(dst);
