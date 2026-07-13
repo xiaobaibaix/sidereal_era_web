@@ -758,6 +758,15 @@ function updateSpectator(dt) {
     _move.normalize().multiplyScalar(params.spectatorSpeed * dt);
     spectatorCamera.position.add(_move);
   }
+  // 地表夹紧: 防止飞入行星内部(内部看 FrontSide 会把面朝外的表面全部剔除, 只剩裙边墙)
+  const pos = spectatorCamera.position;
+  const r = pos.length();
+  if (r > 1e-4) {
+    const inv = 1 / r;
+    const nx = pos.x * inv, ny = pos.y * inv, nz = pos.z * inv;
+    const groundR = params.radius + planet.heightAt(nx, ny, nz) * params.maxHeight + 2;
+    if (r < groundR) pos.set(nx * groundR, ny * groundR, nz * groundR);
+  }
 }
 
 // 渲染一个视口: 场景 → RT(带深度) →(可选)大气(云已并入同一 raymarch 统一积分)→rtLit→God rays/blit→屏幕。

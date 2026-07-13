@@ -124,9 +124,12 @@ export function buildPatchArrays(A, B, C, N, R, maxHeight, seaLevel, heightAt, c
   const outPos = [], outNor = [], outCol = [];
   for (let k = 0; k < mainCount * 3; k++) { outPos.push(pos[k]); outNor.push(nor[k]); outCol.push(col[k]); }
 
+  // 裙边深度: 30% 边长 + 小常数, 上限 R*0.02。
+  // 目的只是兜底 LOD 过渡瞬间的裂缝, 不需要深入行星内部(原 chord²*R*3 项 + R*0.4 上限
+  // 在 R=500 时裙边深达 200 单位, 配合 DoubleSide 会在 limb 处看到裙边墙反面穿透)。
   const chord = dist3(A, B);
   const edgeWorld = chord * R;
-  const skirtDepth = Math.min(edgeWorld * 0.6 + chord * chord * R * 3 + 0.3, R * 0.4);
+  const skirtDepth = Math.min(edgeWorld * 0.3 + 0.3, R * 0.02);
   for (const eg of [giAB, giAC, giBC]) {
     const start = outPos.length / 3;
     for (let m = 0; m < eg.length; m++) {

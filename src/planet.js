@@ -101,7 +101,7 @@ export class Planet extends THREE.Group {
     this.params = params;
     this.stats = { patches: 0, triangles: 0, queued: 0, inflight: 0 };
     this.material = new THREE.MeshStandardMaterial({
-      vertexColors: true, roughness: 0.9, metalness: 0.0, side: THREE.DoubleSide,
+      vertexColors: true, roughness: 0.9, metalness: 0.0, side: THREE.FrontSide,
       polygonOffsetFactor: 1, polygonOffsetUnits: 1,
     });
     this.wireMaterial = new THREE.LineBasicMaterial({ color: 0xffffff });
