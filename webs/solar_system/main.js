@@ -48,7 +48,7 @@ const params = {
   detail: true,        // 近距 LOD 地形行星(常驻)
   detailAtmo: true,    // 近距行星大气(总开关)
   detailClouds: true,  // 近距行星体积云(总开关)
-  atmoResolutionScale: 0.5,  // 大气+云 pass 渲染比例(0.5=半分辨率, 体积云/大气是软效果, 几乎无损, 帧率 ~3-4x)
+  atmoResolutionScale: 1.0,  // 大气+云 pass 渲染比例(<1.0 会把整个画面(含地形细节)糊化, 仅在极限性能压力下降到 0.75/0.5)
   wireframe: 'off',    // 线框模式: 'off' 关 / 'current' 仅当前聚焦行星 / 'all' 全部行星
   worldScale: 1,       // 全局尺度: 距离/半径×S, 质量×S³(轨道周期不变) → 试 1e6 米级
   character: false,    // 角色模式: 登陆当前聚焦的地形星球, 第三人称行走

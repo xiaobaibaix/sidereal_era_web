@@ -93,6 +93,7 @@ export function createAtmospherePass() {
     uUseLUT: { value: 1.0 },          // 1=查表加速, 0=实时 raymarch(回退)
     uOzone: { value: new THREE.Vector3(0.007, 0.02, 0.0009) }, // 臭氧吸收(绿>红>蓝)
     uDither: { value: 1.0 },          // raymarch 抖动强度(去 banding)
+    uOutputLT: { value: 0.0 },        // 1=输出 vec4(L, T.gray) 供 composite pass 半分辨率合成(不 tonemap); 0=原行为(输出最终颜色)
 
     // —— 体积云(与大气在同一 raymarch 内统一积分, 避免两层硬切产生的分界线)——
     uCloudsOn: { value: 0.0 },        // 1=在同一积分里叠加云(统一介质); 0=纯大气(与旧版逐字节一致)
@@ -157,6 +158,7 @@ export function createAtmospherePass() {
       uniform float uDither;           // raymarch 起点抖动强度(去 banding)
       uniform sampler2D uTransLUT;     // 透射率 LUT
       uniform float uUseLUT;           // 1=查表, 0=实时 raymarch
+      uniform float uOutputLT;         // 1=输出 (L, T.gray) 给 composite pass; 0=输出最终颜色
 
       // 云(与大气统一积分)
       uniform float uCloudsOn;
@@ -355,7 +357,11 @@ export function createAtmospherePass() {
 
       void main() {
         vec3 sceneColor = texture2D(tDiffuse, vUv).rgb;   // 线性 HDR
-        if (uEnabled < 0.5) { gl_FragColor = vec4(outColor(sceneColor), 1.0); return; }
+        if (uEnabled < 0.5) {
+          // 大气关: LT 模式下输出 (0, 1) (无内散射, 全透射); 否则原 passthrough
+          if (uOutputLT > 0.5) { gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }
+          gl_FragColor = vec4(outColor(sceneColor), 1.0); return;
+        }
 
         // 从深度重建视线方向与场景距离
         vec2 ndc = vUv * 2.0 - 1.0;
@@ -491,8 +497,15 @@ export function createAtmospherePass() {
         }
 
         // 背景(地表)被整段介质衰减 + 累计内散射(全在线性 HDR 空间)
-        vec3 color = background * T + L;
+        // LT 模式: 输出 (L, T.gray) 给半分辨率合成 — 把昂贵的 background*T 留给全分辨率 composite,
+        // 地形细节由 composite 在全分辨率上保留, 只有大气/云(L, T)承受半分辨率的双线性插值。
+        if (uOutputLT > 0.5) {
+          float Tgray = clamp((T.r + T.g + T.b) / 3.0, 0.0, 1.0);
+          gl_FragColor = vec4(L, Tgray);
+          return;
+        }
 
+        vec3 color = background * T + L;
         gl_FragColor = vec4(outColor(color), 1.0);   // 末端 tonemap(或多行星中间 pass 输出线性HDR)
       }
     `,
@@ -504,6 +517,68 @@ export function createAtmospherePass() {
   quad.frustumCulled = false;
   quadScene.add(quad);
 
+  return {
+    uniforms,
+    material,
+    render(renderer) { renderer.render(quadScene, quadCam); },
+  };
+}
+
+// 全分辨率合成 pass: 把全分辨率场景颜色(线性 HDR) 与半分辨率 (L, T) 合在一起。
+// 关键点: 昂贵的 background * T 运算在【全分辨率】上做 → 地形细节(高频边缘)不被半分辨率
+// 双线性插值糊掉; 只有软效果(L, T)承受半分辨率 → 锐利 + 快。
+// 输入: tScene = rtMain.texture (线性 HDR 场景颜色), tAtmo = rtLit.texture (RGBA: RGB=L, A=T.gray)。
+export function createCompositePass() {
+  const uniforms = {
+    tScene: { value: null },
+    tAtmo: { value: null },
+    uExposure: { value: 1.0 },
+    uTonemap: { value: 1 },          // 0=Reinhard, 1=ACES filmic (与 atmoPass 保持一致)
+  };
+  const material = new THREE.ShaderMaterial({
+    uniforms,
+    depthTest: false,
+    depthWrite: false,
+    vertexShader: /* glsl */`
+      varying vec2 vUv;
+      void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }
+    `,
+    fragmentShader: /* glsl */`
+      precision highp float;
+      varying vec2 vUv;
+      uniform sampler2D tScene;
+      uniform sampler2D tAtmo;
+      uniform float uExposure;
+      uniform int   uTonemap;
+
+      vec3 acesFilm(vec3 x) {
+        return clamp((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0);
+      }
+      vec3 linearToSRGB(vec3 c) {
+        c = clamp(c, 0.0, 1.0);
+        return mix(12.92 * c, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, c));
+      }
+      vec3 tonemap(vec3 c) {
+        c *= uExposure;
+        vec3 m = (uTonemap == 1) ? acesFilm(c) : (c / (1.0 + c));
+        return linearToSRGB(m);
+      }
+
+      void main() {
+        vec3 scene = texture2D(tScene, vUv).rgb;     // 全分辨率线性 HDR
+        vec4 atmo = texture2D(tAtmo, vUv);           // 半分辨率(双线性): RGB=L (线性 HDR), A=T.gray
+        vec3 L = atmo.rgb;
+        float T = atmo.a;
+        vec3 color = scene * T + L;                  // 合成: 场景被介质衰减 + 介质内散射
+        gl_FragColor = vec4(tonemap(color), 1.0);    // 末端 tonemap(曝光+ACES+sRGB)
+      }
+    `,
+  });
+  const quadScene = new THREE.Scene();
+  const quadCam = new THREE.Camera();
+  const quad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), material);
+  quad.frustumCulled = false;
+  quadScene.add(quad);
   return {
     uniforms,
     material,

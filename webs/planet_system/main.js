@@ -8,7 +8,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
 import GUI from 'lil-gui';
 import { Planet } from '../../src/planet.js';
-import { createOcean, createAtmospherePass, createGodrayPass, createTransmittanceLUT } from '../../src/effects.js';
+import { createOcean, createAtmospherePass, createCompositePass, createGodrayPass, createTransmittanceLUT } from '../../src/effects.js';
 import { PlanetWalker } from './character.js';
 
 // ----------------------------------------------------------------------------
@@ -50,7 +50,7 @@ const params = {
   atmoOzone: 0.02,          // 臭氧吸收强度(0=关, 日落品红/天空更纯净蓝)
   atmoDither: 0.5,          // raymarch 抖动强度(去同心圆 banding; 太高会变颗粒噪点)
   atmoLUT: true,            // 透射率 LUT 加速(省太阳方向内循环; 关=实时 raymarch)
-  atmoResolutionScale: 0.5, // 大气+云 pass 渲染比例(0.5=半分辨率, 体积云/大气是软效果, 半分辨率几乎无损, 帧率 ~3-4x)
+  atmoResolutionScale: 0.5, // 大气+云 pass 的(L, T)输出分辨率(地形细节走全分辨率 composite, 不糊; 仅云边缘略软)
 
   // 体积云(全屏 raymarch pass)
   showClouds: true,
@@ -296,7 +296,7 @@ function makeSceneRT(w, h) {
   rt.depthTexture.type = THREE.UnsignedIntType;
   return rt;
 }
-// 大气/God rays 的中转 RT(HalfFloat 线性, 无深度): 场景→rtScene→大气(含云)→rtLit→God rays→屏幕
+// 大气/God rays 的中转 RT(HalfFloat 线性, 无深度): 场景→rtScene→大气(含云, 输出 L+T)→rtLit→composite→God rays→屏幕
 // 注: 云不再单独成 pass, 而是与大气在同一条 raymarch 里统一积分(uCloudsOn=1)。
 function makeColorRT(w, h) {
   const rt = new THREE.WebGLRenderTarget(Math.max(1, w), Math.max(1, h), {
@@ -308,8 +308,35 @@ function makeColorRT(w, h) {
   rt.texture.colorSpace = THREE.LinearSRGBColorSpace;
   return rt;
 }
+// 同上但 RGBA(存 L+T.gray): 大气 pass 输出 vec4(L.rgb, T.gray), 半分辨率
+function makeColorRT4(w, h) {
+  const rt = new THREE.WebGLRenderTarget(Math.max(1, w), Math.max(1, h), {
+    minFilter: THREE.LinearFilter,
+    magFilter: THREE.LinearFilter,
+    depthBuffer: false,
+    type: THREE.HalfFloatType,
+    format: THREE.RGBAFormat,
+  });
+  rt.texture.colorSpace = THREE.LinearSRGBColorSpace;
+  return rt;
+}
 
 const godrayPass = createGodrayPass();
+const compositePass = createCompositePass();   // 全分辨率合成: rtMain + rtLit(L+T) → rtComposite
+// 升采样 blit pass: 全分辨率 rtComposite → 屏幕视口(God rays 关时的直通路径)
+const blitPass = (() => {
+  const u = { tLit: { value: null } };
+  const mat = new THREE.ShaderMaterial({
+    uniforms: u,
+    depthTest: false, depthWrite: false,
+    vertexShader: /* glsl */`varying vec2 vUv; void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`,
+    fragmentShader: /* glsl */`precision highp float; varying vec2 vUv; uniform sampler2D tLit;
+      void main() { gl_FragColor = texture2D(tLit, vUv); }`,
+  });
+  const s = new THREE.Scene(); const c = new THREE.Camera();
+  const q = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), mat); q.frustumCulled = false; s.add(q);
+  return { uniforms: u, material: mat, render(renderer) { renderer.render(s, c); } };
+})();
 const transLUT = createTransmittanceLUT();
 // 透射率 LUT 目标(x=太阳天顶余弦, y=高度), 大气参数变化时重烘
 const lutRT = new THREE.WebGLRenderTarget(256, 64, {
@@ -318,37 +345,17 @@ const lutRT = new THREE.WebGLRenderTarget(256, 64, {
 });
 lutRT.texture.colorSpace = THREE.LinearSRGBColorSpace;
 atmoPass.uniforms.uTransLUT.value = lutRT.texture;
-
-// 升采样 blit pass: 半分辨率 rtLit → 全屏视口(双线性插值, 体积云/大气是软效果几乎无损)
-const blitPass = (() => {
-  const u = { tLit: { value: null } };
-  const mat = new THREE.ShaderMaterial({
-    uniforms: u,
-    depthTest: false, depthWrite: false,
-    vertexShader: /* glsl */`
-      varying vec2 vUv;
-      void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }
-    `,
-    fragmentShader: /* glsl */`
-      precision highp float;
-      varying vec2 vUv;
-      uniform sampler2D tLit;
-      void main() { gl_FragColor = texture2D(tLit, vUv); }
-    `,
-  });
-  const s = new THREE.Scene();
-  const c = new THREE.Camera();
-  const q = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), mat);
-  q.frustumCulled = false;
-  s.add(q);
-  return { uniforms: u, material: mat, render(renderer) { renderer.render(s, c); } };
-})();
+atmoPass.uniforms.uOutputLT.value = 1.0;   // LT 模式: 半分辨率输出 (L, T.gray), 由 composite 全分辨率合成
 
 const _pr = renderer.getPixelRatio();
 const rtMain = makeSceneRT(innerWidth * _pr, innerHeight * _pr);
 const rtInset = makeSceneRT(1, 1);   // 尺寸随小窗动态调整
-const rtLitMain = makeColorRT(1, 1);   // 大气输出(分辨率随 atmoResolutionScale 缩放, 在 resizeSceneRTs 设置)
-const rtLitInset = makeColorRT(1, 1);
+// rtLit = 半分辨率 (L, T.gray) 缓冲, 由 atmoPass 输出; composite 在全分辨率上把它和 rtMain 合成
+const rtLitMain = makeColorRT4(1, 1);
+const rtLitInset = makeColorRT4(1, 1);
+// rtComposite = 全分辨率合成结果(线性 HDR + tonemap 后), 供 God rays 或直接到屏幕
+const rtCompositeMain = makeColorRT(innerWidth * _pr, innerHeight * _pr);
+const rtCompositeInset = makeColorRT(1, 1);
 const _sunProj = new THREE.Vector3(), _camFwd = new THREE.Vector3();
 const _pv = new THREE.Matrix4();
 const _invVP = new THREE.Matrix4();
@@ -358,7 +365,8 @@ function resizeSceneRTs() {
   const pr = renderer.getPixelRatio();
   const w = Math.floor(innerWidth * pr), h = Math.floor(innerHeight * pr);
   rtMain.setSize(w, h);
-  // 大气+云 pass 渲染分辨率(半分辨率时像素数 1/4, 软视觉效果几乎无损)
+  rtCompositeMain.setSize(w, h);                       // composite 走全分辨率, 保留地形细节
+  // 大气+云 pass 渲染分辨率(只 L+T 半分辨率, scene*T 在 composite 全分辨率上做 → 不糊地形)
   const sw = Math.max(1, Math.floor(w * params.atmoResolutionScale));
   const sh = Math.max(1, Math.floor(h * params.atmoResolutionScale));
   rtLitMain.setSize(sw, sh);
@@ -769,9 +777,9 @@ function updateSpectator(dt) {
   }
 }
 
-// 渲染一个视口: 场景 → RT(带深度) →(可选)大气(云已并入同一 raymarch 统一积分)→rtLit→God rays/blit→屏幕。
-function renderView(cam, rt, rtLit, vpX, vpY, vpW, vpH, scissor) {
-  // 1) 场景(行星 + 海洋)渲染到 RT(全分辨率, 带深度)。绑定 RT 后 three 自动用整张 RT 作视口。
+// 渲染一个视口: 场景 → RT(带深度) → 大气 pass(半分辨率输出 L+T) → composite(全分辨率合成)→ God rays/屏幕。
+function renderView(cam, rt, rtLit, rtComposite, vpX, vpY, vpW, vpH, scissor) {
+  // 1) 场景(行星 + 海洋)渲染到 RT(全分辨率, 带深度)。
   renderer.setScissorTest(false);
   renderer.setRenderTarget(rt);
   renderer.clear();
@@ -783,8 +791,8 @@ function renderView(cam, rt, rtLit, vpX, vpY, vpW, vpH, scissor) {
   _invVP.copy(_pv).invert();
   cam.getWorldPosition(_camPos);
 
-  // 2) 大气 pass(云由 uCloudsOn 控制, 已并入同一条 raymarch)。无论是否开 God rays,
-  //    都先渲染到 rtLit(半分辨率以加速; rtLit 尺寸已在 resizeSceneRTs 中按 atmoResolutionScale 缩放)。
+  // 2) 大气 pass(云已并入同一 raymarch)。半分辨率输出 (L, T.gray) 到 rtLit。
+  //    rtLit 尺寸在 resizeSceneRTs 中按 atmoResolutionScale 缩放(半分辨率时像素数 1/4, raymarch 大幅加速)。
   const u = atmoPass.uniforms;
   u.tDiffuse.value = rt.texture;
   u.tDepth.value = rt.depthTexture;
@@ -796,21 +804,32 @@ function renderView(cam, rt, rtLit, vpX, vpY, vpW, vpH, scissor) {
   atmoPass.render(renderer);
   renderer.setRenderTarget(null);
 
+  // 3) composite pass(全分辨率): rtMain(场景线性 HDR) × T(半分辨率双线性) + L(半分辨率) → tonemap → rtComposite
+  //    地形细节(高频边缘)在 scene*T 中保留全分辨率锐度; 只有软效果(L, T)承受半分辨率插值。
+  const cu = compositePass.uniforms;
+  cu.tScene.value = rt.texture;
+  cu.tAtmo.value = rtLit.texture;
+  cu.uExposure.value = params.atmoExposure;
+  cu.uTonemap.value = params.atmoACES ? 1 : 0;
+  renderer.setRenderTarget(rtComposite);
+  compositePass.render(renderer);
+  renderer.setRenderTarget(null);
+
   renderer.setViewport(vpX, vpY, vpW, vpH);
   if (scissor) { renderer.setScissorTest(true); renderer.setScissor(vpX, vpY, vpW, vpH); }
 
   if (params.showGodrays) {
-    // God rays 自然把半分辨率 rtLit 上采样到屏幕(光束效果本身就是大幅模糊, 半分辨率几乎无损)
+    // God rays 读全分辨率 rtComposite(自然清晰), 加光束
     const g = godrayPass.uniforms;
-    g.tLit.value = rtLit.texture;
+    g.tLit.value = rtComposite.texture;
     _sunProj.copy(sun.position).multiplyScalar(1e7).project(cam);
     g.uSunUV.value.set(_sunProj.x * 0.5 + 0.5, _sunProj.y * 0.5 + 0.5);
     cam.getWorldDirection(_camFwd);
     g.uSunVis.value = THREE.MathUtils.smoothstep(_camFwd.dot(sun.position), 0.0, 0.35);
     godrayPass.render(renderer);
   } else {
-    // 直接双线性上采样 rtLit 到屏幕视口(体积云/大气是软效果, 半分辨率视觉上几乎无差别)
-    blitPass.uniforms.tLit.value = rtLit.texture;
+    // 直接把 rtComposite 显示到屏幕视口(全分辨率, 锐)
+    blitPass.uniforms.tLit.value = rtComposite.texture;
     blitPass.render(renderer);
   }
   renderer.setScissorTest(false);
@@ -839,7 +858,7 @@ function renderViews() {
   const w = innerWidth, h = innerHeight;
 
   // 主画面(全屏)
-  renderView(mainCam(), rtMain, rtLitMain, 0, 0, w, h, false);
+  renderView(mainCam(), rtMain, rtLitMain, rtCompositeMain, 0, 0, w, h, false);
 
   // 小窗(左上角): 独立视口 + 独立 RT(尺寸随小窗)
   if (params.showInset) {
@@ -847,14 +866,15 @@ function renderViews() {
     const ih = Math.max(1, Math.floor(insetH * pr));
     if (rtInset.width !== iw || rtInset.height !== ih) {
       rtInset.setSize(iw, ih);
+      rtCompositeInset.setSize(iw, ih);   // composite 走全分辨率(同场景 RT)
     }
     const sw = Math.max(1, Math.floor(iw * params.atmoResolutionScale));
     const sh = Math.max(1, Math.floor(ih * params.atmoResolutionScale));
     if (rtLitInset.width !== sw || rtLitInset.height !== sh) {
-      rtLitInset.setSize(sw, sh);
+      rtLitInset.setSize(sw, sh);         // rtLit 半分辨率(L+T)
     }
     const x = INSET_MARGIN, y = h - insetH - INSET_MARGIN;
-    renderView(insetCam(), rtInset, rtLitInset, x, y, insetW, insetH, true);
+    renderView(insetCam(), rtInset, rtLitInset, rtCompositeInset, x, y, insetW, insetH, true);
   }
 }
 
