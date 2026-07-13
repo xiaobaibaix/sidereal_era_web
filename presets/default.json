@@ -48,7 +48,7 @@
   "sunAzimuth": 40,
   "autoSun": false,
   "sunSpeed": 6,
-  "maxLevel": 8,
+  "maxLevel": 10,
   "splitFactor": 2.5,
   "patchResolution": 16,
   "frustumMargin": 0.15,

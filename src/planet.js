@@ -273,13 +273,16 @@ export class Planet extends THREE.Group {
     this.stats.triangles += node.mesh.userData.triangles;
   }
 
-  update(camera) {
+  // camera: 用于计算视锥(剔除用); lodTarget: 可选, LOD 距离判断追踪这个点(角色模式下传 walker.position,
+  // 让细分跟着角色而不是相机走 — 相机绕角色转时不会触发重新细分)。
+  update(camera, lodTarget) {
     camera.updateMatrixWorld();
-    // 相机在行星本地系的位置(行星在原点时 this.position=0, cp=camera.position, 主项目行为不变)
-    const cp = _localCam.copy(camera.position).sub(this.position);
+    // LOD 追踪点在行星本地系的位置(行星在原点时 this.position=0)
+    const lodPos = lodTarget ? lodTarget : camera.position;
+    const cp = _localCam.copy(lodPos).sub(this.position);
     this._camMoved = (Math.abs(cp.x - this._camPos[0]) + Math.abs(cp.y - this._camPos[1]) + Math.abs(cp.z - this._camPos[2])) > 1e-3;
     this._camPos[0] = cp.x; this._camPos[1] = cp.y; this._camPos[2] = cp.z;
-    // 短路: 相机静止且无在途任务 → 跳过整棵 selectLOD 遍历
+    // 短路: 追踪点静止且无在途任务 → 跳过整棵 selectLOD 遍历
     if (!this._camMoved && this._queued === 0 && this._inflight === 0) {
       this.stats.queued = 0;
       this.stats.inflight = 0;

@@ -564,6 +564,12 @@ function applyBodyRadius() {
 const _raycaster = new THREE.Raycaster();
 const _pointer = new THREE.Vector2();
 let _downXY = null;
+// 角色模式下滚轮调相机距离(轨道模式滚轮由 OrbitControls 自己处理)
+addEventListener('wheel', (e) => {
+  if (!charMode || !walker) return;
+  const step = Math.sign(e.deltaY) * Math.max(1, walker.camDist * 0.1);
+  walker.camDist = THREE.MathUtils.clamp(walker.camDist + step, 4, 500);
+}, { passive: true });
 renderer.domElement.addEventListener('pointerdown', (e) => { _downXY = { x: e.clientX, y: e.clientY }; });
 renderer.domElement.addEventListener('pointerup', (e) => {
   if (charMode) return;                 // 角色模式: 点击用于锁定视角, 不切换聚焦
@@ -595,7 +601,7 @@ const _tmpV = new THREE.Vector3();
 // GUI 编辑的始终是"当前聚焦天体"的这份 tune, 切换聚焦时保存旧/载入新。
 const tune = {
   seed: 1337,               // 顶层种子: 驱动大陆/山脉/域扭曲/板块/湿度全部子种子。复用配置后只改这个即可换地形。
-  maxLevel: 8, splitFactor: 2.5, patchResolution: 16, frustumMargin: 0.15,
+  maxLevel: 10, splitFactor: 2.5, patchResolution: 16, frustumMargin: 0.15,
   nearRadiusFrac: 0.5, maxHeightFrac: 0.03, seaLevel: 0.0, oceanEnabled: true,
   splitBudget: 16, mergeHysteresis: 1.15, horizonCulling: true,
   continentFreq: 1.2, continentOctaves: 5, mountainFreq: 3.0, mountainStrength: 0.6,
@@ -888,7 +894,8 @@ function manageDetail() {
       continue;
     }
     e.planet.position.copy(b.pos).sub(_off);   // 定位到浮动原点空间(聚焦天体处为原点)
-    e.planet.update(renderCam());
+    // 角色模式: LOD 追踪角色本身(walker.position), 相机绕角色转时不会触发 chunk 重新细分
+    e.planet.update(renderCam(), (charMode && walker && walker.planet === e.planet) ? walker.position : null);
     if (e.ocean) {
       e.ocean.position.copy(e.planet.position);
       e.ocean.visible = camDistTo(b) < b.radius * ATMO_DIST;   // 近距才画水面(远处地形海洋色兜底)
@@ -933,7 +940,7 @@ function frameFocus() {
 const fLOD = gui.addFolder('近距行星 (LOD/地形)');
 const seedCtrl = fLOD.add(tune, 'seed', 0, 99999, 1).name('顶层种子').onFinishChange(applyDetailRebuild);
 fLOD.add({ rnd: () => { tune.seed = Math.floor(Math.random() * 100000); seedCtrl.updateDisplay(); applyDetailRebuild(); } }, 'rnd').name('🎲 随机种子');
-fLOD.add(tune, 'maxLevel', 0, 12, 1).name('最大层数').onChange(applyLODLive);
+fLOD.add(tune, 'maxLevel', 0, 14, 1).name('最大层数').onChange(applyLODLive);
 fLOD.add(tune, 'splitFactor', 1, 5).name('细分激进度').onChange(applyLODLive);
 fLOD.add(tune, 'frustumMargin', 0, 0.5).name('视锥余量').onChange(applyLODLive);
 fLOD.add(tune, 'nearRadiusFrac', 0, 2).name('预细分半径 ×R').onChange(applyLODLive);

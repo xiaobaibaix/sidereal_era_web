@@ -82,7 +82,7 @@ const params = {
   sunSpeed: 6,              // 度/秒
 
   // LOD
-  maxLevel: 8,             // 四叉树最大细分层数
+  maxLevel: 10,            // 四叉树最大细分层数
   splitFactor: 2.5,        // 相机距离 < 边长*splitFactor 时细分(越大越激进)
   patchResolution: 16,     // 每个 patch 的网格分辨率(必须是 2 的幂, 缝合依赖 dyadic 嵌套)
   frustumMargin: 0.15,     // 视锥外扩余量(屏幕外预细分一圈, 减少旋转 pop-in)
@@ -252,6 +252,13 @@ addEventListener('keydown', (e) => {
   if (mainCam() === spectatorCamera && plControls.isLocked && e.code === 'Space') e.preventDefault();
 });
 addEventListener('keyup', (e) => { keys[e.code] = false; });
+
+// 角色模式下滚轮调相机距离(轨道模式滚轮由 OrbitControls 自己处理)
+addEventListener('wheel', (e) => {
+  if (!characterMode || !walker) return;
+  const step = Math.sign(e.deltaY) * Math.max(1, walker.camDist * 0.1);
+  walker.camDist = THREE.MathUtils.clamp(walker.camDist + step, 4, 500);
+}, { passive: true });
 
 // 光照
 const sun = new THREE.DirectionalLight(0xffffff, 2.2);
@@ -564,7 +571,7 @@ fGod.add(params, 'godrayThreshold', 0.0, 1.0).name('亮度阈值').onChange(layo
 fGod.add(params, 'godraySamples', 16, 96, 1).name('采样数').onChange(layoutEffects);
 
 const fLod = gui.addFolder('LOD');
-fLod.add(params, 'maxLevel', 0, 12, 1).name('最大层数');
+fLod.add(params, 'maxLevel', 0, 14, 1).name('最大层数');
 fLod.add(params, 'splitFactor', 1, 5).name('细分激进度');
 fLod.add(params, 'patchResolution', [4, 8, 16, 32]).name('patch 分辨率').onChange(rebuild);
 fLod.add(params, 'frustumMargin', 0, 0.5).name('视锥余量');
@@ -896,7 +903,8 @@ function animate() {
 
   atmoPass.uniforms.uTime.value = clock.elapsedTime;   // 云飘动(云已并入大气 pass)
   updateClips();                                  // 动态近/远面, 消除 z-fighting
-  planet.update(lodCam());                        // LOD 由主体相机(轨道/角色)驱动
+  // 角色模式: LOD 追踪角色本身(walker.position), 相机绕角色转时不会触发 chunk 重新细分
+  planet.update(lodCam(), characterMode && walker ? walker.position : null);
   renderViews();
 
   const s = planet.stats;
