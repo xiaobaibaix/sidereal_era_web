@@ -574,6 +574,7 @@ const tune = {
   seed: 1337,               // 顶层种子: 驱动大陆/山脉/域扭曲/板块/湿度全部子种子。复用配置后只改这个即可换地形。
   maxLevel: 8, splitFactor: 2.5, patchResolution: 16, frustumMargin: 0.15,
   nearRadiusFrac: 0.5, maxHeightFrac: 0.03, seaLevel: 0.0, oceanEnabled: true,
+  splitBudget: 16, mergeHysteresis: 1.15, horizonCulling: true,
   continentFreq: 1.2, continentOctaves: 5, mountainFreq: 3.0, mountainStrength: 0.6,
   warpStrength: 0.2, plateStrength: 0.5, useClimate: true,
   // 气态行星(替代地形: 纬向气带 + 湍流; gas=true 时不生成地形/海洋)
@@ -742,6 +743,7 @@ function planetParamsFor(body) {
     radius: body.radius, maxHeight: body.radius * t.maxHeightFrac, seaLevel: t.seaLevel,
     patchResolution: t.patchResolution, maxLevel: t.maxLevel, splitFactor: t.splitFactor,
     nearRadius: body.radius * t.nearRadiusFrac, frustumMargin: t.frustumMargin,
+    splitBudget: t.splitBudget, mergeHysteresis: t.mergeHysteresis, horizonCulling: t.horizonCulling,
     continentSeed: s, continentFreq: t.continentFreq, continentOctaves: t.continentOctaves,
     continentGain: 0.5, continentLacunarity: 2.0,
     mountainSeed: s + 11, mountainFreq: t.mountainFreq, mountainOctaves: 5, mountainStrength: t.mountainStrength,
@@ -763,6 +765,7 @@ function applyLODLive() {
   const p = e.planet.params;
   p.maxLevel = tune.maxLevel; p.splitFactor = tune.splitFactor; p.frustumMargin = tune.frustumMargin;
   p.nearRadius = b.radius * tune.nearRadiusFrac;
+  p.splitBudget = tune.splitBudget; p.mergeHysteresis = tune.mergeHysteresis; p.horizonCulling = tune.horizonCulling;
 }
 // 结构/地形类参数: 重建聚焦行星的详细网格
 function applyDetailRebuild() {
@@ -911,6 +914,9 @@ fLOD.add(tune, 'maxLevel', 0, 12, 1).name('最大层数').onChange(applyLODLive)
 fLOD.add(tune, 'splitFactor', 1, 5).name('细分激进度').onChange(applyLODLive);
 fLOD.add(tune, 'frustumMargin', 0, 0.5).name('视锥余量').onChange(applyLODLive);
 fLOD.add(tune, 'nearRadiusFrac', 0, 2).name('预细分半径 ×R').onChange(applyLODLive);
+fLOD.add(tune, 'splitBudget', 1, 64, 1).name('每帧分裂预算').onChange(applyLODLive);
+fLOD.add(tune, 'mergeHysteresis', 1.0, 2.0, 0.05).name('合并滞回').onChange(applyLODLive);
+fLOD.add(tune, 'horizonCulling').name('地平线剔除').onChange(applyLODLive);
 fLOD.add(tune, 'patchResolution', [4, 8, 16, 32]).name('patch 分辨率').onChange(applyDetailRebuild);
 fLOD.add(tune, 'maxHeightFrac', 0, 0.2).name('地形起伏 ×R').onFinishChange(applyDetailRebuild);
 fLOD.add(tune, 'seaLevel', -1, 0.5).name('海平面').onFinishChange(applyDetailRebuild);
@@ -1120,6 +1126,9 @@ const FIXED_DT = 0.02;            // 物理子步上限(单步最大模拟时间
 const MAX_SUBSTEPS = 40;          // 每帧最多物理子步(极慢帧不追帧, 防螺旋)
 let e0 = null, cloudTime = 0;
 
+// FPS: 0.5s 滑动窗口(frames / 累计时长), 比 1/dt 稳、比 EMA 直观
+let fpsFrames = 0, fpsAccum = 0, fpsValue = 0;
+
 addEventListener('resize', () => {
   camera.aspect = innerWidth / innerHeight;
   camera.updateProjectionMatrix();
@@ -1256,11 +1265,14 @@ function animate() {
   const e = system.energy();
   if (e0 === null) e0 = e.total;
   const drift = e0 !== 0 ? ((e.total - e0) / Math.abs(e0) * 100) : 0;
+  // FPS 累计: 满 0.5s 结算一次, 避免每帧抖动
+  fpsFrames++; fpsAccum += dt;
+  if (fpsAccum >= 0.5) { fpsValue = fpsFrames / fpsAccum; fpsFrames = 0; fpsAccum = 0; }
   const hint = charMode
     ? `角色: ${params.focus} · 点击锁定视角 · WASD 移动 · 空格跳 · 鼠标看 · ESC 释放(取消勾选退出)`
     : `聚焦: ${params.focus} · 点击天体切换观察中心 · 拖动旋转 · 滚轮缩放`;
   hud.innerHTML =
-    `天体: ${system.bodies.length} · G=${params.G.toFixed(2)} · t=${system.time.toFixed(0)}<br>` +
+    `FPS: ${fpsValue.toFixed(0)} · 天体: ${system.bodies.length} · G=${params.G.toFixed(2)} · t=${system.time.toFixed(0)}<br>` +
     `总能量: ${e.total.toExponential(3)} · 漂移: ${drift.toFixed(3)}%(越小越稳)<br>` +
     hint;
 }

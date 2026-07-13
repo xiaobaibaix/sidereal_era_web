@@ -86,6 +86,9 @@ const params = {
   patchResolution: 16,     // 每个 patch 的网格分辨率(必须是 2 的幂, 缝合依赖 dyadic 嵌套)
   frustumMargin: 0.15,     // 视锥外扩余量(屏幕外预细分一圈, 减少旋转 pop-in)
   nearRadius: 50,          // 相机周围此半径内一律细分(不受视锥限制, 环视不卡)
+  splitBudget: 16,         // 每帧新分裂上限(防止靠近时 worker 队列暴涨)
+  mergeHysteresis: 1.15,   // 合并阈值 = splitFactor × 此值(避免边界 churn)
+  horizonCulling: true,    // 地平线剔除(跳过行星本体背面的 chunk)
 
   // 大陆噪声 (fBm)
   continentSeed: 1337,
@@ -527,6 +530,9 @@ fLod.add(params, 'splitFactor', 1, 5).name('细分激进度');
 fLod.add(params, 'patchResolution', [4, 8, 16, 32]).name('patch 分辨率').onChange(rebuild);
 fLod.add(params, 'frustumMargin', 0, 0.5).name('视锥余量');
 fLod.add(params, 'nearRadius', 0, 300).name('预细分半径');
+fLod.add(params, 'splitBudget', 1, 64, 1).name('每帧分裂预算');
+fLod.add(params, 'mergeHysteresis', 1.0, 2.0, 0.05).name('合并滞回');
+fLod.add(params, 'horizonCulling').name('地平线剔除');
 
 gui.add(params, 'radius', 10, 500).name('半径').onFinishChange(rebuild);
 gui.add(params, 'maxHeight', 0, 30).name('最大高度').onFinishChange(rebuild);
@@ -690,6 +696,9 @@ fPreset.add({ f: importParams }, 'f').name('导入 JSON(上传)');
 // ----------------------------------------------------------------------------
 const info = document.getElementById('info');
 
+// FPS: 0.5s 滑动窗口(frames / 累计时长), 比 1/dt 稳、比 EMA 直观
+let fpsFrames = 0, fpsAccum = 0, fpsValue = 0;
+
 addEventListener('resize', () => {
   const aspect = innerWidth / innerHeight;
   camera.aspect = aspect;
@@ -827,7 +836,10 @@ function animate() {
   renderViews();
 
   const s = planet.stats;
-  const base = `patch: ${s.patches} · 三角形: ${s.triangles} · 队列: ${s.queued} · 生成中: ${s.inflight}`;
+  // FPS 累计: 满 0.5s 结算一次, 避免每帧抖动
+  fpsFrames++; fpsAccum += dt;
+  if (fpsAccum >= 0.5) { fpsValue = fpsFrames / fpsAccum; fpsFrames = 0; fpsAccum = 0; }
+  const base = `FPS: ${fpsValue.toFixed(0)} · patch: ${s.patches} · 三角形: ${s.triangles} · 队列: ${s.queued} · 生成中: ${s.inflight}`;
   let hint;
   if (main === spectatorCamera) hint = '旁观相机(主画面) · 点击锁定 · WASD 移动 · 空格/Shift 升降 · ESC 释放';
   else if (walker && main === walker.camera) hint = '角色(主画面) · 点击锁定 · WASD 移动 · 空格跳 · ESC 释放';

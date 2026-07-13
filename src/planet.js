@@ -117,6 +117,7 @@ export class Planet extends THREE.Group {
     this._inflight = 0;         // 本行星正在 worker 上的 job 数(HUD)
     this._camPos = [1e9, 1e9, 1e9];
     this._camMoved = true;   // 相机移动时才重算缝合步长(静止时跳过, 省开销)
+    this._remainingSplits = 0;  // 本帧剩余分裂预算(限制 worker 队列瞬时暴涨)
 
     this._buildNoise();
     this._buildRoots();
@@ -278,9 +279,16 @@ export class Planet extends THREE.Group {
     const cp = _localCam.copy(camera.position).sub(this.position);
     this._camMoved = (Math.abs(cp.x - this._camPos[0]) + Math.abs(cp.y - this._camPos[1]) + Math.abs(cp.z - this._camPos[2])) > 1e-3;
     this._camPos[0] = cp.x; this._camPos[1] = cp.y; this._camPos[2] = cp.z;
+    // 短路: 相机静止且无在途任务 → 跳过整棵 selectLOD 遍历
+    if (!this._camMoved && this._queued === 0 && this._inflight === 0) {
+      this.stats.queued = 0;
+      this.stats.inflight = 0;
+      return;
+    }
     const m = new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
     const frustum = new THREE.Frustum().setFromProjectionMatrix(m);
     this.stats.patches = 0; this.stats.triangles = 0;
+    this._remainingSplits = this.params.splitBudget != null ? this.params.splitBudget : 16;
     for (const r of this.roots) r.selectLOD(cp, frustum, this);
     this.stats.queued = this._queued;
     this.stats.inflight = this._inflight;
@@ -362,6 +370,11 @@ class QNode {
     const chord = A.distanceTo(B);
     const skirt = Math.min(chord * R * 0.6 + chord * chord * R * 3, R * 0.4);
     this.bsphere = new THREE.Sphere(this.centerWorld.clone(), spread + planet.params.maxHeight * 2 + skirt + 1);
+
+    // 地平线剔除预算: chunk 在球面上的角半径(三个顶点到 centerDir 的最小 cos = 最大夹角)
+    const minCos = Math.min(this.centerDir.dot(A), this.centerDir.dot(B), this.centerDir.dot(C));
+    this.horizonCosAlpha = minCos;
+    this.horizonSinAlpha = Math.sqrt(Math.max(0, 1 - minCos * minCos));
   }
 
   // 计算三条边(AB, AC, BC)的缝合步长
@@ -392,6 +405,12 @@ class QNode {
 
   selectLOD(camPos, frustum, planet) {
     const d = camPos.distanceTo(this.centerWorld);
+
+    // 地平线剔除: 行星本体背面的 chunk 直接跳过(移植自 Godot quad.gd:_is_above_horizon)
+    if (planet.params.horizonCulling && this._isBelowHorizon(camPos, planet)) {
+      this._hideSubtree();
+      return false;
+    }
     // 近处(预细分球内)不受视锥限制, 始终按距离细分 —— 避免原地环视时背后需要现补细分。
     // 远处用带余量(margin)的视锥测试 —— 屏幕外预留一圈已细分好, 减少旋转时的 pop-in。
     if (d >= planet.params.nearRadius) {
@@ -400,36 +419,79 @@ class QNode {
       _testSphere.radius = this.bsphere.radius + d * planet.params.frustumMargin;
       if (!frustum.intersectsSphere(_testSphere)) { this._hideSubtree(); return true; }
     }
-    const wantSplit = this.level < planet.params.maxLevel && d < this.edgeLen * planet.params.splitFactor;
 
-    if (wantSplit) {
-      if (!this.children) this._split(planet);
-      const cr = this.children[0].mesh && this.children[1].mesh && this.children[2].mesh && this.children[3].mesh;
-      if (cr) {
-        if (this.mesh) this.mesh.visible = false;
-        for (const c of this.children) c.selectLOD(camPos, frustum, planet);
-        return true;
-      } else {
-        for (const c of this.children) {
-          if (!c.mesh && !c.pending) { const ds = c.computeStrides(planet); planet.requestMesh(c, ds, ds.join(',')); }
-        }
-        for (const c of this.children) c._hideSubtree();
-        if (!this.mesh && !this.pending) planet.requestMesh(this, [1, 1, 1], '1,1,1');
-        if (this.mesh) { this.mesh.visible = true; planet._count(this); return true; }
-        return false;
+    // 滞回: 分裂/合并用不同阈值, 避免边界 churn(移植自 Godot planet.gd:_compute_lod_thresholds)
+    const splitT = this.edgeLen * planet.params.splitFactor;
+    const mergeH = planet.params.mergeHysteresis != null ? planet.params.mergeHysteresis : 1.15;
+    const wantSplit = this.level < planet.params.maxLevel && d < splitT;
+    const wantMerge = d > splitT * mergeH;
+
+    if (wantSplit && !this.children) {
+      // 分裂预算: 限制每帧新分裂数, 防止靠近时 worker 队列暴涨(移植自 Godot planet.gd:split_budget)
+      if (planet._remainingSplits <= 0) {
+        // 预算用完: 本帧退化为叶, 下帧再尝试
+        return this._renderLeaf(planet);
       }
-    } else {
-      if (this.children) this._merge(planet);
-      if (!this.mesh) {
-        if (!this.pending) { const ds = this.computeStrides(planet); planet.requestMesh(this, ds, ds.join(',')); }
-      } else if (planet._camMoved && !this.pending) {
-        const ds = this.computeStrides(planet);
-        const key = ds.join(',');
-        if (this._builtKey !== key) planet.requestMesh(this, ds, key);
-      }
-      if (this.mesh) { this.mesh.visible = true; planet._count(this); return true; }
-      return false;
+      planet._remainingSplits--;
+      this._split(planet);
+    } else if (wantMerge && this.children) {
+      this._merge(planet);
     }
+    // 既不应分裂也不应合并 → 维持现状(滞回区, 原 bug: 总是 fall through 到 merge 分支)
+
+    if (this.children) return this._renderInterior(camPos, frustum, planet);
+    return this._renderLeaf(planet);
+  }
+
+  // 渲染为叶节点(自身 mesh)
+  _renderLeaf(planet) {
+    if (!this.mesh) {
+      if (!this.pending) { const ds = this.computeStrides(planet); planet.requestMesh(this, ds, ds.join(',')); }
+    } else if (planet._camMoved && !this.pending) {
+      const ds = this.computeStrides(planet);
+      const key = ds.join(',');
+      if (this._builtKey !== key) planet.requestMesh(this, ds, key);
+    }
+    if (this.mesh) { this.mesh.visible = true; planet._count(this); return true; }
+    return false;
+  }
+
+  // 渲染为内部节点(递归 4 子)
+  _renderInterior(camPos, frustum, planet) {
+    const cr = this.children[0].mesh && this.children[1].mesh && this.children[2].mesh && this.children[3].mesh;
+    if (cr) {
+      if (this.mesh) this.mesh.visible = false;
+      for (const c of this.children) c.selectLOD(camPos, frustum, planet);
+      return true;
+    }
+    // 子节点 mesh 不齐: 派发请求 + 自身兜底渲染
+    for (const c of this.children) {
+      if (!c.mesh && !c.pending) { const ds = c.computeStrides(planet); planet.requestMesh(c, ds, ds.join(',')); }
+    }
+    for (const c of this.children) c._hideSubtree();
+    if (!this.mesh && !this.pending) planet.requestMesh(this, [1, 1, 1], '1,1,1');
+    if (this.mesh) { this.mesh.visible = true; planet._count(this); return true; }
+    return false;
+  }
+
+  // 地平线剔除: chunk 是否在行星本体背面被完全遮挡
+  _isBelowHorizon(camPos, planet) {
+    const R = planet.params.radius;
+    const H = planet.params.maxHeight;
+    const camDist = camPos.length();
+    if (camDist <= R) return false;                       // 相机在行星内部 → 全可见
+    const cosCamChunk = camPos.dot(this.centerDir) / camDist;
+    if (cosCamChunk >= this.horizonCosAlpha) return false; // 相机在 chunk 角范围内 → 可见
+    // 总地平线 = 相机地平线 + 地形抬升(cos(a+b) = cos(a)cos(b) - sin(a)sin(b))
+    const cosCamHor = R / camDist;
+    const sinCamHor = Math.sqrt(Math.max(0, 1 - cosCamHor * cosCamHor));
+    const cosTer = R / (R + H);
+    const sinTer = Math.sqrt(Math.max(0, 1 - cosTer * cosTer));
+    const cosTotHor = cosCamHor * cosTer - sinCamHor * sinTer;
+    // chunk 最近边(cos(a-b) = cos(a)cos(b) + sin(a)sin(b))
+    const sinAng = Math.sqrt(Math.max(0, 1 - cosCamChunk * cosCamChunk));
+    const cosNear = cosCamChunk * this.horizonCosAlpha + sinAng * this.horizonSinAlpha;
+    return cosNear <= cosTotHor;
   }
 
   _hideSubtree() {
