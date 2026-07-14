@@ -213,7 +213,9 @@ export class ExcavatorSystem {
     const h0 = this.planet.heightAt(d.x, d.y, d.z);   // 挖前当前地表 h(含已烘焙的旧编辑)
     const level = h0 - digDepth;              // 目标平面 h
     const total = Math.max(1e-4, digDepth);   // 待挖"深度当量"(定进度/配土方)
-    const edit = { type: 'level', pos: [d.x, d.y, d.z], radius, level, progress: 0, falloff: 'smooth' };
+    const sea = this.planet.params.seaLevel || 0;
+    // dry: 在陆地(原地表高于海平面)上开挖 → 供海洋"干区"遮罩用, 坑挖到海平面下也不露海水
+    const edit = { type: 'level', pos: [d.x, d.y, d.z], radius, level, progress: 0, falloff: 'smooth', dry: h0 > sea };
     this.digZone = { dir: d, radius, level, total, removed: 0, edit };
     this._pushEdit(edit);
     this._updateRing(this.digRing, d, radius);

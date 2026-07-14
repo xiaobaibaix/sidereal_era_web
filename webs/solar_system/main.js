@@ -11,7 +11,7 @@ import { Body, NBodySystem } from './nbody.js';
 import { Planet } from '../../src/planet.js';       // 复用主项目的 LOD 地形行星(近距详细表现)
 import { PlanetWalker } from '../planet_system/character.js';   // 复用主项目的登陆行星角色控制器
 import { ExcavatorSystem } from '../../src/excavators.js';       // 挖机/卡车自动施工车队
-import { createAtmospherePass, createCloudPass, createOcean, createGasGiant } from '../../src/effects.js';   // 复用深度感知大气 + 体积云 + 海洋 海洋
+import { createAtmospherePass, createCloudPass, createOcean, setOceanDryZones, createGasGiant } from '../../src/effects.js';   // 复用深度感知大气 + 体积云 + 海洋
 
 // ----------------------------------------------------------------------------
 // 星系配置(初始条件; 之后可纳入预设)
@@ -1128,6 +1128,7 @@ function manageDetail() {
       e.ocean.position.copy(e.planet.position);
       e.ocean.visible = camDistTo(b) < b.radius * ATMO_DIST;   // 近距才画水面(远处地形海洋色兜底)
       e.ocean.material.uniforms.uSunDir.value.copy(starBody.pos).sub(b.pos).normalize();
+      setOceanDryZones(e.ocean, e.planet.params.edits);        // 陆地挖掘坑不露海水
     }
   }
 }

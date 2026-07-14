@@ -3,12 +3,17 @@
 import * as THREE from 'three';
 
 // 半透明海洋: 菲涅尔边缘 + 太阳漫反射 + 高光。放在海平面半径处, 陆地从中穿出。
+export const OCEAN_DRY_MAX = 8;   // 海洋"干区"遮罩最多支持的挖掘区数量(shader 数组长度)
+
 export function createOcean() {
   const uniforms = {
     uSunDir: { value: new THREE.Vector3(1, 0.6, 0.8).normalize() },
     uDeep: { value: new THREE.Color(0x0a1e3f) },
     uShallow: { value: new THREE.Color(0x2e78a8) },
     uAmbient: { value: 0.2 },   // 夜面(背向太阳)海洋的基础亮度: 0=夜面全黑(无环境光), 默认0.2保持主项目原样
+    // 干区遮罩: 陆地上的挖掘坑(xyz=单位方向, w=cos(角半径)); 该方向的海面 discard, 使陆地坑保持干燥
+    uDryZones: { value: Array.from({ length: OCEAN_DRY_MAX }, () => new THREE.Vector4(0, 0, 0, 2)) },
+    uDryCount: { value: 0 },
   };
   const material = new THREE.ShaderMaterial({
     uniforms,
@@ -29,10 +34,17 @@ export function createOcean() {
       uniform vec3 uDeep;
       uniform vec3 uShallow;
       uniform float uAmbient;
+      uniform int uDryCount;
+      uniform vec4 uDryZones[${OCEAN_DRY_MAX}];
       varying vec3 vWorldNormal;
       varying vec3 vWorldPos;
       void main() {
-        vec3 N = normalize(vWorldNormal);
+        vec3 N = normalize(vWorldNormal);   // 球面法线 = 从行星中心指向该片元的径向方向
+        // 陆地开挖坑: 该径向落在任一干区内 → 不画海水(避免坑里露出海平面球壳)
+        for (int i = 0; i < ${OCEAN_DRY_MAX}; i++) {
+          if (i >= uDryCount) break;
+          if (dot(N, uDryZones[i].xyz) > uDryZones[i].w) discard;
+        }
         vec3 V = normalize(cameraPosition - vWorldPos);
         vec3 L = normalize(uSunDir);
         float fres = pow(1.0 - max(dot(N, V), 0.0), 3.0);
@@ -50,6 +62,24 @@ export function createOcean() {
   const mesh = new THREE.Mesh(new THREE.SphereGeometry(1, 160, 80), material);
   mesh.renderOrder = 1;
   return mesh;
+}
+
+// 用行星的 edits 刷新某片海洋的"干区"遮罩: 取所有陆地上的整平挖掘区(type==='level' && dry),
+// 写进海洋 shader 的 uDryZones/uDryCount → 这些坑里不再画海水。edits 为空/无海洋时安全跳过。
+export function setOceanDryZones(ocean, edits) {
+  if (!ocean || !ocean.material || !ocean.material.uniforms.uDryZones) return;
+  const u = ocean.material.uniforms;
+  let n = 0;
+  if (Array.isArray(edits)) {
+    for (let i = 0; i < edits.length && n < OCEAN_DRY_MAX; i++) {
+      const e = edits[i];
+      if (e && e.type === 'level' && e.dry) {
+        u.uDryZones.value[n].set(e.pos[0], e.pos[1], e.pos[2], Math.cos(e.radius));
+        n++;
+      }
+    }
+  }
+  u.uDryCount.value = n;
 }
 
 // 大气(瑞利 + 米氏单次散射, 实时 raymarch) —— 深度感知的全屏后处理 pass。

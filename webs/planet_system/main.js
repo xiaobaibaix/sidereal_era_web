@@ -8,7 +8,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
 import GUI from 'lil-gui';
 import { Planet } from '../../src/planet.js';
-import { createOcean, createAtmospherePass, createCompositePass, createGodrayPass, createTransmittanceLUT } from '../../src/effects.js';
+import { createOcean, setOceanDryZones, createAtmospherePass, createCompositePass, createGodrayPass, createTransmittanceLUT } from '../../src/effects.js';
 import { PlanetWalker } from './character.js';
 import { ExcavatorSystem } from '../../src/excavators.js';
 
@@ -1180,6 +1180,7 @@ function animate() {
   if (characterMode) walker.update(dt);           // 角色始终更新(输入由 active 门控)
   if (brush.enabled && _digHeld && _charDigActive()) tryDig(false);   // 角色模式: 按住 F 连续挖(在 planet.update 前, 本帧即生效)
   excavators.update(dt, mainCam());               // 挖机+卡车(状态机 + 地形提交节流 + 实例矩阵 + 头顶标记)
+  setOceanDryZones(ocean, planet.params.edits);   // 陆地挖掘坑不露海水
   if (excavators.running) {
     const pct = (excavators.progress() * 100).toFixed(0);
     exTool.status = excavators.allDone()
