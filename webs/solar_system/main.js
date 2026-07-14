@@ -567,6 +567,8 @@ let _downXY = null;
 // 角色模式下滚轮调相机距离(轨道模式滚轮由 OrbitControls 自己处理)
 addEventListener('wheel', (e) => {
   if (!charMode || !walker) return;
+  // 鼠标在 lil-gui 参数栏上滚动 → 交给 GUI 自己滚(参数列表), 不动相机
+  if (e.target && e.target.closest && e.target.closest('.lil-gui')) return;
   const step = Math.sign(e.deltaY) * Math.max(1, walker.camDist * 0.1);
   walker.camDist = THREE.MathUtils.clamp(walker.camDist + step, 4, 500);
 }, { passive: true });
@@ -1216,7 +1218,8 @@ function animate() {
       if (d > maxD) maxD = d;
     }
     const far = camDist + maxD * 1.5 + fR * 10;
-    const near = Math.max((camDist - fR) * 0.3, fR * 1e-4, far * 1e-7);
+    // near 用更小乘子(0.1)避免相机贴地(pitch 压低时 clamp 到 groundR+camClearance)后近裁面斜切前方地形
+    const near = Math.max((camDist - fR) * 0.1, fR * 1e-4, far * 1e-7);
     walker.camera.near = near;
     walker.camera.far = far;
     walker.camera.updateProjectionMatrix();

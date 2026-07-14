@@ -21,6 +21,7 @@ export class PlanetWalker {
     this.feetOffset = 2.0;    // 胶囊中心到脚底(= 胶囊半高)
     this.camDist = 14;
     this.camHeight = 6;
+    this.camClearance = 5.0;  // 相机离地最小间隙(避免近裁面斜切前方地形)
     this.pitchMin = -0.2;     // 俯仰下限(越负越能仰头看天; 太接近 -π/2 相机会翻转)
     this.pitchMax = 1.35;     // 俯仰上限(越大越俯瞰; 太接近 +π/2 相机会翻转)
 
@@ -157,7 +158,7 @@ export class PlanetWalker {
     this._arm.copy(this._back).multiplyScalar(Math.cos(this.pitch)).addScaledVector(this._n, Math.sin(this.pitch));
     this._camPos.copy(this.position).addScaledVector(this._n, this.camHeight).addScaledVector(this._arm, this.camDist);
     const cn = this._camPos.clone().normalize();
-    const camGround = this.groundRadius(cn) + 2;
+    const camGround = this.groundRadius(cn) + this.camClearance;
     if (this._camPos.length() < camGround) this._camPos.copy(cn).multiplyScalar(camGround);
     this.camera.position.copy(this._camPos);
     this.camera.up.copy(this._n);
