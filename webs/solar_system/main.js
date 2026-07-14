@@ -87,31 +87,6 @@ let walker = null;      // 懒创建: 首次进入时绑定当前聚焦行星的
 let charMode = false;
 function renderCam() { return (charMode && walker) ? walker.camera : camera; }
 
-// 调试用: 在 console 输入 debugPlanets() 查看每个 detail 行星的 chunk 可见性状态
-window.debugPlanets = function() {
-  console.log('%c=== detailMap 诊断 ===', 'color:#0bf;font-weight:bold');
-  console.log('camera.position:', camera.position.toArray(), 'distance:', camera.position.length());
-  console.log('focus:', params.focus, '_off:', _off.toArray());
-  for (const [b, e] of detailMap) {
-    if (!e.planet) continue;
-    const p = e.planet;
-    const chunks = [];
-    let visibleCount = 0;
-    for (const r of p.roots) {
-      const visit = (n, depth = 0) => {
-        if (n.mesh) {
-          chunks.push({ lvl: n.level, vis: n.mesh.visible, hasMesh: true });
-          if (n.mesh.visible) visibleCount++;
-        }
-        if (n.children) for (const c of n.children) visit(c, depth + 1);
-      };
-      visit(r);
-    }
-    console.log(`%c[${b.name}]%c pos=${p.position.toArray()} cp=${p._camPos} _camMoved=${p._camMoved} _queued=${p._queued} _inflight=${p._inflight} _meshArrived=${p._meshArrived} chunks(with mesh)=${chunks.length} visible=${visibleCount} selectLOD计数=${JSON.stringify(p._dbgSel || {})}`,
-      'color:#fb0;font-weight:bold', 'color:reset');
-  }
-};
-
 // 太阳点光源: 主光(衰减=0 全系统可见)。夜面靠环境光兜底, 否则行星背阳面纯黑
 // 对黑色星空背景完全不可见(聚焦后看不到行星, 必须拖动相机绕到朝阳面才能看见)。
 const sunLight = new THREE.PointLight(0xffffff, 3.5, 0, 0);
@@ -515,8 +490,11 @@ toolGui.add(brush, 'enabled').name('启用(关=切焦点)').listen();
 toolGui.add(brush, 'size', 0.005, 0.2, 0.001).name('刷子大小(角半径)');
 toolGui.add(brush, 'depth', 0.05, 1.0, 0.05).name('深度');
 toolGui.add(brush, 'falloff', ['smooth', 'linear', 'sharp']).name('边缘过渡');
-toolGui.add(brush, 'mode', ['dig', 'raise']).name('模式(暂只 dig)');
+toolGui.add(brush, 'mode', ['dig', 'raise']).name('模式(dig/raise)');
+toolGui.add({ undo: undoEdit }, 'undo').name('撤销 (Ctrl+Z)');
+toolGui.add({ redo: redoEdit }, 'redo').name('重做 (Ctrl+Shift+Z)');
 toolGui.add(brush, '_clearEdits').name('清空所有 edits');
+toolGui.add({ saveNow: () => { const fb = focusBody(); const fe = fb && detailMap.get(fb); if (fe && fe.planet) saveEdits(fb, fe.planet); } }, 'saveNow').name('手动保存到 localStorage');
 gui.add(params, 'worldScale', { '×1 (演示)': 1, '×1e2': 100, '×1e3': 1000, '×1e4': 10000, '×1e5 (~1e6 米)': 100000 })
   .name('全局尺度(×S)').onChange(() => { rebuild(); frameFocus(); });
 gui.add(params, 'softening', 0.1, 20).name('软化(防奇点)').onFinishChange(() => { system.softening = params.softening * params.worldScale; });
@@ -622,7 +600,159 @@ function applyBodyRadius() {
 // 点击天体切换观察中心(区分点击/拖动)
 const _raycaster = new THREE.Raycaster();
 const _pointer = new THREE.Vector2();
+const _mouseNDC = new THREE.Vector2(-2, -2);  // 屏外初始
 let _downXY = null;
+let _brushDown = false;        // brush 启用时鼠标按下状态
+let _lastDigDir = null;        // 上次 dig 方向(单位向量, 拖拽时节流用)
+const _CENTER = new THREE.Vector2(0, 0);   // 角色模式: 屏幕中心准星瞄点
+let _digHeld = false;          // 角色模式: 按住 F 连续挖
+
+// 角色模式挖掘是否可用(角色模式下相机被 walker 接管, 鼠标被指针锁定 → 用屏幕中心瞄点)
+function _charDigActive() { return charMode && !!walker; }
+
+// 屏幕中心准星(角色模式瞄点视觉反馈)
+const crosshair = document.createElement('div');
+crosshair.style.cssText = 'position:fixed;left:50%;top:50%;width:22px;height:22px;margin:-11px 0 0 -11px;border:2px solid rgba(255,255,255,0.9);border-radius:50%;box-shadow:0 0 3px rgba(0,0,0,0.85);pointer-events:none;display:none;z-index:20;';
+document.body.appendChild(crosshair);
+
+// === brush edit 持久化(localStorage, 按 body 名字) ===
+function _editsLSKey(body) { return `three_planet_edits_${body.name}`; }
+function loadEdits(body, planet) {
+  try {
+    const s = localStorage.getItem(_editsLSKey(body));
+    if (s) {
+      const edits = JSON.parse(s);
+      if (Array.isArray(edits) && edits.length) {
+        planet.params.edits = edits;
+        planet._buildNoise();
+        for (const r of planet.roots) planet._invalidateAffected(r, { x: 1, y: 0, z: 0 }, Math.PI);
+        planet._editPending = true;
+      }
+    }
+  } catch (e) { /* localStorage 不可用 */ }
+}
+function saveEdits(body, planet) {
+  try { localStorage.setItem(_editsLSKey(body), JSON.stringify(planet.params.edits)); }
+  catch (e) { /* 隐私模式等: 忽略 */ }
+}
+
+// === Undo / Redo ===
+const _redoStack = new Map();   // body → edits[]
+function _regenAroundEdit(planet, edit) {
+  planet._buildNoise();
+  for (const r of planet.roots) planet._invalidateAffected(r, { x: edit.pos[0], y: edit.pos[1], z: edit.pos[2] }, edit.radius);
+  planet._editPending = true;
+}
+function undoEdit() {
+  const fb = focusBody();
+  const fe = fb && detailMap.get(fb);
+  if (!fe || !fe.planet || !fe.planet.params.edits.length) return;
+  const popped = fe.planet.params.edits.pop();
+  if (!_redoStack.has(fb)) _redoStack.set(fb, []);
+  _redoStack.get(fb).push(popped);
+  _regenAroundEdit(fe.planet, popped);
+  saveEdits(fb, fe.planet);
+}
+function redoEdit() {
+  const fb = focusBody();
+  const fe = fb && detailMap.get(fb);
+  const stack = _redoStack.get(fb);
+  if (!fe || !fe.planet || !stack || !stack.length) return;
+  const restored = stack.pop();
+  fe.planet.params.edits.push(restored);
+  _regenAroundEdit(fe.planet, restored);
+  saveEdits(fb, fe.planet);
+}
+addEventListener('keydown', (e) => {
+  if ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z')) {
+    e.preventDefault();
+    if (e.shiftKey) redoEdit(); else undoEdit();
+  } else if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || e.key === 'Y')) {
+    e.preventDefault();
+    redoEdit();
+  }
+});
+
+// === Brush ring 可视化(鼠标悬停在地表的圆环) ===
+const BRUSH_RING_N = 64;
+const _ringGeo = new THREE.BufferGeometry();
+_ringGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(BRUSH_RING_N * 3), 3));
+const _ringMat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.85, depthTest: false });
+const brushRing = new THREE.LineLoop(_ringGeo, _ringMat);
+brushRing.frustumCulled = false;
+brushRing.renderOrder = 999;
+brushRing.visible = false;
+scene.add(brushRing);
+const _ringN = new THREE.Vector3(), _ringT1 = new THREE.Vector3(), _ringT2 = new THREE.Vector3();
+
+function updateBrushRing() {
+  const inChar = _charDigActive();
+  crosshair.style.display = (inChar && brush.enabled) ? 'block' : 'none';
+  if (!brush.enabled) { brushRing.visible = false; return; }
+  const fb = focusBody();
+  const fe = fb && detailMap.get(fb);
+  if (!fe || !fe.planet) { brushRing.visible = false; return; }
+  // 轨道模式: 鼠标处; 角色模式: 屏幕中心(renderCam() 已返回 walker.camera)
+  const ndc = inChar ? _CENTER : _mouseNDC;
+  _raycaster.setFromCamera(ndc, renderCam());
+  const targets = [fe.planet, ...(fe.ocean ? [fe.ocean] : [])];
+  const hits = _raycaster.intersectObjects(targets, true);
+  if (!hits.length) { brushRing.visible = false; return; }
+  const hitLocal = hits[0].point.clone().sub(fe.planet.position);
+  _ringN.copy(hitLocal).normalize();
+  // 切平面基(t1, t2 ⊥ _ringN)
+  if (Math.abs(_ringN.y) < 0.99) _ringT1.set(0, 1, 0).cross(_ringN).normalize();
+  else _ringT1.set(1, 0, 0).cross(_ringN).normalize();
+  _ringT2.crossVectors(_ringN, _ringT1).normalize();
+  // 球面上以 _ringN 为中心、brush.size 为角半径采 N 个点
+  const R = fe.planet.params.radius;
+  const sin_r = Math.sin(brush.size), cos_r = Math.cos(brush.size);
+  const offset = R * 1.002;   // 略高于地表防 z-fighting
+  const pos = _ringGeo.attributes.position.array;
+  for (let i = 0; i < BRUSH_RING_N; i++) {
+    const a = (i / BRUSH_RING_N) * Math.PI * 2;
+    const ca = Math.cos(a), sa = Math.sin(a);
+    const tx = sin_r * (ca * _ringT1.x + sa * _ringT2.x);
+    const ty = sin_r * (ca * _ringT1.y + sa * _ringT2.y);
+    const tz = sin_r * (ca * _ringT1.z + sa * _ringT2.z);
+    const px = _ringN.x * cos_r + tx;
+    const py = _ringN.y * cos_r + ty;
+    const pz = _ringN.z * cos_r + tz;
+    const len = Math.hypot(px, py, pz) || 1;
+    const s = offset / len;
+    pos[i * 3]     = px * s + fe.planet.position.x;
+    pos[i * 3 + 1] = py * s + fe.planet.position.y;
+    pos[i * 3 + 2] = pz * s + fe.planet.position.z;
+  }
+  _ringGeo.attributes.position.needsUpdate = true;
+  brushRing.visible = true;
+}
+
+// 实际挖一次(返回是否成功)
+function tryDig(force = false) {
+  const fb = focusBody();
+  const fe = fb && detailMap.get(fb);
+  if (!fe || !fe.planet) return false;
+  const ndc = _charDigActive() ? _CENTER : _mouseNDC;
+  _raycaster.setFromCamera(ndc, renderCam());
+  const targets = [fe.planet, ...(fe.ocean ? [fe.ocean] : [])];
+  const hits = _raycaster.intersectObjects(targets, true);
+  if (!hits.length) return false;
+  const localPos = hits[0].point.clone().sub(fe.planet.position);
+  const dir = localPos.clone().normalize();
+  // 拖拽节流: 上次 dig 方向到当前方向角距离 > 0.4×size 才挖(避免每像素一个 edit)
+  if (!force && _lastDigDir) {
+    const cos = dir.dot(_lastDigDir);
+    const ang = Math.acos(Math.max(-1, Math.min(1, cos)));
+    if (ang < brush.size * 0.4) return false;
+  }
+  const depth = brush.mode === 'raise' ? -brush.depth : brush.depth;
+  fe.planet.applyEdit(localPos, brush.size, depth, brush.falloff);
+  _lastDigDir = dir;
+  _redoStack.set(fb, []);   // 新 edit 清 redo
+  saveEdits(fb, fe.planet);
+  return true;
+}
 // 角色模式下滚轮调相机距离(轨道模式滚轮由 OrbitControls 自己处理)
 addEventListener('wheel', (e) => {
   if (!charMode || !walker) return;
@@ -631,41 +761,47 @@ addEventListener('wheel', (e) => {
   const step = Math.sign(e.deltaY) * Math.max(1, walker.camDist * 0.1);
   walker.camDist = THREE.MathUtils.clamp(walker.camDist + step, 4, 500);
 }, { passive: true });
-renderer.domElement.addEventListener('pointerdown', (e) => { _downXY = { x: e.clientX, y: e.clientY }; });
+renderer.domElement.addEventListener('pointerdown', (e) => {
+  _downXY = { x: e.clientX, y: e.clientY };
+  if (brush.enabled && !charMode) { _brushDown = true; _lastDigDir = null; }
+});
+renderer.domElement.addEventListener('pointermove', (e) => {
+  _mouseNDC.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
+  if (_brushDown) tryDig(false);
+});
+renderer.domElement.addEventListener('pointerleave', () => {
+  _brushDown = false; _lastDigDir = null;
+});
 renderer.domElement.addEventListener('pointerup', (e) => {
-  if (charMode) return;                 // 角色模式: 点击用于锁定视角, 不切换聚焦
+  _brushDown = false; _lastDigDir = null;
+  if (charMode) return;                 // 角色模式: 点击用于锁定视角
   if (!_downXY) return;
   const moved = Math.hypot(e.clientX - _downXY.x, e.clientY - _downXY.y);
   _downXY = null;
-  if (moved > 5) return;                    // 拖动旋转, 不当点击
+  if (moved > 5) return;                // 拖动旋转(或拖拽挖), pointermove 已处理 dig
   _pointer.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
+  _mouseNDC.copy(_pointer);             // 同步 NDC 给 ring 更新
   _raycaster.setFromCamera(_pointer, camera);
 
-  // 挖掘工具启用时: 射线打焦点行星, 加 edit(不切焦点)
-  if (brush.enabled) {
-    const fb = focusBody();
-    const fe = fb && detailMap.get(fb);
-    if (fe && fe.planet) {
-      // 射线打 LOD planet 的所有 chunks + 海洋球
-      const targets = [fe.planet, ...(fe.ocean ? [fe.ocean] : [])];
-      const hits = _raycaster.intersectObjects(targets, true);
-      if (hits.length) {
-        const localPos = hits[0].point.clone().sub(fe.planet.position);
-        const depth = brush.mode === 'raise' ? -brush.depth : brush.depth;  // raise: 负 dig = 抬升
-        fe.planet.applyEdit(localPos, brush.size, depth, brush.falloff);
-        return;
-      }
-    }
-    return;   // 没打中也不切焦点
-  }
+  // brush 启用 + 单击(非拖动): 挖一次
+  if (brush.enabled) { tryDig(true); return; }
 
-  // 否则: 原行为(点击切焦点)
+  // 否则: 原行为(切焦点)
   const hits = _raycaster.intersectObjects(entries.map((en) => en.mesh), false);
   if (hits.length) {
     const e2 = entries.find((en) => en.mesh === hits[0].object);
     if (e2) setFocus(e2.body);
   }
 });
+
+// 角色模式: 按住 F 在屏幕中心准星处连续挖(登陆星球后鼠标被指针锁定, 无法用光标瞄点)。
+addEventListener('keydown', (e) => {
+  if (e.code === 'KeyF' && brush.enabled && _charDigActive()) {
+    if (!_digHeld) { _digHeld = true; _lastDigDir = null; }
+    e.preventDefault();
+  }
+});
+addEventListener('keyup', (e) => { if (e.code === 'KeyF') _digHeld = false; });
 
 // ----------------------------------------------------------------------------
 // 近距详细表现: 靠近聚焦天体时, 用主项目的 LOD 地形行星替代简单球(在原点=浮动原点中心)
@@ -933,6 +1069,7 @@ function addDetail(body) {
   if (ocean) scene.add(ocean);
   const e = { planet, ocean };
   detailMap.set(body, e);
+  loadEdits(body, planet);             // 从 localStorage 恢复上次挖掘
   if (params.wireframe === 'all' || (params.wireframe === 'current' && body === focusBody())) planet.setWireframe(true);
   return e;
 }
@@ -1291,6 +1428,7 @@ function animate() {
 
   if (charMode) walker.update(dt);   // 角色: WASD/鼠标驱动, 相机由 walker 管理
   else controls.update();
+  if (brush.enabled && _digHeld && _charDigActive()) tryDig(false);   // 角色模式: 按住 F 连续挖(在 manageDetail/planet.update 前, 本帧即生效)
   // 先更新相机 near/far(在 manageDetail 之前!), 否则首帧 frustum 还用旧 far(初始 20000)剔除
   // → 行星 chunks 全部 outOfFrustum → 之后浮动原点静止 _camMoved=false 短路 → 永远 invisible
   if (charMode) {
@@ -1420,12 +1558,17 @@ function animate() {
   fpsFrames++; fpsAccum += dt;
   if (fpsAccum >= 0.5) { fpsValue = fpsFrames / fpsAccum; fpsFrames = 0; fpsAccum = 0; }
   const hint = charMode
-    ? `角色: ${params.focus} · 点击锁定视角 · WASD 移动 · 空格跳 · 鼠标看 · ESC 释放(取消勾选退出)`
-    : `聚焦: ${params.focus} · 点击天体切换观察中心 · 拖动旋转 · 滚轮缩放`;
+    ? (brush.enabled
+        ? `⛏ 角色: ${params.focus} · 按住 F 挖(准星瞄点) · WASD 移动 · 鼠标看 · Ctrl+Z 撤销`
+        : `角色: ${params.focus} · 点击锁定视角 · WASD 移动 · 空格跳 · 鼠标看 · ESC 释放(取消勾选退出)`)
+    : brush.enabled
+      ? `⛏ ${params.focus} · 拖拽连续挖 · Ctrl+Z 撤销 · Ctrl+Shift+Z 重做`
+      : `聚焦: ${params.focus} · 点击天体切换观察中心 · 拖动旋转 · 滚轮缩放`;
   hud.innerHTML =
     `FPS: ${fpsValue.toFixed(0)} · 天体: ${system.bodies.length} · G=${params.G.toFixed(2)} · t=${system.time.toFixed(0)}<br>` +
     `总能量: ${e.total.toExponential(3)} · 漂移: ${drift.toFixed(3)}%(越小越稳)<br>` +
     hint;
+  updateBrushRing();   // 鼠标悬停在地表的白色圆环
 }
 
 restoreParams();                 // 恢复上次的 Controls 参数(localStorage) → 无需每次重调
@@ -1434,15 +1577,4 @@ gui.controllersRecursive().forEach((c) => c.updateDisplay());   // 同步所有�
 // 总是 frameFocus: 焦点恢复成行星(localStorage)时, 默认相机位 (0,1600,3800) 是给恒星用的,
 // 距离行星 ~4000 单位 → 行星只占几像素, 看起来"地形没出现"。frameFocus 把相机拉到 R×8 处。
 frameFocus();
-// ====== 启动诊断(看完可删) ======
-console.log('%c[solar_system 启动]', 'color:#0bf;font-weight:bold', {
-  focus: params.focus,
-  focusBodyRadius: focusBody()?.radius,
-  cameraPositionAfterFrameFocus: camera.position.toArray(),
-  cameraDistance: camera.position.length(),
-  detailMapSizeAtStartup: detailMap.size,
-  detailMapKeys: [...detailMap.keys()].map((b) => b.name),
-  hasAmbientLight: !!scene.children.find((c) => c.isAmbientLight),
-  hasSunLight: !!scene.children.find((c) => c.isPointLight),
-});
 animate();

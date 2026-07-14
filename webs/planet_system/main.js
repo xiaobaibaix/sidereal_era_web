@@ -885,6 +885,202 @@ function renderViews() {
   }
 }
 
+// ============================================================================
+// 挖掘工具(完整版): 鼠标悬停圆环 + 拖拽连续挖 + localStorage 持久化 + undo/redo
+// ============================================================================
+const brush = {
+  enabled: false,
+  size: 0.05,
+  depth: 0.3,
+  falloff: 'smooth',
+  mode: 'dig',
+};
+
+const _brushRaycaster = new THREE.Raycaster();
+const _mouseNDC = new THREE.Vector2(-2, -2);
+const _CENTER = new THREE.Vector2(0, 0);   // 角色模式: 屏幕中心准星瞄点
+let _brushDown = false;
+let _lastDigDir = null;
+let _digHeld = false;                       // 角色模式: 按住 F 连续挖
+
+// 角色模式挖掘是否可用: 已进入角色模式且角色是主画面(在小窗时不挖)
+function _charDigActive() { return characterMode && walker && mainCam() === walker.camera; }
+
+// 屏幕中心准星(角色模式瞄点视觉反馈)
+const crosshair = document.createElement('div');
+crosshair.style.cssText = 'position:fixed;left:50%;top:50%;width:22px;height:22px;margin:-11px 0 0 -11px;border:2px solid rgba(255,255,255,0.9);border-radius:50%;box-shadow:0 0 3px rgba(0,0,0,0.85);pointer-events:none;display:none;z-index:20;';
+document.body.appendChild(crosshair);
+
+const EDITS_LS_KEY = 'three_planet_edits_planet_system';
+function loadEdits() {
+  try {
+    const s = localStorage.getItem(EDITS_LS_KEY);
+    if (s) {
+      const edits = JSON.parse(s);
+      if (Array.isArray(edits) && edits.length) {
+        planet.params.edits = edits;
+        planet._buildNoise();
+        for (const r of planet.roots) planet._invalidateAffected(r, { x: 1, y: 0, z: 0 }, Math.PI);
+        planet._editPending = true;
+      }
+    }
+  } catch (e) { /* localStorage 不可用 */ }
+}
+function saveEdits() {
+  try { localStorage.setItem(EDITS_LS_KEY, JSON.stringify(planet.params.edits)); }
+  catch (e) {}
+}
+
+let _redoStack = [];
+function _regenAroundEdit(edit) {
+  planet._buildNoise();
+  for (const r of planet.roots) planet._invalidateAffected(r, { x: edit.pos[0], y: edit.pos[1], z: edit.pos[2] }, edit.radius);
+  planet._editPending = true;
+}
+function undoEdit() {
+  if (!planet.params.edits.length) return;
+  const popped = planet.params.edits.pop();
+  _redoStack.push(popped);
+  _regenAroundEdit(popped);
+  saveEdits();
+}
+function redoEdit() {
+  if (!_redoStack.length) return;
+  const restored = _redoStack.pop();
+  planet.params.edits.push(restored);
+  _regenAroundEdit(restored);
+  saveEdits();
+}
+addEventListener('keydown', (e) => {
+  if (!brush.enabled) return;
+  if ((e.ctrlKey || e.metaKey) && (e.key === 'z' || e.key === 'Z')) {
+    e.preventDefault();
+    if (e.shiftKey) redoEdit(); else undoEdit();
+  } else if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || e.key === 'Y')) {
+    e.preventDefault();
+    redoEdit();
+  }
+});
+
+// Brush ring 可视化(悬停在地表的圆环)
+const BRUSH_RING_N = 64;
+const _ringGeo = new THREE.BufferGeometry();
+_ringGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(BRUSH_RING_N * 3), 3));
+const _ringMat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.85, depthTest: false });
+const brushRing = new THREE.LineLoop(_ringGeo, _ringMat);
+brushRing.frustumCulled = false;
+brushRing.renderOrder = 999;
+brushRing.visible = false;
+scene.add(brushRing);
+const _ringN = new THREE.Vector3(), _ringT1 = new THREE.Vector3(), _ringT2 = new THREE.Vector3();
+
+function _brushTargets() {
+  return [planet, ...(typeof ocean !== 'undefined' && ocean ? [ocean] : [])];
+}
+function updateBrushRing() {
+  const inChar = _charDigActive();
+  crosshair.style.display = (inChar && brush.enabled) ? 'block' : 'none';
+  // 轨道模式: 鼠标悬停处显示; 角色模式(主画面): 屏幕中心瞄点显示; 角色在小窗时不显示。
+  if (!brush.enabled || (characterMode && !inChar)) { brushRing.visible = false; return; }
+  const cam = inChar ? walker.camera : primaryCam();
+  const ndc = inChar ? _CENTER : _mouseNDC;
+  _brushRaycaster.setFromCamera(ndc, cam);
+  const hits = _brushRaycaster.intersectObjects(_brushTargets(), true);
+  if (!hits.length) { brushRing.visible = false; return; }
+  const hitLocal = hits[0].point.clone().sub(planet.position);
+  _ringN.copy(hitLocal).normalize();
+  if (Math.abs(_ringN.y) < 0.99) _ringT1.set(0, 1, 0).cross(_ringN).normalize();
+  else _ringT1.set(1, 0, 0).cross(_ringN).normalize();
+  _ringT2.crossVectors(_ringN, _ringT1).normalize();
+  const R = planet.params.radius;
+  const sin_r = Math.sin(brush.size), cos_r = Math.cos(brush.size);
+  const offset = R * 1.002;
+  const pos = _ringGeo.attributes.position.array;
+  for (let i = 0; i < BRUSH_RING_N; i++) {
+    const a = (i / BRUSH_RING_N) * Math.PI * 2;
+    const ca = Math.cos(a), sa = Math.sin(a);
+    const tx = sin_r * (ca * _ringT1.x + sa * _ringT2.x);
+    const ty = sin_r * (ca * _ringT1.y + sa * _ringT2.y);
+    const tz = sin_r * (ca * _ringT1.z + sa * _ringT2.z);
+    const px = _ringN.x * cos_r + tx;
+    const py = _ringN.y * cos_r + ty;
+    const pz = _ringN.z * cos_r + tz;
+    const len = Math.hypot(px, py, pz) || 1;
+    const s = offset / len;
+    pos[i * 3]     = px * s + planet.position.x;
+    pos[i * 3 + 1] = py * s + planet.position.y;
+    pos[i * 3 + 2] = pz * s + planet.position.z;
+  }
+  _ringGeo.attributes.position.needsUpdate = true;
+  brushRing.visible = true;
+}
+
+function tryDig(force = false) {
+  const inChar = _charDigActive();
+  const cam = inChar ? walker.camera : primaryCam();
+  const ndc = inChar ? _CENTER : _mouseNDC;
+  _brushRaycaster.setFromCamera(ndc, cam);
+  const hits = _brushRaycaster.intersectObjects(_brushTargets(), true);
+  if (!hits.length) return false;
+  const localPos = hits[0].point.clone().sub(planet.position);
+  const dir = localPos.clone().normalize();
+  if (!force && _lastDigDir) {
+    const cos = dir.dot(_lastDigDir);
+    const ang = Math.acos(Math.max(-1, Math.min(1, cos)));
+    if (ang < brush.size * 0.4) return false;
+  }
+  const depth = brush.mode === 'raise' ? -brush.depth : brush.depth;
+  planet.applyEdit(localPos, brush.size, depth, brush.falloff);
+  _lastDigDir = dir;
+  _redoStack = [];   // 新 edit 清 redo
+  saveEdits();
+  return true;
+}
+
+renderer.domElement.addEventListener('pointerdown', () => {
+  if (brush.enabled && !characterMode) { _brushDown = true; _lastDigDir = null; }
+});
+renderer.domElement.addEventListener('pointermove', (e) => {
+  _mouseNDC.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
+  if (_brushDown) tryDig(false);
+});
+renderer.domElement.addEventListener('pointerleave', () => { _brushDown = false; _lastDigDir = null; });
+renderer.domElement.addEventListener('pointerup', () => {
+  const wasBrushDown = _brushDown;
+  _brushDown = false; _lastDigDir = null;
+  if (wasBrushDown) tryDig(true);
+});
+
+// 角色模式: 按住 F 在屏幕中心准星处连续挖(鼠标已被指针锁定, 无法用光标瞄点)。
+addEventListener('keydown', (e) => {
+  if (e.code === 'KeyF' && brush.enabled && _charDigActive()) {
+    if (!_digHeld) { _digHeld = true; _lastDigDir = null; }
+    e.preventDefault();
+  }
+});
+addEventListener('keyup', (e) => { if (e.code === 'KeyF') _digHeld = false; });
+
+// 左侧工具栏
+const toolGui = new GUI({ title: '⛏ 挖掘工具' });
+toolGui.domElement.parentElement.style.left = '0px';
+toolGui.domElement.parentElement.style.right = 'auto';
+toolGui.add(brush, 'enabled').name('启用').listen();
+toolGui.add(brush, 'size', 0.005, 0.2, 0.001).name('刷子大小(角半径)');
+toolGui.add(brush, 'depth', 0.05, 1.0, 0.05).name('深度');
+toolGui.add(brush, 'falloff', ['smooth', 'linear', 'sharp']).name('边缘过渡');
+toolGui.add(brush, 'mode', ['dig', 'raise']).name('模式');
+toolGui.add({ undo: undoEdit }, 'undo').name('撤销 (Ctrl+Z)');
+toolGui.add({ redo: redoEdit }, 'redo').name('重做 (Ctrl+Shift+Z)');
+toolGui.add({ clear: () => {
+  planet.params.edits.length = 0;
+  planet._buildNoise();
+  for (const r of planet.roots) planet._invalidateAffected(r, { x: 1, y: 0, z: 0 }, Math.PI);
+  planet._editPending = true;
+  saveEdits();
+} }, 'clear').name('清空所有 edits');
+
+loadEdits();   // 从 localStorage 恢复上次挖掘
+
 function animate() {
   requestAnimationFrame(animate);
   const dt = Math.min(clock.getDelta(), 0.05);   // 限制步长, 防止掉帧时穿地
@@ -900,11 +1096,13 @@ function animate() {
   if (main === camera) controls.update();
   else if (main === spectatorCamera) updateSpectator(dt);
   if (characterMode) walker.update(dt);           // 角色始终更新(输入由 active 门控)
+  if (brush.enabled && _digHeld && _charDigActive()) tryDig(false);   // 角色模式: 按住 F 连续挖(在 planet.update 前, 本帧即生效)
 
   atmoPass.uniforms.uTime.value = clock.elapsedTime;   // 云飘动(云已并入大气 pass)
   updateClips();                                  // 动态近/远面, 消除 z-fighting
   // 角色模式: LOD 追踪角色本身(walker.position), 相机绕角色转时不会触发 chunk 重新细分
   planet.update(lodCam(), characterMode && walker ? walker.position : null);
+  updateBrushRing();                              // 挖掘刷子圆环(轨道:鼠标处 / 角色:屏幕中心)
   renderViews();
 
   const s = planet.stats;
@@ -914,8 +1112,12 @@ function animate() {
   const base = `FPS: ${fpsValue.toFixed(0)} · patch: ${s.patches} · 三角形: ${s.triangles} · 队列: ${s.queued} · 生成中: ${s.inflight}`;
   let hint;
   if (main === spectatorCamera) hint = '旁观相机(主画面) · 点击锁定 · WASD 移动 · 空格/Shift 升降 · ESC 释放';
-  else if (walker && main === walker.camera) hint = '角色(主画面) · 点击锁定 · WASD 移动 · 空格跳 · ESC 释放';
-  else hint = '鼠标左键旋转 · 滚轮缩放 · 右键平移';
+  else if (walker && main === walker.camera) hint = brush.enabled
+    ? '⛏ 角色 · 按住 F 挖(准星瞄点) · WASD 移动 · 鼠标看 · Ctrl+Z 撤销 · ESC 释放'
+    : '角色(主画面) · 点击锁定 · WASD 移动 · 空格跳 · ESC 释放';
+  else hint = brush.enabled
+    ? '⛏ 拖拽连续挖 · Ctrl+Z 撤销 · Ctrl+Shift+Z 重做 · 滚轮缩放'
+    : '鼠标左键旋转 · 滚轮缩放 · 右键平移';
   info.innerHTML = `${hint} · 点左上小窗切换<br />${base}`;
 }
 animate();
