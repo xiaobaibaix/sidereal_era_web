@@ -1,14 +1,15 @@
 // 自动施工系统: 挖机(挖掘) + 卡车(运输), 两种角色协作。
 //
 // 角色分工:
-//   挖机(Excavator): 驻扎在挖掘区, 持续把地形挖低(挖掘区 edit 深度渐增 → 地面下沉成坑),
-//                    挖出的土方进入共享"料堆"(stockpile)。挖到目标深度即停。
-//   卡车(Truck):     在挖掘区↔填埋区往返。到挖掘区从料堆装土 → 开到填埋区卸土(地面抬升)
-//                    → 回来, 只要还有料就循环, 直到料堆清空且挖机完工。
+//   挖机(Excavator): 驻扎挖掘区, 空闲时挑一台开到它旁边等待的卡车来装车; 装车时才挖地形
+//                    (挖掘区 edit 深度渐增 → 地面下沉成坑), 把土直接装进那台卡车。没车来时
+//                    在区内小范围换点推进作业面; 挖到目标深度即停。
+//   卡车(Truck):     开到指派挖机旁排队 → 被装满 → 开到填埋区卸土(地面抬升) → 回来找挖机,
+//                    循环直到挖掘区挖到目标深度、且自己空车。
 //
 // 与地形耦合复用 planet.params.edits 管线, 有界 + 守恒:
 //   - 只放 2 条受管理 edit: 挖掘区(depth 增大→下沉) 与 填埋区(depth 变负→抬升)。
-//   - 挖出总量 = 料堆 + 卡车在途 + 已填(按球冠面积比换算), 体积守恒。
+//   - 挖出总量 = 卡车在途 + 已填(按球冠面积比换算), 体积守恒(挖=装, 一勺不落地)。
 //   - mesh 重建(_buildNoise + invalidate)节流(每 ~0.12s 一次), 避免上千次改动打爆 worker。
 //
 // 渲染: 挖机与卡车各用一个 InstancedMesh(几百个也很便宜), per-instance 颜色表示状态。
@@ -17,32 +18,34 @@ import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 
 // 挖机状态
-const EX = { TO_DIG: 0, DIGGING: 1, IDLE: 2, DONE: 3 };
+const EX = { TO_DIG: 0, IDLE: 1, LOADING: 2, DONE: 3 };
 // 卡车状态
-const TR = { TO_LOAD: 0, LOADING: 1, TO_DUMP: 2, DUMPING: 3, DONE: 4 };
+const TR = { TO_EXCA: 0, WAITING: 1, LOADING: 2, TO_DUMP: 3, DUMPING: 4, DONE: 5 };
 
 const EX_COLOR = {
-  [EX.TO_DIG]: new THREE.Color(0xffd24a),  // 开往挖掘区: 黄
-  [EX.DIGGING]: new THREE.Color(0xff7a2d), // 挖掘中: 橙
-  [EX.IDLE]: new THREE.Color(0xf0c000),    // 料满等车: 深黄
-  [EX.DONE]: new THREE.Color(0x59636f),    // 完工: 暗灰
+  [EX.TO_DIG]: new THREE.Color(0xffd24a),   // 开往挖点: 黄
+  [EX.IDLE]: new THREE.Color(0xf0c000),     // 就位待命(等卡车): 深黄
+  [EX.LOADING]: new THREE.Color(0xff7a2d),  // 挖掘装车中: 橙
+  [EX.DONE]: new THREE.Color(0x59636f),     // 完工: 暗灰
 };
 const TR_COLOR = {
-  [TR.TO_LOAD]: new THREE.Color(0xffe27a), // 空车去装: 浅黄
-  [TR.LOADING]: new THREE.Color(0xffb74a), // 装载中: 橙黄
-  [TR.TO_DUMP]: new THREE.Color(0x9c6b3f), // 满载去卸: 棕
-  [TR.DUMPING]: new THREE.Color(0x6fcf6f), // 卸土中: 绿
-  [TR.DONE]: new THREE.Color(0x59636f),    // 完工: 暗灰
+  [TR.TO_EXCA]: new THREE.Color(0xffe27a),  // 空车开往挖机: 浅黄
+  [TR.WAITING]: new THREE.Color(0xffcf5a),  // 在挖机旁排队等装: 黄
+  [TR.LOADING]: new THREE.Color(0xffb74a),  // 装载中: 橙黄
+  [TR.TO_DUMP]: new THREE.Color(0x9c6b3f),  // 满载去卸: 棕
+  [TR.DUMPING]: new THREE.Color(0x6fcf6f),  // 卸土中: 绿
+  [TR.DONE]: new THREE.Color(0x59636f),     // 完工: 暗灰
 };
 
 const MAX_INSTANCES = 512;
 
 // 基础速率(depth 单位/秒, 会乘以 rate 倍率)
-const BASE_DIG = 0.015;    // 单台挖机挖掘速率
-const BASE_LOAD = 0.045;   // 卡车装载速率
-const BASE_DUMP = 0.045;   // 卡车卸载速率
+const BASE_LOAD = 0.016;   // 挖机装车(=挖掘)速率: 装满一车约需 TRUCK_CAP/BASE_LOAD 秒
+const BASE_DUMP = 0.03;    // 卡车卸载速率
 const TRUCK_CAP = 0.02;    // 单车运力(depth 单位)
-const STOCK_MAX_PER_EXCA = 0.03;  // 每台挖机允许堆积的料上限(料满则挖机暂停等车)
+const LOAD_DIST = 0.05;    // 卡车距挖机多近才算"到位"可被装车(弧度)
+const DIG_SPOT_TIME = 3.2; // 挖机没车来时, 在一个挖点待多久后换点(秒)
+const DIG_SPOT_JITTER = 1.4; // 换点间隔随机抖动(±秒, 避免所有挖机同步换点)
 
 // ---- 球面小工具 ----
 function perpAxis(n, out) {
@@ -101,12 +104,9 @@ export class ExcavatorSystem {
     this.fillZone = null;  // { dir, radius, edit }
     this._ownedEdits = []; // 本系统产生的全部 edit(含已"烘焙"为永久的旧区域), 供"恢复地形"一次清除
 
-    // 料堆(挖出但未运走, depth 单位)
-    this.stockpile = 0;
-
     // 机器
-    this.excavators = [];  // { dir, fwd, state, phase }
-    this.trucks = [];      // { dir, fwd, state, cargo, target }
+    this.excavators = [];  // { dir, fwd, state, target, phase, digTimer, spotTime, serving, _q }
+    this.trucks = [];      // { dir, fwd, state, cargo, target, assigned }
 
     // 提交节流
     this._dirty = false; this._commitTimer = 0; this._commitEvery = 0.12;
@@ -194,12 +194,15 @@ export class ExcavatorSystem {
     this._commit();
     this._fireChange();
   }
-  // 给挖机分配挖掘区内的挖点并置为"开往"状态(从当前位置开过去, 不瞬移)
+  // 给挖机分配挖掘区内的挖点并置为"开往"状态(从当前位置开过去, 不瞬移); 卡车重新找挖机
   _retaskExcavators() {
     if (!this.digZone) return;
     for (const e of this.excavators) {
       this._randInCap(this.digZone.dir, this.digZone.radius * 0.6, e.target);
-      e.state = EX.TO_DIG;
+      e.state = EX.TO_DIG; e.serving = null;
+    }
+    for (const t of this.trucks) {
+      if (t.state === TR.TO_EXCA || t.state === TR.WAITING || t.state === TR.LOADING) { t.state = TR.TO_EXCA; t.assigned = null; }
     }
   }
   hasZones() { return !!(this.digZone && this.fillZone); }
@@ -217,10 +220,9 @@ export class ExcavatorSystem {
     const capA = (r) => 1 - Math.cos(r);
     return capA(this.digZone.radius) / Math.max(1e-6, capA(this.fillZone.radius));
   }
-  _stockMax() { return Math.max(TRUCK_CAP * 2, this.excavators.length * STOCK_MAX_PER_EXCA); }
 
   // ---- 生成机器 ----
-  // 挖机在挖掘区"外围"集结, 开始施工后开进挖掘区就位再挖(TO_DIG → DIGGING)。
+  // 挖机在挖掘区"外围"集结, 开始施工后开进挖掘区就位待命(TO_DIG → IDLE)。
   spawnExcavators(n) {
     const base = this.digZone ? this.digZone.dir : new THREE.Vector3(0, 1, 0);
     const rz = this.digZone ? this.digZone.radius : 0.05;
@@ -230,6 +232,7 @@ export class ExcavatorSystem {
       const e = {
         dir, fwd: this._tangentToward(dir, base, new THREE.Vector3()),
         state: EX.TO_DIG, target: new THREE.Vector3().copy(base), phase: Math.random() * 6.28,
+        digTimer: 0, spotTime: DIG_SPOT_TIME, serving: null, _q: 0,
       };
       if (this.digZone) this._randInCap(this.digZone.dir, this.digZone.radius * 0.6, e.target);  // 分配挖点
       this.excavators.push(e);
@@ -240,15 +243,15 @@ export class ExcavatorSystem {
     const spread = this.digZone ? this.digZone.radius * 1.6 + 0.03 : 0.08;
     for (let i = 0; i < n && this.trucks.length < MAX_INSTANCES; i++) {
       const dir = this._randInCap(base, spread, new THREE.Vector3());
-      const t = { dir, fwd: this._tangentToward(dir, base, new THREE.Vector3()), state: this.running ? TR.TO_LOAD : TR.TO_LOAD, cargo: 0, target: new THREE.Vector3().copy(dir) };
-      if (this.running && this.digZone) this._retargetTruck(t);
-      this.trucks.push(t);
+      this.trucks.push({
+        dir, fwd: this._tangentToward(dir, base, new THREE.Vector3()),
+        state: TR.TO_EXCA, cargo: 0, target: new THREE.Vector3().copy(dir), assigned: null,
+      });
     }
   }
 
   clearAgents() {
     this.excavators.length = 0; this.trucks.length = 0;
-    this.stockpile = 0;
     this.excaMesh.count = 0; this.truckMesh.count = 0;
   }
   clearAll() {
@@ -272,17 +275,19 @@ export class ExcavatorSystem {
     for (const e of this.excavators) {
       if (!e.target) e.target = new THREE.Vector3();
       this._randInCap(this.digZone.dir, this.digZone.radius * 0.6, e.target);
-      e.state = EX.TO_DIG;
+      e.state = EX.TO_DIG; e.serving = null;
     }
-    for (const t of this.trucks) if (t.state === TR.DONE) { t.state = TR.TO_LOAD; this._retargetTruck(t); }
+    // 空车/排队中的卡车重新去找挖机; 正在卸货(TO_DUMP/DUMPING)的保持
+    for (const t of this.trucks) {
+      if (t.state === TR.DONE || t.state === TR.WAITING || t.state === TR.LOADING || t.state === TR.TO_EXCA) { t.state = TR.TO_EXCA; t.assigned = null; }
+    }
     return true;
   }
   pause() { this.running = false; this._commit(); this._fireChange(); }
 
-  // 是否整体完工: 挖机挖完 + 料堆空 + 卡车无在途
+  // 是否整体完工: 挖掘区挖到目标 + 所有卡车空车
   allDone() {
-    return this.digRemaining() <= 1e-6 && this.stockpile <= 1e-6 &&
-      this.trucks.every((t) => t.cargo <= 1e-6);
+    return this.digRemaining() <= 1e-6 && this.trucks.every((t) => t.cargo <= 1e-6);
   }
 
   // ---- 主循环 ----
@@ -290,11 +295,13 @@ export class ExcavatorSystem {
     this._time += dt;
     if (this.running && this.hasZones()) {
       const r = this.rate;
-      const stockMax = this._stockMax();
       const maxAng = (this.surfaceSpeed / this.planet.params.radius) * dt;
-      // 挖机: 先开到挖点(TO_DIG), 到位后原地挖(DIGGING); 料满则等车(IDLE)
-      for (const e of this.excavators) this._stepExcavator(e, dt, maxAng, r, stockMax);
-      // 卡车
+      // 统计每台挖机的"指派卡车数"(在途/等待/装载中), 用于负载均衡 + 决定挖机是否可换点
+      for (const e of this.excavators) e._q = 0;
+      for (const t of this.trucks) {
+        if (t.assigned && (t.state === TR.TO_EXCA || t.state === TR.WAITING || t.state === TR.LOADING)) t.assigned._q++;
+      }
+      for (const e of this.excavators) this._stepExcavator(e, dt, maxAng, r);
       for (const t of this.trucks) this._stepTruck(t, dt, maxAng, r);
 
       // 提交节流
@@ -305,66 +312,132 @@ export class ExcavatorSystem {
     this._syncTrucks();
   }
 
-  _stepExcavator(e, dt, maxAng, r, stockMax) {
-    if (this.digRemaining() <= 1e-6) { e.state = EX.DONE; return; }
-    if (e.state === EX.TO_DIG) {
-      if (this._moveTo(e, maxAng)) e.state = EX.DIGGING;   // 开到挖点就位
-      return;
+  _stepExcavator(e, dt, maxAng, r) {
+    const done = this.digRemaining() <= 1e-6;
+    switch (e.state) {
+      case EX.TO_DIG: {
+        if (done) { e.state = EX.DONE; return; }
+        if (this._moveTo(e, maxAng)) {   // 开到挖点就位, 转待命
+          e.state = EX.IDLE;
+          e.digTimer = 0;
+          e.spotTime = Math.max(1.0, DIG_SPOT_TIME + (Math.random() - 0.5) * 2 * DIG_SPOT_JITTER);
+        }
+        return;
+      }
+      case EX.IDLE: {
+        if (done) { e.state = EX.DONE; return; }
+        // 挑一台开到我旁边、指派给我、正在等待的卡车 → 开始挖掘装车
+        const truck = this._findWaitingTruck(e);
+        if (truck) { e.serving = truck; truck.state = TR.LOADING; e.state = EX.LOADING; return; }
+        // 没有卡车指派我(_q==0) → 空闲一段后在附近小范围换点(推进作业面); 有车要来则守住位置
+        if (e._q === 0) {
+          e.digTimer += dt;
+          if (e.digTimer >= e.spotTime) { this._nextDigSpot(e, e.target); e.state = EX.TO_DIG; }
+        }
+        return;
+      }
+      case EX.LOADING: {
+        const t = e.serving;
+        if (!t || t.state !== TR.LOADING) { e.serving = null; e.state = EX.IDLE; return; }
+        // 挖掘装车: 挖低地形 → 土直接进卡车(挖=装, 守恒)
+        const amt = Math.min(BASE_LOAD * r * dt, this.digRemaining(), TRUCK_CAP - t.cargo);
+        if (amt > 0) { this.digZone.edit.depth += amt; t.cargo += amt; this._markDirty(); }
+        if (t.cargo >= TRUCK_CAP - 1e-6 || this.digRemaining() <= 1e-6) {   // 装满 或 没土可挖: 放行
+          t.state = t.cargo > 1e-6 ? TR.TO_DUMP : TR.DONE;
+          if (t.state === TR.TO_DUMP) this._retargetTruck(t);
+          t.assigned = null; e.serving = null;
+          e.state = this.digRemaining() <= 1e-6 ? EX.DONE : EX.IDLE;
+        }
+        return;
+      }
+      default: return;   // DONE
     }
-    // DIGGING / IDLE: 原地作业
-    if (this.stockpile >= stockMax) { e.state = EX.IDLE; return; }   // 料满, 停挖等车
-    e.state = EX.DIGGING;
-    const amt = Math.min(BASE_DIG * r * dt, this.digRemaining(), stockMax - this.stockpile);
-    if (amt > 0) { this.digZone.edit.depth += amt; this.stockpile += amt; this._markDirty(); }
+  }
+
+  // 找一台指派给挖机 e、正在其旁边(LOAD_DIST 内)等待的卡车(取最近的)
+  _findWaitingTruck(e) {
+    let best = null, bestDot = -2;
+    for (const t of this.trucks) {
+      if (t.assigned === e && t.state === TR.WAITING) {
+        const d = t.dir.dot(e.dir);
+        if (d > bestDot) { bestDot = d; best = t; }
+      }
+    }
+    if (best && Math.acos(THREE.MathUtils.clamp(bestDot, -1, 1)) <= LOAD_DIST) return best;
+    return null;
+  }
+  // 为卡车挑一台挖机: 指派数最少者优先, 其次就近
+  _pickExcavator(t) {
+    let best = null, bestScore = Infinity;
+    for (const e of this.excavators) {
+      if (e.state === EX.DONE) continue;
+      const dist = Math.acos(THREE.MathUtils.clamp(t.dir.dot(e.dir), -1, 1));
+      const score = e._q * 10 + dist;
+      if (score < bestScore) { bestScore = score; best = e; }
+    }
+    return best;
+  }
+  // 卡车停靠点: 挖机旁 ~0.02~0.04 弧度处(随机方位, 避免叠在一起)
+  _targetBesideExca(e, t) {
+    this._pointAtAngle(e.dir, 0.02 + Math.random() * 0.02, Math.random() * Math.PI * 2, t.target);
+  }
+
+  // 在挖机当前位置附近小范围取新挖点, 并夹在挖掘区内(角距中心不超过 0.8×半径)
+  _nextDigSpot(e, out) {
+    const step = this.digZone.radius * 0.35;
+    this._pointAtAngle(e.dir, step * (0.4 + Math.random() * 0.6), Math.random() * Math.PI * 2, out);
+    const dot = THREE.MathUtils.clamp(out.dot(this.digZone.dir), -1, 1);
+    const fromCenter = Math.acos(dot);
+    const maxFromCenter = this.digZone.radius * 0.8;
+    if (fromCenter > maxFromCenter) {   // 超出边界: 朝中心拉回到边界处
+      this._axis.crossVectors(out, this.digZone.dir);
+      if (this._axis.lengthSq() > 1e-12) { this._axis.normalize(); out.applyAxisAngle(this._axis, fromCenter - maxFromCenter).normalize(); }
+    }
+    return out;
   }
 
   _stepTruck(t, dt, maxAng, r) {
     switch (t.state) {
-      case TR.TO_LOAD: {
-        // 没料可装且挖机也挖完了 → 收工(带货就先去卸)
-        if (this.stockpile <= 1e-6 && this.digRemaining() <= 1e-6) {
-          t.state = t.cargo > 1e-6 ? TR.TO_DUMP : TR.DONE;
-          if (t.state === TR.TO_DUMP) this._retargetTruck(t);
-          break;
+      case TR.TO_EXCA: {
+        if (!t.assigned || t.assigned.state === EX.DONE) {
+          const e = this._pickExcavator(t);
+          if (!e) {   // 暂无可用挖机
+            if (this.digRemaining() <= 1e-6) { t.state = t.cargo > 1e-6 ? TR.TO_DUMP : TR.DONE; if (t.state === TR.TO_DUMP) this._retargetTruck(t); }
+            return;   // 否则原地等(挖机还在赶来/尚未生成)
+          }
+          t.assigned = e; e._q++;               // 认领(当帧即计入队列, 便于其它卡车分流)
+          this._targetBesideExca(e, t);
         }
-        if (this._moveTo(t, maxAng)) t.state = TR.LOADING;
-        break;
+        if (this._moveTo(t, maxAng)) t.state = TR.WAITING;
+        return;
       }
-      case TR.LOADING: {
-        const want = TRUCK_CAP - t.cargo;
-        const take = Math.min(BASE_LOAD * r * dt, want, this.stockpile);
-        if (take > 0) { this.stockpile -= take; t.cargo += take; }
-        if (t.cargo >= TRUCK_CAP - 1e-6) { t.state = TR.TO_DUMP; this._retargetTruck(t); }
-        else if (this.stockpile <= 1e-6 && this.digRemaining() <= 1e-6) {
-          // 不会再有料了: 有货就去卸, 没货就收工
-          t.state = t.cargo > 1e-6 ? TR.TO_DUMP : TR.DONE;
-          if (t.state === TR.TO_DUMP) this._retargetTruck(t);
-        }
-        // 否则原地等挖机产料(停在装载点)
-        break;
+      case TR.WAITING: {
+        if (!t.assigned || t.assigned.state === EX.DONE) { t.state = TR.TO_EXCA; t.assigned = null; return; }
+        // 挖机挪窝了(离远) → 重新贴近
+        if (t.dir.dot(t.assigned.dir) < Math.cos(LOAD_DIST)) { this._targetBesideExca(t.assigned, t); t.state = TR.TO_EXCA; return; }
+        return;   // 就位排队, 等挖机来装(由挖机 step 触发 LOADING)
       }
+      case TR.LOADING: return;   // 挖机装载中, 原地不动(挖机 step 负责)
       case TR.TO_DUMP: {
         if (this._moveTo(t, maxAng)) t.state = TR.DUMPING;
-        break;
+        return;
       }
       case TR.DUMPING: {
         const amt = Math.min(BASE_DUMP * r * dt, t.cargo);
         if (amt > 0) { t.cargo -= amt; this.fillZone.edit.depth -= amt * this._fillK(); this._markDirty(); }
         if (t.cargo <= 1e-6) {
           t.cargo = 0;
-          if (this.stockpile > 1e-6 || this.digRemaining() > 1e-6) { t.state = TR.TO_LOAD; this._retargetTruck(t); }
-          else t.state = TR.DONE;
+          t.state = this.digRemaining() > 1e-6 ? TR.TO_EXCA : TR.DONE;
+          t.assigned = null;
         }
-        break;
+        return;
       }
-      default: break;  // DONE
+      default: return;  // DONE
     }
   }
 
-  _retargetTruck(t) {
-    if (t.state === TR.TO_LOAD || t.state === TR.LOADING) this._randInCap(this.digZone.dir, this.digZone.radius * 0.55, t.target);
-    else this._randInCap(this.fillZone.dir, this.fillZone.radius * 0.7, t.target);
-  }
+  // 卡车去卸土: 目标 = 填埋区内一点
+  _retargetTruck(t) { this._randInCap(this.fillZone.dir, this.fillZone.radius * 0.7, t.target); }
 
   // 沿大圆走一步; 返回是否到达
   _moveTo(a, maxAng) {
@@ -430,8 +503,8 @@ export class ExcavatorSystem {
     this.excaMesh.count = n;
     for (let i = 0; i < n; i++) {
       const e = this.excavators[i];
-      // 挖掘中: 上下小幅 bob, 表示在作业
-      const bob = e.state === EX.DIGGING ? Math.sin(this._time * 6 + e.phase) * 0.35 * this.size : 0;
+      // 装车(挖掘)中: 上下小幅 bob, 表示在作业
+      const bob = e.state === EX.LOADING ? Math.sin(this._time * 6 + e.phase) * 0.35 * this.size : 0;
       this._writeInstance(this.excaMesh, i, e.dir, e.fwd, bob);
       this.excaMesh.setColorAt(i, EX_COLOR[e.state] || EX_COLOR[EX.IDLE]);
     }
@@ -446,7 +519,7 @@ export class ExcavatorSystem {
     for (let i = 0; i < n; i++) {
       const t = this.trucks[i];
       this._writeInstance(this.truckMesh, i, t.dir, t.fwd, 0);
-      this.truckMesh.setColorAt(i, TR_COLOR[t.state] || TR_COLOR[TR.TO_LOAD]);
+      this.truckMesh.setColorAt(i, TR_COLOR[t.state] || TR_COLOR[TR.TO_EXCA]);
     }
     this.truckMesh.instanceMatrix.needsUpdate = true;
     if (this.truckMesh.instanceColor) this.truckMesh.instanceColor.needsUpdate = true;

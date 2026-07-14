@@ -1181,7 +1181,7 @@ function animate() {
     const pct = (excavators.progress() * 100).toFixed(0);
     exTool.status = excavators.allDone()
       ? `完工 100%`
-      : `施工 ${pct}% · 挖机${excavators.excavators.length} 卡车${excavators.trucks.length} 料堆${(excavators.stockpile * 100).toFixed(0)}`;
+      : `施工 ${pct}% · 挖机${excavators.excavators.length} 卡车${excavators.trucks.length}`;
   }
 
   atmoPass.uniforms.uTime.value = clock.elapsedTime;   // 云飘动(云已并入大气 pass)
