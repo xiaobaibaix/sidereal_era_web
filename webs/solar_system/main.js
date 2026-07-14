@@ -1206,10 +1206,22 @@ function animate() {
   manageDetail();
   updateRender();
   if (charMode) {
-    // 角色模式: walker 自管相机 near/far; 星空只需跟随角色相机
-    walker.camera.getWorldPosition(_tmpV);
-    starField.position.copy(_tmpV);
-    starField.scale.setScalar(walker.camera.far * 0.9);
+    // 角色模式: 动态 near/far(与轨道相机同逻辑)。walker.camera 默认 0.1/200000 比值 2M,
+    // 深度精度极差 → 大气(raymarch 重建 hitPos)与海洋(depthTest 对地形)在角色移动时颤抖。
+    const fR = focusBody().radius;
+    const camDist = walker.camera.position.length();
+    let maxD = fR * 3;
+    for (const b of system.bodies) {
+      const d = _tmpV.copy(b.pos).sub(_off).length();
+      if (d > maxD) maxD = d;
+    }
+    const far = camDist + maxD * 1.5 + fR * 10;
+    const near = Math.max((camDist - fR) * 0.3, fR * 1e-4, far * 1e-7);
+    walker.camera.near = near;
+    walker.camera.far = far;
+    walker.camera.updateProjectionMatrix();
+    starField.position.copy(walker.camera.position);
+    starField.scale.setScalar(far * 0.9);
   } else {
     updateCameraRange();   // 动态 near/far(在场景渲染前设好投影)
   }
