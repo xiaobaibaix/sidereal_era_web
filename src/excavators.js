@@ -1,0 +1,487 @@
+// 自动施工系统: 挖机(挖掘) + 卡车(运输), 两种角色协作。
+//
+// 角色分工:
+//   挖机(Excavator): 驻扎在挖掘区, 持续把地形挖低(挖掘区 edit 深度渐增 → 地面下沉成坑),
+//                    挖出的土方进入共享"料堆"(stockpile)。挖到目标深度即停。
+//   卡车(Truck):     在挖掘区↔填埋区往返。到挖掘区从料堆装土 → 开到填埋区卸土(地面抬升)
+//                    → 回来, 只要还有料就循环, 直到料堆清空且挖机完工。
+//
+// 与地形耦合复用 planet.params.edits 管线, 有界 + 守恒:
+//   - 只放 2 条受管理 edit: 挖掘区(depth 增大→下沉) 与 填埋区(depth 变负→抬升)。
+//   - 挖出总量 = 料堆 + 卡车在途 + 已填(按球冠面积比换算), 体积守恒。
+//   - mesh 重建(_buildNoise + invalidate)节流(每 ~0.12s 一次), 避免上千次改动打爆 worker。
+//
+// 渲染: 挖机与卡车各用一个 InstancedMesh(几百个也很便宜), per-instance 颜色表示状态。
+
+import * as THREE from 'three';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+
+// 挖机状态
+const EX = { TO_DIG: 0, DIGGING: 1, IDLE: 2, DONE: 3 };
+// 卡车状态
+const TR = { TO_LOAD: 0, LOADING: 1, TO_DUMP: 2, DUMPING: 3, DONE: 4 };
+
+const EX_COLOR = {
+  [EX.TO_DIG]: new THREE.Color(0xffd24a),  // 开往挖掘区: 黄
+  [EX.DIGGING]: new THREE.Color(0xff7a2d), // 挖掘中: 橙
+  [EX.IDLE]: new THREE.Color(0xf0c000),    // 料满等车: 深黄
+  [EX.DONE]: new THREE.Color(0x59636f),    // 完工: 暗灰
+};
+const TR_COLOR = {
+  [TR.TO_LOAD]: new THREE.Color(0xffe27a), // 空车去装: 浅黄
+  [TR.LOADING]: new THREE.Color(0xffb74a), // 装载中: 橙黄
+  [TR.TO_DUMP]: new THREE.Color(0x9c6b3f), // 满载去卸: 棕
+  [TR.DUMPING]: new THREE.Color(0x6fcf6f), // 卸土中: 绿
+  [TR.DONE]: new THREE.Color(0x59636f),    // 完工: 暗灰
+};
+
+const MAX_INSTANCES = 512;
+
+// 基础速率(depth 单位/秒, 会乘以 rate 倍率)
+const BASE_DIG = 0.015;    // 单台挖机挖掘速率
+const BASE_LOAD = 0.045;   // 卡车装载速率
+const BASE_DUMP = 0.045;   // 卡车卸载速率
+const TRUCK_CAP = 0.02;    // 单车运力(depth 单位)
+const STOCK_MAX_PER_EXCA = 0.03;  // 每台挖机允许堆积的料上限(料满则挖机暂停等车)
+
+// ---- 球面小工具 ----
+function perpAxis(n, out) {
+  if (Math.abs(n.y) < 0.99) out.set(0, 1, 0); else out.set(1, 0, 0);
+  return out.crossVectors(out, n).normalize();
+}
+
+function buildFrom(boxes) {
+  // boxes: [ [w,h,d, x,y,z, rx?] ... ]  底面尽量贴 y=0
+  const parts = boxes.map(([w, h, d, x, y, z, rx]) => {
+    const g = new THREE.BoxGeometry(w, h, d);
+    if (rx) g.rotateX(rx);
+    g.translate(x, y, z);
+    return g;
+  });
+  const geo = mergeGeometries(parts, false);
+  geo.computeVertexNormals();
+  return geo;
+}
+// 挖机: 底盘 + 车身 + 驾驶室 + 挖臂 + 铲斗(朝 +Z)
+function buildExcavatorGeometry() {
+  return buildFrom([
+    [2.6, 0.5, 3.4, 0, 0.25, 0],
+    [2.0, 0.8, 2.4, 0, 0.9, -0.2],
+    [1.3, 0.9, 1.1, 0, 1.7, -0.7],
+    [0.35, 0.35, 2.2, 0, 1.15, 1.35, -0.35],
+    [1.0, 0.6, 0.7, 0, 0.55, 2.5],
+  ]);
+}
+// 卡车: 长底盘 + 驾驶室(前) + 货斗(后, 带矮侧壁)
+function buildTruckGeometry() {
+  return buildFrom([
+    [2.4, 0.5, 4.6, 0, 0.25, 0],       // 底盘
+    [2.0, 1.1, 1.4, 0, 1.05, 1.5],     // 驾驶室(前 +Z)
+    [2.2, 0.3, 2.6, 0, 0.75, -0.8],    // 货斗底
+    [2.2, 0.6, 0.2, 0, 1.0, -2.0],     // 货斗后壁
+    [0.2, 0.6, 2.6, 1.0, 1.0, -0.8],   // 货斗左壁
+    [0.2, 0.6, 2.6, -1.0, 1.0, -0.8],  // 货斗右壁
+  ]);
+}
+
+export class ExcavatorSystem {
+  constructor(planet, scene) {
+    this.planet = planet;
+    this.scene = scene;
+    this.running = false;
+    this.onChange = null;   // 地形离散变更(设区/暂停/清除)时回调, 供外部统一持久化到 localStorage
+
+    // 可调
+    this.surfaceSpeed = 20;
+    this.rate = 1.0;
+    this.size = 1.0;
+
+    // 区域(受管理 edit)
+    this.digZone = null;   // { dir, radius, target, edit }
+    this.fillZone = null;  // { dir, radius, edit }
+    this._ownedEdits = []; // 本系统产生的全部 edit(含已"烘焙"为永久的旧区域), 供"恢复地形"一次清除
+
+    // 料堆(挖出但未运走, depth 单位)
+    this.stockpile = 0;
+
+    // 机器
+    this.excavators = [];  // { dir, fwd, state, phase }
+    this.trucks = [];      // { dir, fwd, state, cargo, target }
+
+    // 提交节流
+    this._dirty = false; this._commitTimer = 0; this._commitEvery = 0.12;
+    this._time = 0;
+
+    // 复用向量
+    this._v = new THREE.Vector3(); this._axis = new THREE.Vector3();
+    this._t1 = new THREE.Vector3(); this._t2 = new THREE.Vector3();
+    this._pos = new THREE.Vector3(); this._xA = new THREE.Vector3();
+    this._sv = new THREE.Vector3(); this._m = new THREE.Matrix4();
+
+    // 两个 InstancedMesh
+    this.excaMesh = this._makeInstanced(buildExcavatorGeometry());
+    this.truckMesh = this._makeInstanced(buildTruckGeometry());
+    scene.add(this.excaMesh, this.truckMesh);
+
+    // 区域环
+    this.digRing = this._makeRing(0xff4d4d);
+    this.fillRing = this._makeRing(0x4fd873);
+    scene.add(this.digRing, this.fillRing);
+  }
+
+  _makeInstanced(geo) {
+    const mat = new THREE.MeshStandardMaterial({ roughness: 0.7, metalness: 0.1 });
+    const mesh = new THREE.InstancedMesh(geo, mat, MAX_INSTANCES);
+    mesh.frustumCulled = false;
+    mesh.count = 0;
+    mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    const white = new THREE.Color(0xffffff);
+    for (let i = 0; i < MAX_INSTANCES; i++) mesh.setColorAt(i, white);
+    mesh.instanceColor.needsUpdate = true;
+    return mesh;
+  }
+
+  setPlanet(planet) { this.planet = planet; }
+
+  // ---- 地形高度 / 表面坐标 ----
+  _groundR(dir) {
+    const p = this.planet.params;
+    return p.radius + this.planet.heightAt(dir.x, dir.y, dir.z) * p.maxHeight;
+  }
+  _groundPos(dir, out) { return out.copy(dir).multiplyScalar(this._groundR(dir)).add(this.planet.position); }
+
+  // ---- 区域 edit 管理 ----
+  _findEdit(edit) { return this.planet.params.edits.indexOf(edit) !== -1; }
+  _ensureEdit(zone, depth) {
+    if (!zone) return;
+    if (!zone.edit || !this._findEdit(zone.edit)) {
+      zone.edit = { pos: [zone.dir.x, zone.dir.y, zone.dir.z], radius: zone.radius, depth, falloff: 'smooth' };
+      this.planet.params.edits.push(zone.edit);
+      this._ownedEdits.push(zone.edit);
+    }
+  }
+  // 从 params.edits + _ownedEdits 彻底移除某条 edit
+  _discardEdit(edit) {
+    let i = this.planet.params.edits.indexOf(edit);
+    if (i !== -1) this.planet.params.edits.splice(i, 1);
+    i = this._ownedEdits.indexOf(edit);
+    if (i !== -1) this._ownedEdits.splice(i, 1);
+  }
+  // "释放"旧区域: 已挖/填出地形的 edit 保留(烘焙为永久, 仍在 _ownedEdits 里以便日后清除);
+  // 从没动过(depth≈0)的空 edit 直接丢弃, 避免泄漏。
+  _releaseZone(zone) {
+    if (zone && zone.edit && Math.abs(zone.edit.depth) < 1e-6) this._discardEdit(zone.edit);
+  }
+
+  _fireChange() { if (this.onChange) this.onChange(); }
+
+  setDigZone(dir, radius, target) {
+    const d = dir.clone().normalize();
+    this._releaseZone(this.digZone);          // 旧坑: 已挖的保留, 空的丢弃
+    this.digZone = { dir: d, radius, target, edit: null };
+    this._ensureEdit(this.digZone, 0);
+    this._updateRing(this.digRing, d, radius);
+    this._retaskExcavators();                 // 已有挖机重新领新挖点并开过去
+    this._commit();                           // 只失效新区; 旧区 edit 未改动, 地形保持
+    this._fireChange();
+  }
+  setFillZone(dir, radius) {
+    const d = dir.clone().normalize();
+    this._releaseZone(this.fillZone);
+    this.fillZone = { dir: d, radius, edit: null };
+    this._ensureEdit(this.fillZone, 0);
+    this._updateRing(this.fillRing, d, radius);
+    this._commit();
+    this._fireChange();
+  }
+  // 给挖机分配挖掘区内的挖点并置为"开往"状态(从当前位置开过去, 不瞬移)
+  _retaskExcavators() {
+    if (!this.digZone) return;
+    for (const e of this.excavators) {
+      this._randInCap(this.digZone.dir, this.digZone.radius * 0.6, e.target);
+      e.state = EX.TO_DIG;
+    }
+  }
+  hasZones() { return !!(this.digZone && this.fillZone); }
+
+  progress() {
+    if (!this.digZone) return 0;
+    return Math.min(1, this.digZone.edit.depth / Math.max(1e-6, this.digZone.target));
+  }
+  digRemaining() {
+    if (!this.digZone) return 0;
+    return Math.max(0, this.digZone.target - this.digZone.edit.depth);
+  }
+  _fillK() {
+    if (!this.digZone || !this.fillZone) return 1;
+    const capA = (r) => 1 - Math.cos(r);
+    return capA(this.digZone.radius) / Math.max(1e-6, capA(this.fillZone.radius));
+  }
+  _stockMax() { return Math.max(TRUCK_CAP * 2, this.excavators.length * STOCK_MAX_PER_EXCA); }
+
+  // ---- 生成机器 ----
+  // 挖机在挖掘区"外围"集结, 开始施工后开进挖掘区就位再挖(TO_DIG → DIGGING)。
+  spawnExcavators(n) {
+    const base = this.digZone ? this.digZone.dir : new THREE.Vector3(0, 1, 0);
+    const rz = this.digZone ? this.digZone.radius : 0.05;
+    for (let i = 0; i < n && this.excavators.length < MAX_INSTANCES; i++) {
+      // 集结点: 挖区外一圈(1.6~2.4 倍半径处)
+      const dir = this._pointAtAngle(base, rz * (1.6 + Math.random() * 0.8), Math.random() * Math.PI * 2, new THREE.Vector3());
+      const e = {
+        dir, fwd: this._tangentToward(dir, base, new THREE.Vector3()),
+        state: EX.TO_DIG, target: new THREE.Vector3().copy(base), phase: Math.random() * 6.28,
+      };
+      if (this.digZone) this._randInCap(this.digZone.dir, this.digZone.radius * 0.6, e.target);  // 分配挖点
+      this.excavators.push(e);
+    }
+  }
+  spawnTrucks(n) {
+    const base = this.digZone ? this.digZone.dir : new THREE.Vector3(0, 1, 0);
+    const spread = this.digZone ? this.digZone.radius * 1.6 + 0.03 : 0.08;
+    for (let i = 0; i < n && this.trucks.length < MAX_INSTANCES; i++) {
+      const dir = this._randInCap(base, spread, new THREE.Vector3());
+      const t = { dir, fwd: this._tangentToward(dir, base, new THREE.Vector3()), state: this.running ? TR.TO_LOAD : TR.TO_LOAD, cargo: 0, target: new THREE.Vector3().copy(dir) };
+      if (this.running && this.digZone) this._retargetTruck(t);
+      this.trucks.push(t);
+    }
+  }
+
+  clearAgents() {
+    this.excavators.length = 0; this.trucks.length = 0;
+    this.stockpile = 0;
+    this.excaMesh.count = 0; this.truckMesh.count = 0;
+  }
+  clearAll() {
+    this.clearAgents();
+    // 收集所有自有 edit 的区域(含已烘焙的旧区域), 移除后失效这些区域 → 地形全部恢复
+    const regions = this._ownedEdits.map((ed) => ({
+      dir: new THREE.Vector3(ed.pos[0], ed.pos[1], ed.pos[2]), radius: ed.radius,
+    }));
+    for (const ed of this._ownedEdits.slice()) this._discardEdit(ed);
+    this.digZone = null; this.fillZone = null;
+    this.digRing.visible = false; this.fillRing.visible = false;
+    this.running = false;
+    this._commit(regions);
+    this._fireChange();
+  }
+
+  start() {
+    if (!this.hasZones()) return false;
+    this.running = true;
+    // 挖机统一去挖掘区就位(没分配挖点的补一个)
+    for (const e of this.excavators) {
+      if (!e.target) e.target = new THREE.Vector3();
+      this._randInCap(this.digZone.dir, this.digZone.radius * 0.6, e.target);
+      e.state = EX.TO_DIG;
+    }
+    for (const t of this.trucks) if (t.state === TR.DONE) { t.state = TR.TO_LOAD; this._retargetTruck(t); }
+    return true;
+  }
+  pause() { this.running = false; this._commit(); this._fireChange(); }
+
+  // 是否整体完工: 挖机挖完 + 料堆空 + 卡车无在途
+  allDone() {
+    return this.digRemaining() <= 1e-6 && this.stockpile <= 1e-6 &&
+      this.trucks.every((t) => t.cargo <= 1e-6);
+  }
+
+  // ---- 主循环 ----
+  update(dt) {
+    this._time += dt;
+    if (this.running && this.hasZones()) {
+      const r = this.rate;
+      const stockMax = this._stockMax();
+      const maxAng = (this.surfaceSpeed / this.planet.params.radius) * dt;
+      // 挖机: 先开到挖点(TO_DIG), 到位后原地挖(DIGGING); 料满则等车(IDLE)
+      for (const e of this.excavators) this._stepExcavator(e, dt, maxAng, r, stockMax);
+      // 卡车
+      for (const t of this.trucks) this._stepTruck(t, dt, maxAng, r);
+
+      // 提交节流
+      this._commitTimer += dt;
+      if (this._dirty && this._commitTimer >= this._commitEvery) this._commit();
+    }
+    this._syncExcavators();
+    this._syncTrucks();
+  }
+
+  _stepExcavator(e, dt, maxAng, r, stockMax) {
+    if (this.digRemaining() <= 1e-6) { e.state = EX.DONE; return; }
+    if (e.state === EX.TO_DIG) {
+      if (this._moveTo(e, maxAng)) e.state = EX.DIGGING;   // 开到挖点就位
+      return;
+    }
+    // DIGGING / IDLE: 原地作业
+    if (this.stockpile >= stockMax) { e.state = EX.IDLE; return; }   // 料满, 停挖等车
+    e.state = EX.DIGGING;
+    const amt = Math.min(BASE_DIG * r * dt, this.digRemaining(), stockMax - this.stockpile);
+    if (amt > 0) { this.digZone.edit.depth += amt; this.stockpile += amt; this._markDirty(); }
+  }
+
+  _stepTruck(t, dt, maxAng, r) {
+    switch (t.state) {
+      case TR.TO_LOAD: {
+        // 没料可装且挖机也挖完了 → 收工(带货就先去卸)
+        if (this.stockpile <= 1e-6 && this.digRemaining() <= 1e-6) {
+          t.state = t.cargo > 1e-6 ? TR.TO_DUMP : TR.DONE;
+          if (t.state === TR.TO_DUMP) this._retargetTruck(t);
+          break;
+        }
+        if (this._moveTo(t, maxAng)) t.state = TR.LOADING;
+        break;
+      }
+      case TR.LOADING: {
+        const want = TRUCK_CAP - t.cargo;
+        const take = Math.min(BASE_LOAD * r * dt, want, this.stockpile);
+        if (take > 0) { this.stockpile -= take; t.cargo += take; }
+        if (t.cargo >= TRUCK_CAP - 1e-6) { t.state = TR.TO_DUMP; this._retargetTruck(t); }
+        else if (this.stockpile <= 1e-6 && this.digRemaining() <= 1e-6) {
+          // 不会再有料了: 有货就去卸, 没货就收工
+          t.state = t.cargo > 1e-6 ? TR.TO_DUMP : TR.DONE;
+          if (t.state === TR.TO_DUMP) this._retargetTruck(t);
+        }
+        // 否则原地等挖机产料(停在装载点)
+        break;
+      }
+      case TR.TO_DUMP: {
+        if (this._moveTo(t, maxAng)) t.state = TR.DUMPING;
+        break;
+      }
+      case TR.DUMPING: {
+        const amt = Math.min(BASE_DUMP * r * dt, t.cargo);
+        if (amt > 0) { t.cargo -= amt; this.fillZone.edit.depth -= amt * this._fillK(); this._markDirty(); }
+        if (t.cargo <= 1e-6) {
+          t.cargo = 0;
+          if (this.stockpile > 1e-6 || this.digRemaining() > 1e-6) { t.state = TR.TO_LOAD; this._retargetTruck(t); }
+          else t.state = TR.DONE;
+        }
+        break;
+      }
+      default: break;  // DONE
+    }
+  }
+
+  _retargetTruck(t) {
+    if (t.state === TR.TO_LOAD || t.state === TR.LOADING) this._randInCap(this.digZone.dir, this.digZone.radius * 0.55, t.target);
+    else this._randInCap(this.fillZone.dir, this.fillZone.radius * 0.7, t.target);
+  }
+
+  // 沿大圆走一步; 返回是否到达
+  _moveTo(a, maxAng) {
+    const dot = THREE.MathUtils.clamp(a.dir.dot(a.target), -1, 1);
+    const ang = Math.acos(dot);
+    if (ang <= Math.max(0.015, maxAng * 1.2)) return true;
+    this._axis.crossVectors(a.dir, a.target);
+    if (this._axis.lengthSq() < 1e-12) return true;
+    this._axis.normalize();
+    a.dir.applyAxisAngle(this._axis, Math.min(maxAng, ang)).normalize();
+    this._tangentToward(a.dir, a.target, a.fwd);
+    return false;
+  }
+  _tangentToward(dir, target, out) {
+    out.copy(target).addScaledVector(dir, -target.dot(dir));
+    if (out.lengthSq() < 1e-10) perpAxis(dir, out); else out.normalize();
+    return out;
+  }
+  // 以 centerDir 为极点, 角距 ang、方位 az 处的球面单位方向
+  _pointAtAngle(centerDir, ang, az, out) {
+    perpAxis(centerDir, this._t1);
+    this._t2.crossVectors(centerDir, this._t1).normalize();
+    const s = Math.sin(ang), c = Math.cos(ang);
+    return out.copy(centerDir).multiplyScalar(c)
+      .addScaledVector(this._t1, s * Math.cos(az))
+      .addScaledVector(this._t2, s * Math.sin(az))
+      .normalize();
+  }
+  // 球冠内均匀随机方向
+  _randInCap(centerDir, capRadius, out) {
+    const u = Math.random();
+    const ang = Math.acos(1 - u * (1 - Math.cos(capRadius)));
+    return this._pointAtAngle(centerDir, ang, Math.random() * Math.PI * 2, out);
+  }
+
+  // ---- 地形提交 ----
+  _markDirty(immediate) { this._dirty = true; if (immediate) this._commit(); }
+  _invalidateZone(dir, radius) { for (const r of this.planet.roots) this.planet._invalidateAffected(r, dir, radius); }
+  _commit(extra) {
+    this.planet._buildNoise();
+    if (this.digZone) this._invalidateZone(this.digZone.dir, this.digZone.radius);
+    if (this.fillZone) this._invalidateZone(this.fillZone.dir, this.fillZone.radius);
+    if (extra) for (const z of extra) if (z) this._invalidateZone(z.dir, z.radius);
+    this.planet._editPending = true;
+    this._dirty = false; this._commitTimer = 0;
+  }
+
+  // ---- 渲染 ----
+  _writeInstance(mesh, i, dir, fwd, yBob) {
+    const n3 = dir;
+    this._v.copy(fwd).addScaledVector(n3, -fwd.dot(n3));
+    if (this._v.lengthSq() < 1e-10) perpAxis(n3, this._v); else this._v.normalize();
+    this._xA.crossVectors(n3, this._v).normalize();      // right = up × forward
+    this._m.makeBasis(this._xA, n3, this._v);            // x=right, y=up, z=forward
+    if (this.size !== 1) this._m.scale(this._sv.set(this.size, this.size, this.size));
+    this._groundPos(n3, this._pos);
+    if (yBob) this._pos.addScaledVector(n3, yBob);
+    this._m.setPosition(this._pos);
+    mesh.setMatrixAt(i, this._m);
+  }
+  _syncExcavators() {
+    const n = Math.min(this.excavators.length, MAX_INSTANCES);
+    this.excaMesh.count = n;
+    for (let i = 0; i < n; i++) {
+      const e = this.excavators[i];
+      // 挖掘中: 上下小幅 bob, 表示在作业
+      const bob = e.state === EX.DIGGING ? Math.sin(this._time * 6 + e.phase) * 0.35 * this.size : 0;
+      this._writeInstance(this.excaMesh, i, e.dir, e.fwd, bob);
+      this.excaMesh.setColorAt(i, EX_COLOR[e.state] || EX_COLOR[EX.IDLE]);
+    }
+    this.excaMesh.instanceMatrix.needsUpdate = true;
+    if (this.excaMesh.instanceColor) this.excaMesh.instanceColor.needsUpdate = true;
+    if (this.digZone) this._updateRing(this.digRing, this.digZone.dir, this.digZone.radius);
+    if (this.fillZone) this._updateRing(this.fillRing, this.fillZone.dir, this.fillZone.radius);
+  }
+  _syncTrucks() {
+    const n = Math.min(this.trucks.length, MAX_INSTANCES);
+    this.truckMesh.count = n;
+    for (let i = 0; i < n; i++) {
+      const t = this.trucks[i];
+      this._writeInstance(this.truckMesh, i, t.dir, t.fwd, 0);
+      this.truckMesh.setColorAt(i, TR_COLOR[t.state] || TR_COLOR[TR.TO_LOAD]);
+    }
+    this.truckMesh.instanceMatrix.needsUpdate = true;
+    if (this.truckMesh.instanceColor) this.truckMesh.instanceColor.needsUpdate = true;
+  }
+
+  _makeRing(color) {
+    const N = 72;
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(N * 3), 3));
+    const m = new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.9, depthTest: false });
+    const ring = new THREE.LineLoop(g, m);
+    ring.frustumCulled = false; ring.renderOrder = 998; ring.visible = false; ring.userData.N = N;
+    return ring;
+  }
+  _updateRing(ring, centerDir, capRadius) {
+    const N = ring.userData.N, p = this.planet.params;
+    perpAxis(centerDir, this._t1);
+    this._t2.crossVectors(centerDir, this._t1).normalize();
+    const sr = Math.sin(capRadius), cr = Math.cos(capRadius);
+    const pos = ring.geometry.attributes.position.array;
+    for (let i = 0; i < N; i++) {
+      const a = (i / N) * Math.PI * 2, ca = Math.cos(a), sa = Math.sin(a);
+      this._v.copy(centerDir).multiplyScalar(cr)
+        .addScaledVector(this._t1, sr * ca).addScaledVector(this._t2, sr * sa).normalize();
+      const rr = (p.radius + this.planet.heightAt(this._v.x, this._v.y, this._v.z) * p.maxHeight) * 1.003;
+      pos[i * 3] = this._v.x * rr + this.planet.position.x;
+      pos[i * 3 + 1] = this._v.y * rr + this.planet.position.y;
+      pos[i * 3 + 2] = this._v.z * rr + this.planet.position.z;
+    }
+    ring.geometry.attributes.position.needsUpdate = true;
+    ring.visible = true;
+  }
+
+  dispose() {
+    this.scene.remove(this.excaMesh, this.truckMesh, this.digRing, this.fillRing);
+    for (const o of [this.excaMesh, this.truckMesh, this.digRing, this.fillRing]) { o.geometry.dispose(); o.material.dispose(); }
+  }
+}

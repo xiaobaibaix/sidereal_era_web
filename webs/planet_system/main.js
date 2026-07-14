@@ -10,6 +10,7 @@ import GUI from 'lil-gui';
 import { Planet } from '../../src/planet.js';
 import { createOcean, createAtmospherePass, createCompositePass, createGodrayPass, createTransmittanceLUT } from '../../src/effects.js';
 import { PlanetWalker } from './character.js';
+import { ExcavatorSystem } from '../../src/excavators.js';
 
 // ----------------------------------------------------------------------------
 // 参数
@@ -289,6 +290,9 @@ scene.add(planet);
 const ocean = createOcean();
 scene.add(ocean);
 const atmoPass = createAtmospherePass();
+
+// 自动施工: 挖掘机/运土车 车队(挖掘区 → 搬运 → 填埋区, 循环)
+const excavators = new ExcavatorSystem(planet, scene);
 
 // 场景渲染目标(带深度纹理), 供大气 pass 采样。主画面 + 小窗各一张。
 function makeSceneRT(w, h) {
@@ -1081,6 +1085,81 @@ toolGui.add({ clear: () => {
 
 loadEdits();   // 从 localStorage 恢复上次挖掘
 
+// ============================================================================
+// 自动施工: 挖掘机车队 UI(选挖掘区 / 填埋区 → 生成机器 → 开始施工)
+// ============================================================================
+const exTool = {
+  mode: '关闭',          // '关闭' | '选挖掘区' | '选填埋区'
+  digRadius: 0.07,       // 挖掘区角半径
+  digDepth: 0.6,         // 目标挖深(0..1, ×maxHeight) — 默认更深, 坑更明显
+  fillRadius: 0.07,      // 填埋区角半径
+  excaCount: 4,          // 挖机数量(驻扎挖掘区挖土)
+  truckCount: 12,        // 卡车数量(往返运土)
+  speed: 20,             // 卡车表面移动速度
+  rate: 1.0,             // 施工速度倍率(挖/装/卸)
+  size: 1.0,             // 机器大小
+  status: '待命',
+};
+const _exRaycaster = new THREE.Raycaster();
+const _exNDC = new THREE.Vector2();
+let _exPickDown = null;
+
+function _exApplyTuning() {
+  excavators.surfaceSpeed = exTool.speed;
+  excavators.rate = exTool.rate;
+  excavators.size = exTool.size;
+}
+// 屏幕点选星球表面 → 单位方向(本地系)
+function _exPickDir(clientX, clientY) {
+  _exNDC.set((clientX / innerWidth) * 2 - 1, -(clientY / innerHeight) * 2 + 1);
+  _exRaycaster.setFromCamera(_exNDC, mainCam());
+  const hits = _exRaycaster.intersectObject(planet, true);
+  if (!hits.length) return null;
+  return hits[0].point.clone().sub(planet.position).normalize();
+}
+renderer.domElement.addEventListener('pointerdown', (e) => {
+  if (exTool.mode !== '关闭') _exPickDown = { x: e.clientX, y: e.clientY };
+});
+renderer.domElement.addEventListener('pointerup', (e) => {
+  if (exTool.mode === '关闭' || !_exPickDown) { _exPickDown = null; return; }
+  const moved = Math.hypot(e.clientX - _exPickDown.x, e.clientY - _exPickDown.y);
+  _exPickDown = null;
+  if (moved > 5) return;   // 拖动 = 轨道旋转, 不当作点选
+  const dir = _exPickDir(e.clientX, e.clientY);
+  if (!dir) return;
+  if (exTool.mode === '选挖掘区') { excavators.setDigZone(dir, exTool.digRadius, exTool.digDepth); exTool.status = '挖掘区已设'; }
+  else if (exTool.mode === '选填埋区') { excavators.setFillZone(dir, exTool.fillRadius); exTool.status = '填埋区已设'; }
+});
+
+const exGui = new GUI({ title: '🚜 挖掘机 (自动施工)' });
+// 固定到左下角(直接改 GUI 根元素的内联样式, 覆盖 lil-gui 默认的右上 autoPlace)。
+// 加 maxHeight + 滚动, 面板高也不会超出屏幕。
+Object.assign(exGui.domElement.style, {
+  position: 'fixed', left: '8px', right: 'auto', top: 'auto', bottom: '8px',
+  maxHeight: '46vh', overflowY: 'auto',
+});
+exGui.add(exTool, 'mode', ['关闭', '选挖掘区', '选填埋区']).name('点选模式').listen()
+  .onChange((v) => { if (v !== '关闭') brush.enabled = false; });   // 选区时关掉手动刷子, 避免抢点击
+exGui.add(exTool, 'digRadius', 0.01, 0.25, 0.005).name('挖掘区半径');
+exGui.add(exTool, 'digDepth', 0.05, 1.0, 0.05).name('挖掘目标深度');
+exGui.add(exTool, 'fillRadius', 0.01, 0.25, 0.005).name('填埋区半径');
+exGui.add(exTool, 'excaCount', 1, 40, 1).name('挖机数量');
+exGui.add(exTool, 'truckCount', 1, 100, 1).name('卡车数量');
+exGui.add(exTool, 'speed', 5, 80).name('卡车速度').onChange(_exApplyTuning);
+exGui.add(exTool, 'rate', 0.2, 4.0, 0.1).name('施工速度').onChange(_exApplyTuning);
+exGui.add(exTool, 'size', 0.3, 4.0, 0.1).name('机器大小').onChange(_exApplyTuning);
+exGui.add({ f: () => { _exApplyTuning(); excavators.spawnExcavators(exTool.excaCount); exTool.status = `挖机 ${excavators.excavators.length} · 卡车 ${excavators.trucks.length}`; } }, 'f').name('▸ 生成挖机');
+exGui.add({ f: () => { _exApplyTuning(); excavators.spawnTrucks(exTool.truckCount); exTool.status = `挖机 ${excavators.excavators.length} · 卡车 ${excavators.trucks.length}`; } }, 'f').name('▸ 生成卡车');
+exGui.add({ f: () => { if (excavators.start()) exTool.status = '施工中…'; else exTool.status = '需先设挖掘区+填埋区'; } }, 'f').name('▶ 开始施工');
+exGui.add({ f: () => { excavators.pause(); exTool.status = '已暂停'; } }, 'f').name('⏸ 暂停');
+exGui.add({ f: () => { excavators.clearAgents(); exTool.status = '机器已清空'; } }, 'f').name('✖ 清空机器');
+exGui.add({ f: () => { excavators.clearAll(); exTool.mode = '关闭'; exTool.status = '已恢复地形'; } }, 'f').name('↺ 恢复地形/清区域');
+exGui.add(exTool, 'status').name('状态').listen().disable();
+_exApplyTuning();
+// 挖掘机与鼠标挖掘共用同一份 edits(planet.params.edits)。这里把挖掘机的离散地形变更
+// (设区/暂停/恢复)也持久化到手动挖掘用的同一个 localStorage → 真正"一份缓存"。
+excavators.onChange = () => saveEdits();
+
 function animate() {
   requestAnimationFrame(animate);
   const dt = Math.min(clock.getDelta(), 0.05);   // 限制步长, 防止掉帧时穿地
@@ -1097,6 +1176,13 @@ function animate() {
   else if (main === spectatorCamera) updateSpectator(dt);
   if (characterMode) walker.update(dt);           // 角色始终更新(输入由 active 门控)
   if (brush.enabled && _digHeld && _charDigActive()) tryDig(false);   // 角色模式: 按住 F 连续挖(在 planet.update 前, 本帧即生效)
+  excavators.update(dt);                          // 挖机+卡车(状态机 + 地形提交节流 + 实例矩阵)
+  if (excavators.running) {
+    const pct = (excavators.progress() * 100).toFixed(0);
+    exTool.status = excavators.allDone()
+      ? `完工 100%`
+      : `施工 ${pct}% · 挖机${excavators.excavators.length} 卡车${excavators.trucks.length} 料堆${(excavators.stockpile * 100).toFixed(0)}`;
+  }
 
   atmoPass.uniforms.uTime.value = clock.elapsedTime;   // 云飘动(云已并入大气 pass)
   updateClips();                                  // 动态近/远面, 消除 z-fighting
