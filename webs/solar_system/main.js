@@ -10,6 +10,7 @@ import GUI from 'lil-gui';
 import { Body, NBodySystem } from './nbody.js';
 import { Planet } from '../../src/planet.js';       // 复用主项目的 LOD 地形行星(近距详细表现)
 import { PlanetWalker } from '../planet_system/character.js';   // 复用主项目的登陆行星角色控制器
+import { ExcavatorSystem } from '../../src/excavators.js';       // 挖机/卡车自动施工车队
 import { createAtmospherePass, createCloudPass, createOcean, createGasGiant } from '../../src/effects.js';   // 复用深度感知大气 + 体积云 + 海洋 海洋
 
 // ----------------------------------------------------------------------------
@@ -604,6 +605,7 @@ const _mouseNDC = new THREE.Vector2(-2, -2);  // 屏外初始
 let _downXY = null;
 let _brushDown = false;        // brush 启用时鼠标按下状态
 let _lastDigDir = null;        // 上次 dig 方向(单位向量, 拖拽时节流用)
+let _exPickActive = false;     // 挖掘机施工面板"选区模式"是否激活(激活时点击用于选挖/填区)
 const _CENTER = new THREE.Vector2(0, 0);   // 角色模式: 屏幕中心准星瞄点
 let _digHeld = false;          // 角色模式: 按住 F 连续挖
 
@@ -774,6 +776,7 @@ renderer.domElement.addEventListener('pointerleave', () => {
 });
 renderer.domElement.addEventListener('pointerup', (e) => {
   _brushDown = false; _lastDigDir = null;
+  if (_exPickActive) { _downXY = null; return; }   // 挖掘机选区模式: 点击交给施工面板处理, 不切焦点/不刷子
   if (charMode) return;                 // 角色模式: 点击用于锁定视角
   if (!_downXY) return;
   const moved = Math.hypot(e.clientX - _downXY.x, e.clientY - _downXY.y);
@@ -1408,6 +1411,90 @@ function resizeAtmoRTs() {
   rtOut.setSize(aw, ah);
 }
 
+// ============================================================================
+// 自动施工: 挖机/卡车车队(绑定到"当前聚焦的地形行星")
+// ============================================================================
+let excavators = null;
+const exTool = {
+  mode: '关闭', digRadius: 0.07, digDepth: 0.6, fillRadius: 0.07,
+  excaCount: 4, truckCount: 12, speed: 20, rate: 1.0, size: 1.0, showMarkers: true, status: '待命',
+};
+const _exRaycaster = new THREE.Raycaster();
+const _exNDC = new THREE.Vector2();
+let _exDown = null;
+
+function _exApplyTuning() {
+  if (!excavators) return;
+  excavators.surfaceSpeed = exTool.speed;
+  excavators.rate = exTool.rate;
+  excavators.size = exTool.size;
+  excavators.showMarkers = exTool.showMarkers;
+}
+function _exSaveFor(planet) { for (const [b, e] of detailMap) if (e.planet === planet) { saveEdits(b, planet); return; } }
+// 绑定到当前聚焦的地形行星(需要时创建其详细地形); 返回 planet 或 null(恒星/气态不可)
+function exBind() {
+  const b = focusBody();
+  if (!b || b.type === 'star' || tuneFor(b).gas) return null;
+  let fe = detailMap.get(b);
+  if (!fe || !fe.planet) fe = addDetail(b);
+  if (!fe || !fe.planet) return null;
+  if (!excavators) {
+    excavators = new ExcavatorSystem(fe.planet, scene);
+    excavators.onChange = () => _exSaveFor(excavators.planet);
+  } else if (excavators.planet !== fe.planet) {
+    excavators.rebind(fe.planet);   // 换聚焦星: 清机器/区域, 旧星地形保持
+  }
+  _exApplyTuning();
+  return fe.planet;
+}
+function exPlanetAlive() {
+  if (!excavators || !excavators.planet) return false;
+  for (const [, e] of detailMap) if (e.planet === excavators.planet) return true;
+  return false;
+}
+function _exPickDir(clientX, clientY) {
+  const planet = excavators && excavators.planet;
+  if (!planet) return null;
+  _exNDC.set((clientX / innerWidth) * 2 - 1, -(clientY / innerHeight) * 2 + 1);
+  _exRaycaster.setFromCamera(_exNDC, renderCam());
+  const hits = _exRaycaster.intersectObject(planet, true);
+  if (!hits.length) return null;
+  return hits[0].point.clone().sub(planet.position).normalize();
+}
+renderer.domElement.addEventListener('pointerdown', (e) => { if (exTool.mode !== '关闭') _exDown = { x: e.clientX, y: e.clientY }; });
+renderer.domElement.addEventListener('pointerup', (e) => {
+  if (exTool.mode === '关闭' || !_exDown) { _exDown = null; return; }
+  const moved = Math.hypot(e.clientX - _exDown.x, e.clientY - _exDown.y);
+  _exDown = null;
+  if (moved > 5) return;   // 拖动 = 轨道旋转, 不当点选
+  if (!exBind()) { exTool.status = '请先聚焦一颗地形行星'; return; }
+  const dir = _exPickDir(e.clientX, e.clientY);
+  if (!dir) return;
+  if (exTool.mode === '选挖掘区') { excavators.setDigZone(dir, exTool.digRadius, exTool.digDepth); exTool.status = '挖掘区已设'; }
+  else if (exTool.mode === '选填埋区') { excavators.setFillZone(dir, exTool.fillRadius); exTool.status = '填埋区已设'; }
+});
+
+const exGui = new GUI({ title: '🚜 挖掘机 (自动施工)' });
+Object.assign(exGui.domElement.style, { position: 'fixed', left: '8px', right: 'auto', top: 'auto', bottom: '8px', maxHeight: '46vh', overflowY: 'auto' });
+exGui.add(exTool, 'mode', ['关闭', '选挖掘区', '选填埋区']).name('点选模式').listen()
+  .onChange((v) => { _exPickActive = (v !== '关闭'); if (_exPickActive) brush.enabled = false; });
+exGui.add(exTool, 'digRadius', 0.01, 0.25, 0.005).name('挖掘区半径');
+exGui.add(exTool, 'digDepth', 0.05, 1.0, 0.05).name('挖掘目标深度');
+exGui.add(exTool, 'fillRadius', 0.01, 0.25, 0.005).name('填埋区半径');
+exGui.add(exTool, 'excaCount', 1, 40, 1).name('挖机数量');
+exGui.add(exTool, 'truckCount', 1, 100, 1).name('卡车数量');
+exGui.add(exTool, 'speed', 5, 80).name('卡车速度').onChange(_exApplyTuning);
+exGui.add(exTool, 'rate', 0.2, 4.0, 0.1).name('施工速度').onChange(_exApplyTuning);
+exGui.add(exTool, 'size', 0.3, 4.0, 0.1).name('机器大小').onChange(_exApplyTuning);
+exGui.add(exTool, 'showMarkers').name('显示指示箭头').onChange(_exApplyTuning);
+exGui.add({ f: () => { if (!exBind()) { exTool.status = '请先聚焦地形行星'; return; } excavators.spawnExcavators(exTool.excaCount); exTool.status = `挖机${excavators.excavators.length} 卡车${excavators.trucks.length}`; } }, 'f').name('▸ 生成挖机');
+exGui.add({ f: () => { if (!exBind()) { exTool.status = '请先聚焦地形行星'; return; } excavators.spawnTrucks(exTool.truckCount); exTool.status = `挖机${excavators.excavators.length} 卡车${excavators.trucks.length}`; } }, 'f').name('▸ 生成卡车');
+exGui.add({ f: () => { if (excavators && excavators.start()) exTool.status = '施工中…'; else exTool.status = '需先设挖掘区+填埋区'; } }, 'f').name('▶ 开始施工');
+exGui.add({ f: () => { if (excavators) excavators.pause(); exTool.status = '已暂停'; } }, 'f').name('⏸ 暂停');
+exGui.add({ f: () => { if (excavators) excavators.clearAgents(); exTool.status = '机器已清空'; } }, 'f').name('✖ 清空机器');
+exGui.add({ f: () => { if (excavators) excavators.clearAll(); exTool.mode = '关闭'; _exPickActive = false; exTool.status = '已恢复地形'; } }, 'f').name('↺ 恢复地形/清区域');
+exGui.add(exTool, 'status').name('状态').listen().disable();
+
 function animate() {
   requestAnimationFrame(animate);
   const dt = Math.min(clock.getDelta(), 0.05);
@@ -1453,6 +1540,18 @@ function animate() {
     updateCameraRange();   // 动态 near/far(在 manageDetail 之前设好投影, 否则首帧 frustum 用旧 far 误剔除焦点行星)
   }
   manageDetail();
+  // 挖机/卡车车队(在 manageDetail 之后: 绑定行星的 position 已更新为浮动原点空间)
+  if (exPlanetAlive()) {
+    excavators.update(dt, renderCam());
+    if (excavators.running) {
+      const pct = (excavators.progress() * 100).toFixed(0);
+      exTool.status = excavators.allDone() ? '完工 100%' : `施工 ${pct}% · 挖机${excavators.excavators.length} 卡车${excavators.trucks.length}`;
+    }
+  } else if (excavators) {   // 绑定行星已不在(关近距地形/被移除): 隐藏机器/标记/区域环
+    excavators.excaMesh.count = 0; excavators.truckMesh.count = 0;
+    excavators.excaMarker.count = 0; excavators.truckMarker.count = 0;
+    excavators.digRing.visible = false; excavators.fillRing.visible = false;
+  }
   updateRender();
 
   // 场景 → HDR RT(带深度)。角色模式下用角色相机渲染整条管线。

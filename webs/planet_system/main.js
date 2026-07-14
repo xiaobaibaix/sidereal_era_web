@@ -1098,6 +1098,7 @@ const exTool = {
   speed: 20,             // 卡车表面移动速度
   rate: 1.0,             // 施工速度倍率(挖/装/卸)
   size: 1.0,             // 机器大小
+  showMarkers: true,     // 头顶指示箭头(帮忙定位)
   status: '待命',
 };
 const _exRaycaster = new THREE.Raycaster();
@@ -1108,6 +1109,7 @@ function _exApplyTuning() {
   excavators.surfaceSpeed = exTool.speed;
   excavators.rate = exTool.rate;
   excavators.size = exTool.size;
+  excavators.showMarkers = exTool.showMarkers;
 }
 // 屏幕点选星球表面 → 单位方向(本地系)
 function _exPickDir(clientX, clientY) {
@@ -1148,6 +1150,7 @@ exGui.add(exTool, 'truckCount', 1, 100, 1).name('卡车数量');
 exGui.add(exTool, 'speed', 5, 80).name('卡车速度').onChange(_exApplyTuning);
 exGui.add(exTool, 'rate', 0.2, 4.0, 0.1).name('施工速度').onChange(_exApplyTuning);
 exGui.add(exTool, 'size', 0.3, 4.0, 0.1).name('机器大小').onChange(_exApplyTuning);
+exGui.add(exTool, 'showMarkers').name('显示指示箭头').onChange(_exApplyTuning);
 exGui.add({ f: () => { _exApplyTuning(); excavators.spawnExcavators(exTool.excaCount); exTool.status = `挖机 ${excavators.excavators.length} · 卡车 ${excavators.trucks.length}`; } }, 'f').name('▸ 生成挖机');
 exGui.add({ f: () => { _exApplyTuning(); excavators.spawnTrucks(exTool.truckCount); exTool.status = `挖机 ${excavators.excavators.length} · 卡车 ${excavators.trucks.length}`; } }, 'f').name('▸ 生成卡车');
 exGui.add({ f: () => { if (excavators.start()) exTool.status = '施工中…'; else exTool.status = '需先设挖掘区+填埋区'; } }, 'f').name('▶ 开始施工');
@@ -1176,7 +1179,7 @@ function animate() {
   else if (main === spectatorCamera) updateSpectator(dt);
   if (characterMode) walker.update(dt);           // 角色始终更新(输入由 active 门控)
   if (brush.enabled && _digHeld && _charDigActive()) tryDig(false);   // 角色模式: 按住 F 连续挖(在 planet.update 前, 本帧即生效)
-  excavators.update(dt);                          // 挖机+卡车(状态机 + 地形提交节流 + 实例矩阵)
+  excavators.update(dt, mainCam());               // 挖机+卡车(状态机 + 地形提交节流 + 实例矩阵 + 头顶标记)
   if (excavators.running) {
     const pct = (excavators.progress() * 100).toFixed(0);
     exTool.status = excavators.allDone()

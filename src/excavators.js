@@ -75,6 +75,13 @@ function buildExcavatorGeometry() {
     [1.0, 0.6, 0.7, 0, 0.55, 2.5],
   ]);
 }
+// 指示标记: 一个尖朝下的圆锥(悬在机器头顶指着它)。单位尺寸, 渲染时按距离缩放。
+function buildMarkerGeometry() {
+  const g = new THREE.ConeGeometry(0.5, 1.3, 6);
+  g.rotateX(Math.PI);              // 尖端朝 -Y(向下)
+  g.translate(0, 1.3 / 2 + 0.1, 0); // 尖端落在原点略上方, 锥体在上
+  return g;
+}
 // 卡车: 长底盘 + 驾驶室(前) + 货斗(后, 带矮侧壁)
 function buildTruckGeometry() {
   return buildFrom([
@@ -98,6 +105,8 @@ export class ExcavatorSystem {
     this.surfaceSpeed = 20;
     this.rate = 1.0;
     this.size = 1.0;
+    this.showMarkers = true;   // 头顶指示箭头(帮忙定位机器)
+    this._cam = null;          // 当前渲染相机(update 时传入, 用于标记按距离缩放)
 
     // 区域(受管理 edit)
     this.digZone = null;   // { dir, radius, target, edit }
@@ -118,10 +127,16 @@ export class ExcavatorSystem {
     this._pos = new THREE.Vector3(); this._xA = new THREE.Vector3();
     this._sv = new THREE.Vector3(); this._m = new THREE.Matrix4();
 
-    // 两个 InstancedMesh
+    // 两个 InstancedMesh(机器本体)
     this.excaMesh = this._makeInstanced(buildExcavatorGeometry());
     this.truckMesh = this._makeInstanced(buildTruckGeometry());
     scene.add(this.excaMesh, this.truckMesh);
+
+    // 头顶指示标记(尖朝下的箭头, 单色不受光, 始终可见): 挖机=橙, 卡车=青
+    const markerGeo = buildMarkerGeometry();
+    this.excaMarker = this._makeMarkerMesh(markerGeo, 0xffa030);
+    this.truckMarker = this._makeMarkerMesh(markerGeo, 0x35d0ff);
+    scene.add(this.excaMarker, this.truckMarker);
 
     // 区域环
     this.digRing = this._makeRing(0xff4d4d);
@@ -140,8 +155,26 @@ export class ExcavatorSystem {
     mesh.instanceColor.needsUpdate = true;
     return mesh;
   }
+  // 标记用: 单色不受光的 InstancedMesh(不需要 per-instance 颜色)
+  _makeMarkerMesh(geo, color) {
+    const mat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.95 });
+    const mesh = new THREE.InstancedMesh(geo, mat, MAX_INSTANCES);
+    mesh.frustumCulled = false;
+    mesh.count = 0;
+    mesh.renderOrder = 997;
+    mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    return mesh;
+  }
 
   setPlanet(planet) { this.planet = planet; }
+  // 换绑到另一颗行星(太阳系换聚焦星时用): 清掉机器/区域/环, 但旧行星地形编辑保持不动; 切换 planet 引用
+  rebind(planet) {
+    this.clearAgents();
+    this.digZone = null; this.fillZone = null;
+    this.digRing.visible = false; this.fillRing.visible = false;
+    this.running = false;
+    this.planet = planet;
+  }
 
   // ---- 地形高度 / 表面坐标 ----
   _groundR(dir) {
@@ -295,7 +328,8 @@ export class ExcavatorSystem {
   }
 
   // ---- 主循环 ----
-  update(dt) {
+  update(dt, cam) {
+    if (cam) this._cam = cam;
     this._time += dt;
     if (this.running && this.hasZones()) {
       const r = this.rate;
@@ -507,31 +541,53 @@ export class ExcavatorSystem {
     this._m.setPosition(this._pos);
     mesh.setMatrixAt(i, this._m);
   }
+  // 头顶指示箭头: 尖朝下悬在机器上方, 按到相机距离缩放(拉远也看得见) + 轻微上下浮动
+  _writeMarker(mesh, i, dir, phase) {
+    this._groundPos(dir, this._pos);                       // 机器地面位置
+    const dist = this._cam ? this._cam.position.distanceTo(this._pos) : 200;
+    const ms = THREE.MathUtils.clamp(dist * 0.03, 1.5, this.planet.params.radius * 0.6) * this.size;
+    const gap = ms * 0.7 + Math.sin(this._time * 3 + phase) * ms * 0.22;   // 悬浮高度 + bob
+    this._pos.addScaledVector(dir, gap);
+    perpAxis(dir, this._xA);
+    this._v.crossVectors(dir, this._xA).normalize();
+    this._m.makeBasis(this._xA, dir, this._v);             // y = 径向上; 圆锥尖朝下指机器
+    this._m.scale(this._sv.set(ms, ms, ms));
+    this._m.setPosition(this._pos);
+    mesh.setMatrixAt(i, this._m);
+  }
   _syncExcavators() {
     const n = Math.min(this.excavators.length, MAX_INSTANCES);
     this.excaMesh.count = n;
+    const mk = this.showMarkers;
+    this.excaMarker.count = mk ? n : 0;
     for (let i = 0; i < n; i++) {
       const e = this.excavators[i];
       // 装车(挖掘)中: 上下小幅 bob, 表示在作业
       const bob = e.state === EX.LOADING ? Math.sin(this._time * 6 + e.phase) * 0.35 * this.size : 0;
       this._writeInstance(this.excaMesh, i, e.dir, e.fwd, bob);
       this.excaMesh.setColorAt(i, EX_COLOR[e.state] || EX_COLOR[EX.IDLE]);
+      if (mk) this._writeMarker(this.excaMarker, i, e.dir, e.phase);
     }
     this.excaMesh.instanceMatrix.needsUpdate = true;
     if (this.excaMesh.instanceColor) this.excaMesh.instanceColor.needsUpdate = true;
+    if (mk) this.excaMarker.instanceMatrix.needsUpdate = true;
     if (this.digZone) this._updateRing(this.digRing, this.digZone.dir, this.digZone.radius);
     if (this.fillZone) this._updateRing(this.fillRing, this.fillZone.dir, this.fillZone.radius);
   }
   _syncTrucks() {
     const n = Math.min(this.trucks.length, MAX_INSTANCES);
     this.truckMesh.count = n;
+    const mk = this.showMarkers;
+    this.truckMarker.count = mk ? n : 0;
     for (let i = 0; i < n; i++) {
       const t = this.trucks[i];
       this._writeInstance(this.truckMesh, i, t.dir, t.fwd, 0);
       this.truckMesh.setColorAt(i, TR_COLOR[t.state] || TR_COLOR[TR.TO_EXCA]);
+      if (mk) this._writeMarker(this.truckMarker, i, t.dir, i * 1.7);
     }
     this.truckMesh.instanceMatrix.needsUpdate = true;
     if (this.truckMesh.instanceColor) this.truckMesh.instanceColor.needsUpdate = true;
+    if (mk) this.truckMarker.instanceMatrix.needsUpdate = true;
   }
 
   _makeRing(color) {
@@ -563,7 +619,8 @@ export class ExcavatorSystem {
   }
 
   dispose() {
-    this.scene.remove(this.excaMesh, this.truckMesh, this.digRing, this.fillRing);
-    for (const o of [this.excaMesh, this.truckMesh, this.digRing, this.fillRing]) { o.geometry.dispose(); o.material.dispose(); }
+    const objs = [this.excaMesh, this.truckMesh, this.excaMarker, this.truckMarker, this.digRing, this.fillRing];
+    this.scene.remove(...objs);
+    for (const o of objs) { o.geometry.dispose(); o.material.dispose(); }
   }
 }
