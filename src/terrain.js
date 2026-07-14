@@ -72,10 +72,15 @@ export function makeTerrain(p) {
   const useClimate = p.useClimate;
   const altRange = p.climateAltRange || 1.0;
 
-  // 运行时编辑(挖掘/抬升)。snapshot 一份避免外部修改影响一致性。
-  // 每个 edit: { pos: [ux,uy,uz] 单位方向, radius: 角半径(弧度), depth: 0..1, falloff }
+  // 运行时编辑。snapshot 一份避免外部修改影响一致性。
+  // 两类:
+  //   减量式(默认, 鼠标刷子/填埋区): { pos, radius, depth(0..1, 正=挖/负=抬), falloff }
+  //   整平式(挖掘机挖掘区): { type:'level', pos, radius, level(目标 h 平面), progress(0..1), falloff }
   const edits = Array.isArray(p.edits) ? p.edits.map((e) => ({
-    pos: e.pos, radius: e.radius, depth: e.depth, falloff: e.falloff || 'smooth',
+    type: e.type || 'sub',
+    pos: e.pos, radius: e.radius,
+    depth: e.depth, level: e.level, progress: e.progress,
+    falloff: e.falloff || 'smooth',
   })) : [];
 
   // 可调调色板(缺省回退到原硬编码值 → 不传颜色的调用者行为不变)
@@ -126,14 +131,24 @@ export function makeTerrain(p) {
         const e = edits[i];
         const cos = ux * e.pos[0] + uy * e.pos[1] + uz * e.pos[2];
         if (cos <= 0) continue;                              // edit 在球的对面, 不影响
-        if (cos >= 1) { h -= e.depth; continue; }            // 正中心
-        const ang = Math.acos(cos);
-        if (ang > e.radius) continue;                        // 角距离 > 半径, 不在刷子内
+        const ang = cos >= 1 ? 0 : Math.acos(cos);
+        if (ang > e.radius) continue;                        // 角距离 > 半径, 不在范围内
         const t = ang / e.radius;                            // 0=中心, 1=边缘
         const fall = e.falloff === 'sharp' ? 1.0
                     : e.falloff === 'linear' ? 1.0 - t
                     : Math.cos(t * Math.PI * 0.5);           // smooth (cosine)
-        h -= e.depth * fall;
+        if (e.type === 'level') {
+          // 整平到目标平面(只挖不填): 用"平顶"权重 → 内侧 ~75% 完全削平到 level(真正的平地),
+          // 外侧 25% 平滑过渡回原地形; 按 progress 推进。progress=1 时圆区内高于 level 处全被削平。
+          const leveled = h < e.level ? h : e.level;
+          const rim = 0.75;
+          let w;
+          if (t <= rim) w = 1.0;
+          else { const s = (t - rim) / (1 - rim); w = 1 - s * s * (3 - 2 * s); }
+          h += (leveled - h) * w * (e.progress || 0);
+        } else {
+          h -= e.depth * fall;                               // 减量式(挖/抬)
+        }
       }
     }
     return h;

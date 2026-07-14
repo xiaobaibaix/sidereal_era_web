@@ -151,15 +151,7 @@ export class ExcavatorSystem {
   _groundPos(dir, out) { return out.copy(dir).multiplyScalar(this._groundR(dir)).add(this.planet.position); }
 
   // ---- 区域 edit 管理 ----
-  _findEdit(edit) { return this.planet.params.edits.indexOf(edit) !== -1; }
-  _ensureEdit(zone, depth) {
-    if (!zone) return;
-    if (!zone.edit || !this._findEdit(zone.edit)) {
-      zone.edit = { pos: [zone.dir.x, zone.dir.y, zone.dir.z], radius: zone.radius, depth, falloff: 'smooth' };
-      this.planet.params.edits.push(zone.edit);
-      this._ownedEdits.push(zone.edit);
-    }
-  }
+  _pushEdit(edit) { this.planet.params.edits.push(edit); this._ownedEdits.push(edit); return edit; }
   // 从 params.edits + _ownedEdits 彻底移除某条 edit
   _discardEdit(edit) {
     let i = this.planet.params.edits.indexOf(edit);
@@ -167,19 +159,30 @@ export class ExcavatorSystem {
     i = this._ownedEdits.indexOf(edit);
     if (i !== -1) this._ownedEdits.splice(i, 1);
   }
-  // "释放"旧区域: 已挖/填出地形的 edit 保留(烘焙为永久, 仍在 _ownedEdits 里以便日后清除);
-  // 从没动过(depth≈0)的空 edit 直接丢弃, 避免泄漏。
+  // 该 edit 是否已产生地形改变(整平看 progress, 减量看 depth)
+  _editChanged(edit) {
+    if (!edit) return false;
+    return edit.type === 'level' ? (edit.progress > 1e-4) : (Math.abs(edit.depth) > 1e-6);
+  }
+  // "释放"旧区域: 已产生地形的 edit 保留(烘焙为永久, 仍在 _ownedEdits 里以便日后清除);
+  // 没动过的空 edit 直接丢弃, 避免泄漏。
   _releaseZone(zone) {
-    if (zone && zone.edit && Math.abs(zone.edit.depth) < 1e-6) this._discardEdit(zone.edit);
+    if (zone && zone.edit && !this._editChanged(zone.edit)) this._discardEdit(zone.edit);
   }
 
   _fireChange() { if (this.onChange) this.onChange(); }
 
-  setDigZone(dir, radius, target) {
+  // digDepth: 相对当前地表往下挖的深度(0..1, ×maxHeight)。挖掘区最终被整平成一块位于
+  // level = 原地表 h - digDepth 的平地(圆内高于 level 的都削平到 level)。
+  setDigZone(dir, radius, digDepth) {
     const d = dir.clone().normalize();
     this._releaseZone(this.digZone);          // 旧坑: 已挖的保留, 空的丢弃
-    this.digZone = { dir: d, radius, target, edit: null };
-    this._ensureEdit(this.digZone, 0);
+    const h0 = this.planet.heightAt(d.x, d.y, d.z);   // 挖前当前地表 h(含已烘焙的旧编辑)
+    const level = h0 - digDepth;              // 目标平面 h
+    const total = Math.max(1e-4, digDepth);   // 待挖"深度当量"(定进度/配土方)
+    const edit = { type: 'level', pos: [d.x, d.y, d.z], radius, level, progress: 0, falloff: 'smooth' };
+    this.digZone = { dir: d, radius, level, total, removed: 0, edit };
+    this._pushEdit(edit);
     this._updateRing(this.digRing, d, radius);
     this._retaskExcavators();                 // 已有挖机重新领新挖点并开过去
     this._commit();                           // 只失效新区; 旧区 edit 未改动, 地形保持
@@ -188,8 +191,9 @@ export class ExcavatorSystem {
   setFillZone(dir, radius) {
     const d = dir.clone().normalize();
     this._releaseZone(this.fillZone);
-    this.fillZone = { dir: d, radius, edit: null };
-    this._ensureEdit(this.fillZone, 0);
+    const edit = { pos: [d.x, d.y, d.z], radius, depth: 0, falloff: 'smooth' };  // 抬升: depth 变负
+    this.fillZone = { dir: d, radius, edit };
+    this._pushEdit(edit);
     this._updateRing(this.fillRing, d, radius);
     this._commit();
     this._fireChange();
@@ -209,11 +213,11 @@ export class ExcavatorSystem {
 
   progress() {
     if (!this.digZone) return 0;
-    return Math.min(1, this.digZone.edit.depth / Math.max(1e-6, this.digZone.target));
+    return Math.min(1, this.digZone.removed / Math.max(1e-6, this.digZone.total));
   }
   digRemaining() {
     if (!this.digZone) return 0;
-    return Math.max(0, this.digZone.target - this.digZone.edit.depth);
+    return Math.max(0, this.digZone.total - this.digZone.removed);
   }
   _fillK() {
     if (!this.digZone || !this.fillZone) return 1;
@@ -339,9 +343,14 @@ export class ExcavatorSystem {
       case EX.LOADING: {
         const t = e.serving;
         if (!t || t.state !== TR.LOADING) { e.serving = null; e.state = EX.IDLE; return; }
-        // 挖掘装车: 挖低地形 → 土直接进卡车(挖=装, 守恒)
+        // 挖掘装车: 推进整平进度(地形被削向目标平面) → 土直接进卡车(挖=装, 守恒)
         const amt = Math.min(BASE_LOAD * r * dt, this.digRemaining(), TRUCK_CAP - t.cargo);
-        if (amt > 0) { this.digZone.edit.depth += amt; t.cargo += amt; this._markDirty(); }
+        if (amt > 0) {
+          this.digZone.removed += amt;
+          this.digZone.edit.progress = Math.min(1, this.digZone.removed / this.digZone.total);
+          t.cargo += amt;
+          this._markDirty();
+        }
         if (t.cargo >= TRUCK_CAP - 1e-6 || this.digRemaining() <= 1e-6) {   // 装满 或 没土可挖: 放行
           t.state = t.cargo > 1e-6 ? TR.TO_DUMP : TR.DONE;
           if (t.state === TR.TO_DUMP) this._retargetTruck(t);
