@@ -384,13 +384,21 @@ export function createAtmospherePass() {
         vec2 atmo = raySphere(ro, rd, uPlanetCenter, uRatmo);
         float tNear = max(atmo.x, 0.0);
         float tFar  = atmo.y;
-        if (tFar <= tNear) { gl_FragColor = vec4(outColor(sceneColor), 1.0); return; }
+        if (tFar <= tNear) {
+          // 视线未穿过大气: 无内散射(L=0), 全透射(T=1)。
+          // LT 模式必须输出 (0, 1), 否则 composite 会把 tonemap 后的场景误当成线性 L 叠上去 → 黑边。
+          if (uOutputLT > 0.5) { gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }
+          gl_FragColor = vec4(outColor(sceneColor), 1.0); return;
+        }
 
         // 止于真实地表(深度)或海平面球(海洋不写深度, 用解析球兜底)
         tFar = min(tFar, sceneDist);
         vec2 gnd = raySphere(ro, rd, uPlanetCenter, uRground);
         if (gnd.x > 0.0 && gnd.y > gnd.x) tFar = min(tFar, gnd.x);
-        if (tFar <= tNear) { gl_FragColor = vec4(outColor(sceneColor), 1.0); return; }
+        if (tFar <= tNear) {
+          if (uOutputLT > 0.5) { gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }
+          gl_FragColor = vec4(outColor(sceneColor), 1.0); return;
+        }
 
         // 背景 = 场景色(行星/海洋)。命中地表时把云影投上去(仅白天侧)。
         vec3 background = sceneColor;
