@@ -537,6 +537,8 @@ function setFocus(body) {
   if (camera.position.lengthSq() > 1e-6) camera.position.setLength(d);
   controls.target.set(0, 0, 0);
   controls.update();
+  // 浮动原点 _off 即将改变 → 强制所有 detailMap 行星下一帧重跑 selectLOD(同 onFocusChange)
+  for (const [, e] of detailMap) if (e.planet) e.planet._meshArrived = true;
   updateGuiForFocus();     // 恒星: 隐藏调参面板; 行星/卫星: 显示
   if (params.wireframe === 'current') applyWireframe();
   persistParams();
@@ -760,7 +762,14 @@ function syncFocusCfg(newBody) {
   editingBody = newBody;
   loadCfg(newBody);
 }
-function onFocusChange() { if (charMode) exitCharacter(); const b = focusBody(); syncFocusCfg(b); syncBodyEdit(); updateGuiForFocus(); if (params.wireframe === 'current') applyWireframe(); }
+function onFocusChange() {
+  if (charMode) exitCharacter();
+  const b = focusBody(); syncFocusCfg(b); syncBodyEdit(); updateGuiForFocus();
+  // 浮动原点 _off 即将改变 → 所有 detailMap 行星的 render-space 位置都会变, 强制下一帧重跑 selectLOD
+  // (防止相机正好不动时 _camMoved=false 短路, 让新聚焦行星的 chunk 可见性及时校正)
+  for (const [, e] of detailMap) if (e.planet) e.planet._meshArrived = true;
+  if (params.wireframe === 'current') applyWireframe();
+}
 
 function hashSeed(str) {
   let h = 2166136261;

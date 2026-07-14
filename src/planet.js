@@ -118,6 +118,7 @@ export class Planet extends THREE.Group {
     this._camPos = [1e9, 1e9, 1e9];
     this._camMoved = true;   // 相机移动时才重算缝合步长(静止时跳过, 省开销)
     this._remainingSplits = 0;  // 本帧剩余分裂预算(限制 worker 队列瞬时暴涨)
+    this._meshArrived = false; // 自上次 selectLOD 后是否有新 mesh 回调(worker 异步完成时新 mesh.visible=wasVisible 可能是 false, 需再跑一次让 _renderLeaf 把可见性落到正确状态)
 
     this._buildNoise();
     this._buildRoots();
@@ -264,6 +265,7 @@ export class Planet extends THREE.Group {
       node.mesh = newMesh;
       node._builtKey = node._reqKey;
       if (this._wire) this._ensureWire(newMesh);
+      this._meshArrived = true;   // 新 mesh 可见性还没经 _renderLeaf 校正(可能 wasVisible=false) → 强制下次 update 跑 selectLOD
     }
     node.pending = false;
   }
@@ -282,12 +284,13 @@ export class Planet extends THREE.Group {
     const cp = _localCam.copy(lodPos).sub(this.position);
     this._camMoved = (Math.abs(cp.x - this._camPos[0]) + Math.abs(cp.y - this._camPos[1]) + Math.abs(cp.z - this._camPos[2])) > 1e-3;
     this._camPos[0] = cp.x; this._camPos[1] = cp.y; this._camPos[2] = cp.z;
-    // 短路: 追踪点静止且无在途任务 → 跳过整棵 selectLOD 遍历
-    if (!this._camMoved && this._queued === 0 && this._inflight === 0) {
+    // 短路: 追踪点静止、无在途任务、无新到达 mesh → 跳过整棵 selectLOD 遍历
+    if (!this._camMoved && this._queued === 0 && this._inflight === 0 && !this._meshArrived) {
       this.stats.queued = 0;
       this.stats.inflight = 0;
       return;
     }
+    this._meshArrived = false;
     const m = new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
     const frustum = new THREE.Frustum().setFromProjectionMatrix(m);
     this.stats.patches = 0; this.stats.triangles = 0;
