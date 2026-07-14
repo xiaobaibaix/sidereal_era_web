@@ -489,6 +489,34 @@ function updateRender() {
 const gui = new GUI();
 gui.add(params, 'G', 0.2, 8.0).name('引力常数 G').onFinishChange(rebuild);
 gui.add(params, 'timeScale', 0.0, 30.0, 0.1).name('时间流速(×倍)');
+
+// 挖掘工具(MVP): 左侧独立 lil-gui 面板, 与右侧主面板分开
+const brush = {
+  enabled: false,            // 关闭时点击 = 切焦点(原行为); 开启时点击 = 挖焦点行星
+  size: 0.05,                // 角半径(弧度, ~3°)
+  depth: 0.3,                // 挖深 0..1(×maxHeight 后是实际高度)
+  falloff: 'smooth',         // 'smooth' | 'linear' | 'sharp'
+  mode: 'dig',               // 'dig' | 'raise'(MVP 先实现 dig, raise 留接口)
+  _clearEdits: () => {
+    const b = focusBody();
+    const fe = detailMap.get(b);
+    if (fe && fe.planet) {
+      fe.planet.params.edits.length = 0;
+      fe.planet._buildNoise();
+      for (const r of fe.planet.roots) fe.planet._invalidateAffected(r, { x: 1, y: 0, z: 0 }, Math.PI);  // 全 invalidated
+      fe.planet._editPending = true;
+    }
+  },
+};
+const toolGui = new GUI({ title: '⛏ 挖掘工具' });
+toolGui.domElement.parentElement.style.left = '0px';
+toolGui.domElement.parentElement.style.right = 'auto';
+toolGui.add(brush, 'enabled').name('启用(关=切焦点)').listen();
+toolGui.add(brush, 'size', 0.005, 0.2, 0.001).name('刷子大小(角半径)');
+toolGui.add(brush, 'depth', 0.05, 1.0, 0.05).name('深度');
+toolGui.add(brush, 'falloff', ['smooth', 'linear', 'sharp']).name('边缘过渡');
+toolGui.add(brush, 'mode', ['dig', 'raise']).name('模式(暂只 dig)');
+toolGui.add(brush, '_clearEdits').name('清空所有 edits');
 gui.add(params, 'worldScale', { '×1 (演示)': 1, '×1e2': 100, '×1e3': 1000, '×1e4': 10000, '×1e5 (~1e6 米)': 100000 })
   .name('全局尺度(×S)').onChange(() => { rebuild(); frameFocus(); });
 gui.add(params, 'softening', 0.1, 20).name('软化(防奇点)').onFinishChange(() => { system.softening = params.softening * params.worldScale; });
@@ -612,6 +640,26 @@ renderer.domElement.addEventListener('pointerup', (e) => {
   if (moved > 5) return;                    // 拖动旋转, 不当点击
   _pointer.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
   _raycaster.setFromCamera(_pointer, camera);
+
+  // 挖掘工具启用时: 射线打焦点行星, 加 edit(不切焦点)
+  if (brush.enabled) {
+    const fb = focusBody();
+    const fe = fb && detailMap.get(fb);
+    if (fe && fe.planet) {
+      // 射线打 LOD planet 的所有 chunks + 海洋球
+      const targets = [fe.planet, ...(fe.ocean ? [fe.ocean] : [])];
+      const hits = _raycaster.intersectObjects(targets, true);
+      if (hits.length) {
+        const localPos = hits[0].point.clone().sub(fe.planet.position);
+        const depth = brush.mode === 'raise' ? -brush.depth : brush.depth;  // raise: 负 dig = 抬升
+        fe.planet.applyEdit(localPos, brush.size, depth, brush.falloff);
+        return;
+      }
+    }
+    return;   // 没打中也不切焦点
+  }
+
+  // 否则: 原行为(点击切焦点)
   const hits = _raycaster.intersectObjects(entries.map((en) => en.mesh), false);
   if (hits.length) {
     const e2 = entries.find((en) => en.mesh === hits[0].object);

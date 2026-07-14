@@ -72,6 +72,12 @@ export function makeTerrain(p) {
   const useClimate = p.useClimate;
   const altRange = p.climateAltRange || 1.0;
 
+  // 运行时编辑(挖掘/抬升)。snapshot 一份避免外部修改影响一致性。
+  // 每个 edit: { pos: [ux,uy,uz] 单位方向, radius: 角半径(弧度), depth: 0..1, falloff }
+  const edits = Array.isArray(p.edits) ? p.edits.map((e) => ({
+    pos: e.pos, radius: e.radius, depth: e.depth, falloff: e.falloff || 'smooth',
+  })) : [];
+
   // 可调调色板(缺省回退到原硬编码值 → 不传颜色的调用者行为不变)
   const C = {
     oceanShallow: p.colOceanShallow || [0.20, 0.45, 0.62],
@@ -111,7 +117,26 @@ export function makeTerrain(p) {
       belt = Math.pow(1 - clamp01(w.f2 - w.f1), 6);
     }
     const mountains = (mtn + belt * plate) * land;
-    return cont + mountains * mStr;
+    let h = cont + mountains * mStr;
+    // 叠加运行时 edits(挖掘/抬升): 把行星表面"按方向"打孔/起脊
+    if (edits.length > 0) {
+      const len = Math.hypot(x, y, z) || 1;
+      const ux = x / len, uy = y / len, uz = z / len;
+      for (let i = 0; i < edits.length; i++) {
+        const e = edits[i];
+        const cos = ux * e.pos[0] + uy * e.pos[1] + uz * e.pos[2];
+        if (cos <= 0) continue;                              // edit 在球的对面, 不影响
+        if (cos >= 1) { h -= e.depth; continue; }            // 正中心
+        const ang = Math.acos(cos);
+        if (ang > e.radius) continue;                        // 角距离 > 半径, 不在刷子内
+        const t = ang / e.radius;                            // 0=中心, 1=边缘
+        const fall = e.falloff === 'sharp' ? 1.0
+                    : e.falloff === 'linear' ? 1.0 - t
+                    : Math.cos(t * Math.PI * 0.5);           // smooth (cosine)
+        h -= e.depth * fall;
+      }
+    }
+    return h;
   }
 
   function colorFor(h, x, y, z) {

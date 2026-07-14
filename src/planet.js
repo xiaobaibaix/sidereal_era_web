@@ -15,6 +15,8 @@ const TERRAIN_KEYS = [
   // 可调调色板(缺省时 terrain.js 用默认色)
   'colOceanShallow', 'colOceanDeep', 'colBeach', 'colDry', 'colWet',
   'colColdDry', 'colColdWet', 'colRock', 'colSnow',
+  // 编辑列表(挖掘/抬升等运行时修改, terrain.heightAt 会叠加在噪声之上)
+  'edits',
 ];
 
 // ---- 小型数组向量工具(供邻居层级查询用, 避免大量 Vector3 分配) ----
@@ -119,6 +121,8 @@ export class Planet extends THREE.Group {
     this._camMoved = true;   // 相机移动时才重算缝合步长(静止时跳过, 省开销)
     this._remainingSplits = 0;  // 本帧剩余分裂预算(限制 worker 队列瞬时暴涨)
     this._meshArrived = false; // 自上次 selectLOD 后是否有新 mesh 回调(worker 异步完成时新 mesh.visible=wasVisible 可能是 false, 需再跑一次让 _renderLeaf 把可见性落到正确状态)
+    this._editPending = false; // 自上次 selectLOD 后是否发生 edit(applyEdit 置 true), 强制下一次 update 把受影响 chunks 重生成
+    if (!this.params.edits) this.params.edits = [];   // 运行时编辑列表(initial empty)
 
     this._buildNoise();
     this._buildRoots();
@@ -133,6 +137,38 @@ export class Planet extends THREE.Group {
 
   _buildNoise() {
     this.terrain = makeTerrain(this._terrainParams());
+  }
+
+  // ---- 运行时挖掘/抬升(MVP) ----
+  // localPos: 行星本地系坐标(planet.position == 0 时即世界坐标减 planet.position)
+  // radius: 角半径(弧度, 球面上刷子范围)
+  // depth: 0..1, 在 heightAt 中 ×maxHeight 才是实际高度
+  // falloff: 'smooth' | 'linear' | 'sharp'
+  applyEdit(localPos, radius, depth, falloff) {
+    if (!this.params.edits) this.params.edits = [];
+    const dir = localPos.clone().normalize();
+    this.params.edits.push({
+      pos: [dir.x, dir.y, dir.z],
+      radius, depth, falloff: falloff || 'smooth',
+    });
+    // 主线程 terrain 也要刷新(_buildNoise 重建闭包, heightAt 才会读到新 edits)
+    this._buildNoise();
+    // 标记受影响 chunks 失效(_builtKey=null → 下次 _renderLeaf 触发 regen)
+    for (const r of this.roots) this._invalidateAffected(r, dir, radius);
+    // 强制下一次 update 跑 selectLOD + 让 _renderLeaf 进入 regen 分支
+    this._editPending = true;
+  }
+
+  // 递归标记受 edit 影响的 chunks(角距离 < chunk 角半径 + edit 角半径 → 受影响)
+  _invalidateAffected(node, editDir, editRadius) {
+    const dot = editDir.x * node.centerDir.x + editDir.y * node.centerDir.y + editDir.z * node.centerDir.z;
+    const angDist = Math.acos(Math.max(-1, Math.min(1, dot)));
+    const chunkR = Math.acos(node.horizonCosAlpha);
+    if (angDist < chunkR + editRadius + 0.005) {       // 0.005 弧度余量(~0.3°)
+      if (node.pending) { node._cancelled = true; node.pending = false; this._cancelJob(node); }
+      node._builtKey = null;
+    }
+    if (node.children) for (const c of node.children) this._invalidateAffected(c, editDir, editRadius);
   }
 
   heightAt(x, y, z) { return this.terrain.heightAt(x, y, z); }
@@ -284,12 +320,14 @@ export class Planet extends THREE.Group {
     const cp = _localCam.copy(lodPos).sub(this.position);
     this._camMoved = (Math.abs(cp.x - this._camPos[0]) + Math.abs(cp.y - this._camPos[1]) + Math.abs(cp.z - this._camPos[2])) > 1e-3;
     this._camPos[0] = cp.x; this._camPos[1] = cp.y; this._camPos[2] = cp.z;
-    // 短路: 追踪点静止、无在途任务、无新到达 mesh → 跳过整棵 selectLOD 遍历
-    if (!this._camMoved && this._queued === 0 && this._inflight === 0 && !this._meshArrived) {
+    // 短路: 追踪点静止、无在途任务、无新到达 mesh、无 pending edit → 跳过整棵 selectLOD 遍历
+    if (!this._camMoved && this._queued === 0 && this._inflight === 0 && !this._meshArrived && !this._editPending) {
       this.stats.queued = 0;
       this.stats.inflight = 0;
       return;
     }
+    // _editPending 强制 _camMoved=true 一帧, 让 _renderLeaf 进入 regen 分支(_builtKey 已被置 null)
+    if (this._editPending) { this._camMoved = true; this._editPending = false; }
     // ====== 诊断(看完可删) ======
     if (!this._dbgLogged) {
       this._dbgLogged = true;
