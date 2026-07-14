@@ -290,6 +290,13 @@ export class Planet extends THREE.Group {
       this.stats.inflight = 0;
       return;
     }
+    // ====== 诊断(看完可删) ======
+    if (!this._dbgLogged) {
+      this._dbgLogged = true;
+      const r0 = this.roots[0];
+      console.log(`%c[planet.update 首次跑 selectLOD] ${this.params.radius > 100 ? '(solar)' : '(planet_system)'}%c R=${this.params.radius} cp=${cp.toArray()} camMoved=${this._camMoved} roots=${this.roots.length} root0.mesh=${r0.mesh ? 'Y' : 'N'} root0.centerWorld=${r0.centerWorld.toArray()}`,
+        'color:#0bf;font-weight:bold', 'color:reset');
+    }
     this._meshArrived = false;
     const m = new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse);
     const frustum = new THREE.Frustum().setFromProjectionMatrix(m);
@@ -415,6 +422,8 @@ class QNode {
     // 地平线剔除: 行星本体背面的 chunk 直接跳过(移植自 Godot quad.gd:_is_above_horizon)
     if (planet.params.horizonCulling && this._isBelowHorizon(camPos, planet)) {
       this._hideSubtree();
+      if (!planet._dbgSel) planet._dbgSel = {};
+      planet._dbgSel.belowHorizon = (planet._dbgSel.belowHorizon || 0) + 1;
       return false;
     }
     // 近处(预细分球内)不受视锥限制, 始终按距离细分 —— 避免原地环视时背后需要现补细分。
@@ -423,8 +432,15 @@ class QNode {
       // frustum 在世界系, centerWorld 是本地系 → 加 planet.position 转世界(原点时不变)
       _testSphere.center.copy(this.centerWorld).add(planet.position);
       _testSphere.radius = this.bsphere.radius + d * planet.params.frustumMargin;
-      if (!frustum.intersectsSphere(_testSphere)) { this._hideSubtree(); return true; }
+      if (!frustum.intersectsSphere(_testSphere)) {
+        this._hideSubtree();
+        if (!planet._dbgSel) planet._dbgSel = {};
+        planet._dbgSel.outOfFrustum = (planet._dbgSel.outOfFrustum || 0) + 1;
+        return true;
+      }
     }
+    if (!planet._dbgSel) planet._dbgSel = {};
+    planet._dbgSel.visible = (planet._dbgSel.visible || 0) + 1;
 
     // 滞回: 分裂/合并用不同阈值, 避免边界 churn(移植自 Godot planet.gd:_compute_lod_thresholds)
     const splitT = this.edgeLen * planet.params.splitFactor;

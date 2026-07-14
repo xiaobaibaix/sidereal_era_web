@@ -87,9 +87,38 @@ let walker = null;      // 懒创建: 首次进入时绑定当前聚焦行星的
 let charMode = false;
 function renderCam() { return (charMode && walker) ? walker.camera : camera; }
 
-// 不加环境光: 只有太阳(点光源)照亮天体 → 背向太阳的一面是暗的(真实昼夜), 不再被环境光提亮。
-const sunLight = new THREE.PointLight(0xffffff, 3.5, 0, 0);   // decay=0: 全系统可见(P1 不追求光照真实)
+// 调试用: 在 console 输入 debugPlanets() 查看每个 detail 行星的 chunk 可见性状态
+window.debugPlanets = function() {
+  console.log('%c=== detailMap 诊断 ===', 'color:#0bf;font-weight:bold');
+  console.log('camera.position:', camera.position.toArray(), 'distance:', camera.position.length());
+  console.log('focus:', params.focus, '_off:', _off.toArray());
+  for (const [b, e] of detailMap) {
+    if (!e.planet) continue;
+    const p = e.planet;
+    const chunks = [];
+    let visibleCount = 0;
+    for (const r of p.roots) {
+      const visit = (n, depth = 0) => {
+        if (n.mesh) {
+          chunks.push({ lvl: n.level, vis: n.mesh.visible, hasMesh: true });
+          if (n.mesh.visible) visibleCount++;
+        }
+        if (n.children) for (const c of n.children) visit(c, depth + 1);
+      };
+      visit(r);
+    }
+    console.log(`%c[${b.name}]%c pos=${p.position.toArray()} cp=${p._camPos} _camMoved=${p._camMoved} _queued=${p._queued} _inflight=${p._inflight} _meshArrived=${p._meshArrived} chunks(with mesh)=${chunks.length} visible=${visibleCount} selectLOD计数=${JSON.stringify(p._dbgSel || {})}`,
+      'color:#fb0;font-weight:bold', 'color:reset');
+  }
+};
+
+// 太阳点光源: 主光(衰减=0 全系统可见)。夜面靠环境光兜底, 否则行星背阳面纯黑
+// 对黑色星空背景完全不可见(聚焦后看不到行星, 必须拖动相机绕到朝阳面才能看见)。
+const sunLight = new THREE.PointLight(0xffffff, 3.5, 0, 0);
 scene.add(sunLight);
+// AmbientLight 不依赖法线方向 → 任何角度都能看见行星轮廓(法线相关的 HemisphereLight 在小角度/远距离时不够)
+const ambientLight = new THREE.AmbientLight(0xffffff, 0.35);
+scene.add(ambientLight);
 
 // 星空背景(单位球; 每帧跟随相机并缩放到 far 附近 → 任意尺度下都像无限远的天幕, 固定屏幕像素大小)
 let starField;
@@ -1214,8 +1243,8 @@ function animate() {
 
   if (charMode) walker.update(dt);   // 角色: WASD/鼠标驱动, 相机由 walker 管理
   else controls.update();
-  manageDetail();
-  updateRender();
+  // 先更新相机 near/far(在 manageDetail 之前!), 否则首帧 frustum 还用旧 far(初始 20000)剔除
+  // → 行星 chunks 全部 outOfFrustum → 之后浮动原点静止 _camMoved=false 短路 → 永远 invisible
   if (charMode) {
     // 角色模式: 动态 near/far(与轨道相机同逻辑)。walker.camera 默认 0.1/200000 比值 2M,
     // 深度精度极差 → 大气(raymarch 重建 hitPos)与海洋(depthTest 对地形)在角色移动时颤抖。
@@ -1235,8 +1264,10 @@ function animate() {
     starField.position.copy(walker.camera.position);
     starField.scale.setScalar(far * 0.9);
   } else {
-    updateCameraRange();   // 动态 near/far(在场景渲染前设好投影)
+    updateCameraRange();   // 动态 near/far(在 manageDetail 之前设好投影, 否则首帧 frustum 用旧 far 误剔除焦点行星)
   }
+  manageDetail();
+  updateRender();
 
   // 场景 → HDR RT(带深度)。角色模式下用角色相机渲染整条管线。
   const rcam = renderCam();
@@ -1352,5 +1383,18 @@ function animate() {
 restoreParams();                 // 恢复上次的 Controls 参数(localStorage) → 无需每次重调
 rebuild();                       // 用恢复后的 G/软化/全局尺度/聚焦 重建星系
 gui.controllersRecursive().forEach((c) => c.updateDisplay());   // 同步所有控件显示为恢复值
-if (params.worldScale !== 1) frameFocus();   // 恢复了非默认尺度: 重新构图, 避免相机卡进放大后的星体
+// 总是 frameFocus: 焦点恢复成行星(localStorage)时, 默认相机位 (0,1600,3800) 是给恒星用的,
+// 距离行星 ~4000 单位 → 行星只占几像素, 看起来"地形没出现"。frameFocus 把相机拉到 R×8 处。
+frameFocus();
+// ====== 启动诊断(看完可删) ======
+console.log('%c[solar_system 启动]', 'color:#0bf;font-weight:bold', {
+  focus: params.focus,
+  focusBodyRadius: focusBody()?.radius,
+  cameraPositionAfterFrameFocus: camera.position.toArray(),
+  cameraDistance: camera.position.length(),
+  detailMapSizeAtStartup: detailMap.size,
+  detailMapKeys: [...detailMap.keys()].map((b) => b.name),
+  hasAmbientLight: !!scene.children.find((c) => c.isAmbientLight),
+  hasSunLight: !!scene.children.find((c) => c.isPointLight),
+});
 animate();
