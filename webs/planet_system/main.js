@@ -1145,6 +1145,7 @@ renderer.domElement.addEventListener('pointerup', (e) => {
   if (!dir) return;
   if (exTool.mode === '选挖掘区') { excavators.setDigZone(dir, exTool.digRadius, exTool.digDepth); exTool.status = '挖掘区已设'; }
   else if (exTool.mode === '选填埋区') { excavators.setFillZone(dir, exTool.fillRadius); exTool.status = '填埋区已设'; }
+  exTool.mode = '关闭';   // 选完自动退出放置模式, 避免误点到别处再放一个
 });
 
 const exGui = new GUI({ title: '🚜 挖掘机 (自动施工)', container: bottomLeftPanels });
