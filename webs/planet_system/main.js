@@ -18,6 +18,7 @@ import { createProductionSystem } from '../../src/factory/systems/production.js'
 import { placeBuilding, demolish } from '../../src/factory/systems/placement.js';
 import { createLogisticsSystem, spawnHaulers } from '../../src/factory/systems/logistics.js';
 import { createFactoryRenderer } from '../../src/factory/render/factory_render.js';
+import { createInspector } from '../../src/factory/render/inspector.js';
 import { pick as anchorPick } from '../../src/factory/core/anchor.js';
 
 // ----------------------------------------------------------------------------
@@ -309,6 +310,9 @@ factory.addSystem('mining', createMiningSystem());
 factory.addSystem('production', createProductionSystem());  // M3: 冶炼/制造按配方产出
 factory.addSystem('logistics', createLogisticsSystem());    // M2a: 卡车按供需搬运
 const factoryRenderer = createFactoryRenderer(scene, planet, { size: 1 });
+const inspector = createInspector({ getWorld: () => factory.world, registry: factory.registry });
+const _facRay = new THREE.Raycaster();       // 点击拾取建筑/agent 用
+const _facNdc = new THREE.Vector2();
 let _facAcc = 0;               // 工厂固定步长累加器
 const FAC_FIXED = 0.05;        // 20Hz 模拟步
 
@@ -1242,9 +1246,42 @@ renderer.domElement.addEventListener('pointerup', (e) => {
     fpTool.status = '已放置仓库';
   } else if (fpTool.mode === '拆除') {
     const eid = factory.spatial.nearest(dir);
-    if (eid != null) { demolish(factory.world, factory.ctx, eid); fpTool.status = '已拆除'; }
+    if (eid != null) { if (inspector.selected() === eid) inspector.hide(); demolish(factory.world, factory.ctx, eid); fpTool.status = '已拆除'; }
   }
 });
+
+// 查看模式(未在放置/挖掘中): 点击建筑/运输车 → 弹出属性面板; 点空白 → 关闭
+let _inspDown = null;
+function inspectIdle() { return fpTool.mode === '关闭' && !brush.enabled && exTool.mode === '关闭'; }
+
+// 拾取被点的建筑/agent: 先试精确射线(能选中运输车), 再退回"点地表 → 最近建筑(角距离阈值内)", 后者更好点中。
+function pickFactoryEntity(clientX, clientY) {
+  _facNdc.set((clientX / innerWidth) * 2 - 1, -(clientY / innerHeight) * 2 + 1);
+  _facRay.setFromCamera(_facNdc, mainCam());
+  const hit = factoryRenderer.pickEntity(_facRay);
+  if (hit != null) return hit;
+  const d = anchorPick(clientX, clientY, mainCam(), planet);
+  if (!d) return null;
+  const dir = [d.x, d.y, d.z];
+  const eid = factory.spatial.nearest(dir, (e) => factory.world.has(e, 'Building'));
+  if (eid == null) return null;
+  const a = factory.world.get(eid, 'Anchor');
+  if (!a) return null;
+  const dot = dir[0] * a.dir[0] + dir[1] * a.dir[1] + dir[2] * a.dir[2];
+  const ang = Math.acos(Math.max(-1, Math.min(1, dot)));
+  return ang < 0.07 ? eid : null;   // ~4° 内算点中该建筑
+}
+
+renderer.domElement.addEventListener('pointerdown', (e) => { if (inspectIdle() && e.button === 0) _inspDown = { x: e.clientX, y: e.clientY }; });
+renderer.domElement.addEventListener('pointerup', (e) => {
+  if (!_inspDown) return;
+  const moved = Math.hypot(e.clientX - _inspDown.x, e.clientY - _inspDown.y);
+  _inspDown = null;
+  if (moved > 5 || !inspectIdle()) return;   // 拖动 = 轨道旋转
+  const eid = pickFactoryEntity(e.clientX, e.clientY);
+  if (eid != null) inspector.show(eid); else inspector.hide();
+});
+window.addEventListener('keydown', (e) => { if (e.key === 'Escape') inspector.hide(); });
 
 // 面板状态: 各类建筑数 + 全系统各资源总量(每帧刷新)
 const _oreNames = {
@@ -1295,7 +1332,9 @@ function animate() {
   _facAcc += dt;
   let _fg = 0;
   while (_facAcc >= FAC_FIXED && _fg < 5) { factory.tick(FAC_FIXED); _facAcc -= FAC_FIXED; _fg++; }
+  factoryRenderer.setSelected(inspector.selected());   // 选中建筑高亮
   factoryRenderer.update(factory.world);
+  inspector.update();                                  // 属性面板数值刷新
   updateFactoryStatus();
 
   atmoPass.uniforms.uTime.value = clock.elapsedTime;   // 云飘动(云已并入大气 pass)

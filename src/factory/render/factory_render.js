@@ -121,21 +121,25 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
     mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     for (let i = 0; i < MAX; i++) mesh.setColorAt(i, white);
     scene.add(mesh);
-    groups[name] = { mesh, geo, mat, base: new THREE.Color(BASE_COLOR[name]), count: 0 };
+    groups[name] = { mesh, geo, mat, base: new THREE.Color(BASE_COLOR[name]), count: 0, eids: [] };
   }
   const fallbackBuilding = groups.miner;
   const fallbackAgent = groups.truck;
+  const _hl = new THREE.Color(0xffffff);   // 选中高亮色
+  let selectedEid = null;
 
-  function put(g, matrix, color) {
+  function put(g, matrix, color, eid) {
     if (g.count >= MAX) return;
     g.mesh.setMatrixAt(g.count, matrix);
-    g.mesh.setColorAt(g.count, color);
+    g.mesh.setColorAt(g.count, eid === selectedEid ? _hl : color);
+    g.eids[g.count] = eid;
     g.count++;
   }
 
   return {
     groups,
     setPlanet(p) { planet = p; },
+    setSelected(eid) { selectedEid = eid; },        // 选中实体高亮(null 取消)
     update(world) {
       for (const name in groups) groups[name].count = 0;
 
@@ -150,7 +154,7 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
         let color = g.base;
         if (miner) color = minerState[miner.state] || g.base;
         else if (prod) color = producerState[prod.state] || g.base;
-        put(g, _m, color);
+        put(g, _m, color, e);
       }
 
       // agent(移动): 朝行进方向 + 卡车按状态染色
@@ -160,7 +164,7 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
         const g = groups[ag.mesh] || fallbackAgent;
         worldMatrixHeading(mv.dir, mv.fwd || mv.dir, planet, _m, size);
         const h = world.get(e, 'Hauler');
-        put(g, _m, (h && haulerState[h.state]) || g.base);
+        put(g, _m, (h && haulerState[h.state]) || g.base, e);
       }
 
       for (const name in groups) {
@@ -169,6 +173,21 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
         g.mesh.instanceMatrix.needsUpdate = true;
         if (g.mesh.instanceColor) g.mesh.instanceColor.needsUpdate = true;
       }
+    },
+    // 屏幕拾取: 用已配置好的 raycaster 命中最近的建筑/agent, 返回其实体 id(未命中 null)
+    pickEntity(raycaster) {
+      let bestEid = null, bestDist = Infinity;
+      for (const name in groups) {
+        const g = groups[name];
+        if (g.count === 0) continue;
+        const hits = raycaster.intersectObject(g.mesh, false);
+        for (const h of hits) {
+          if (h.instanceId == null || h.instanceId >= g.count) continue;
+          if (h.distance < bestDist) { bestDist = h.distance; bestEid = g.eids[h.instanceId]; }
+          break;   // hits 已按距离排序, 取该 mesh 最近的一个即可
+        }
+      }
+      return bestEid;
     },
     dispose() {
       for (const name in groups) {
