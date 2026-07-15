@@ -3,29 +3,29 @@
 import * as THREE from 'three';
 
 // 半透明海洋: 菲涅尔边缘 + 太阳漫反射 + 高光。放在海平面半径处, 陆地从中穿出。
-export const OCEAN_DRY_MAX = 8;   // 海洋"干区"遮罩最多支持的挖掘区数量(shader 数组长度)
-
 export function createOcean() {
   const uniforms = {
     uSunDir: { value: new THREE.Vector3(1, 0.6, 0.8).normalize() },
     uDeep: { value: new THREE.Color(0x0a1e3f) },
     uShallow: { value: new THREE.Color(0x2e78a8) },
     uAmbient: { value: 0.2 },   // 夜面(背向太阳)海洋的基础亮度: 0=夜面全黑(无环境光), 默认0.2保持主项目原样
-    // 干区遮罩: 陆地上的挖掘坑(xyz=单位方向, w=cos(角半径)); 该方向的海面 discard, 使陆地坑保持干燥
-    uDryZones: { value: Array.from({ length: OCEAN_DRY_MAX }, () => new THREE.Vector4(0, 0, 0, 2)) },
-    uDryCount: { value: 0 },
+    // 陆地遮罩: 陆地(原始地形高于海平面)方向不画海水 → 陆地挖坑不露海。逐顶点属性 aLand + 此开关。
+    uMaskLand: { value: 1.0 },   // 1=开(陆地不画海); 0=原行为(整层海平面球壳)
   };
   const material = new THREE.ShaderMaterial({
     uniforms,
     transparent: true,
     depthWrite: false,
     vertexShader: /* glsl */`
+      attribute float aLand;      // 1=该顶点方向天然是陆地(原始地形高于海平面)
       varying vec3 vWorldNormal;
       varying vec3 vWorldPos;
+      varying float vLand;
       void main() {
         vec4 wp = modelMatrix * vec4(position, 1.0);
         vWorldPos = wp.xyz;
         vWorldNormal = normalize(mat3(modelMatrix) * normal);
+        vLand = aLand;
         gl_Position = projectionMatrix * viewMatrix * wp;
       }
     `,
@@ -34,17 +34,13 @@ export function createOcean() {
       uniform vec3 uDeep;
       uniform vec3 uShallow;
       uniform float uAmbient;
-      uniform int uDryCount;
-      uniform vec4 uDryZones[${OCEAN_DRY_MAX}];
+      uniform float uMaskLand;
       varying vec3 vWorldNormal;
       varying vec3 vWorldPos;
+      varying float vLand;
       void main() {
-        vec3 N = normalize(vWorldNormal);   // 球面法线 = 从行星中心指向该片元的径向方向
-        // 陆地开挖坑: 该径向落在任一干区内 → 不画海水(避免坑里露出海平面球壳)
-        for (int i = 0; i < ${OCEAN_DRY_MAX}; i++) {
-          if (i >= uDryCount) break;
-          if (dot(N, uDryZones[i].xyz) > uDryZones[i].w) discard;
-        }
+        if (uMaskLand > 0.5 && vLand > 0.5) discard;   // 陆地方向不画海水(陆地挖坑不露海)
+        vec3 N = normalize(vWorldNormal);
         vec3 V = normalize(cameraPosition - vWorldPos);
         vec3 L = normalize(uSunDir);
         float fres = pow(1.0 - max(dot(N, V), 0.0), 3.0);
@@ -59,27 +55,32 @@ export function createOcean() {
       }
     `,
   });
-  const mesh = new THREE.Mesh(new THREE.SphereGeometry(1, 160, 80), material);
+  const geo = new THREE.SphereGeometry(1, 160, 80);
+  geo.setAttribute('aLand', new THREE.BufferAttribute(new Float32Array(geo.attributes.position.count), 1));   // 初始全 0(海), 由 setOceanLandMask 填充
+  const mesh = new THREE.Mesh(geo, material);
   mesh.renderOrder = 1;
   return mesh;
 }
 
-// 用行星的 edits 刷新某片海洋的"干区"遮罩: 取所有陆地上的整平挖掘区(type==='level' && dry),
-// 写进海洋 shader 的 uDryZones/uDryCount → 这些坑里不再画海水。edits 为空/无海洋时安全跳过。
-export function setOceanDryZones(ocean, edits) {
-  if (!ocean || !ocean.material || !ocean.material.uniforms.uDryZones) return;
-  const u = ocean.material.uniforms;
-  let n = 0;
-  if (Array.isArray(edits)) {
-    for (let i = 0; i < edits.length && n < OCEAN_DRY_MAX; i++) {
-      const e = edits[i];
-      if (e && e.type === 'level') {
-        u.uDryZones.value[n].set(e.pos[0], e.pos[1], e.pos[2], Math.cos(e.radius));
-        n++;
-      }
-    }
+// 用行星"原始地形(无 edits)"计算海洋的逐顶点陆地遮罩: 顶点方向天然是陆地(base >= 海平面)则 aLand=1,
+// 海洋 shader 在这些方向 discard → 陆地上(含挖出来的坑)一律不画海水; 天然海不受影响(且陆地内侧本被地形挡住)。
+// 只需在海洋创建 / 地形重建(rebuild) / 海平面变化时调用一次(与编辑数量无关, 挖机/鼠标挖掘通用)。
+export function setOceanLandMask(ocean, planet) {
+  if (!ocean || !ocean.geometry || !planet || typeof planet.baseHeightAt !== 'function') return;
+  const geo = ocean.geometry;
+  const pos = geo.attributes.position;
+  let aLand = geo.getAttribute('aLand');
+  if (!aLand || aLand.count !== pos.count) {
+    aLand = new THREE.BufferAttribute(new Float32Array(pos.count), 1);
+    geo.setAttribute('aLand', aLand);
   }
-  u.uDryCount.value = n;
+  const sea = (planet.params && planet.params.seaLevel) || 0;
+  const arr = aLand.array;
+  for (let i = 0; i < pos.count; i++) {
+    // 单位球顶点位置即方向
+    arr[i] = planet.baseHeightAt(pos.getX(i), pos.getY(i), pos.getZ(i)) >= sea ? 1 : 0;
+  }
+  aLand.needsUpdate = true;
 }
 
 // 大气(瑞利 + 米氏单次散射, 实时 raymarch) —— 深度感知的全屏后处理 pass。

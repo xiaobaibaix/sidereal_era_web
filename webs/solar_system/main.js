@@ -11,7 +11,7 @@ import { Body, NBodySystem } from './nbody.js';
 import { Planet } from '../../src/planet.js';       // 复用主项目的 LOD 地形行星(近距详细表现)
 import { PlanetWalker } from '../planet_system/character.js';   // 复用主项目的登陆行星角色控制器
 import { ExcavatorSystem } from '../../src/excavators.js';       // 挖机/卡车自动施工车队
-import { createAtmospherePass, createCloudPass, createOcean, setOceanDryZones, createGasGiant } from '../../src/effects.js';   // 复用深度感知大气 + 体积云 + 海洋
+import { createAtmospherePass, createCloudPass, createOcean, setOceanLandMask, createGasGiant } from '../../src/effects.js';   // 复用深度感知大气 + 体积云 + 海洋
 
 // ----------------------------------------------------------------------------
 // 星系配置(初始条件; 之后可纳入预设)
@@ -473,6 +473,7 @@ const brush = {
   depth: 0.3,                // 挖深 0..1(×maxHeight 后是实际高度)
   falloff: 'smooth',         // 'smooth' | 'linear' | 'sharp'
   mode: 'dig',               // 'dig' | 'raise'(MVP 先实现 dig, raise 留接口)
+  dryLand: true,             // 陆地挖坑不露海(干坑露泥土); 关=挖成"湖"(坑内保留海洋色)。逐次挖掘独立记录
   _clearEdits: () => {
     const b = focusBody();
     const fe = detailMap.get(b);
@@ -489,12 +490,19 @@ const bottomLeftPanels = document.createElement('div');
 bottomLeftPanels.style.cssText = 'position:fixed;left:8px;bottom:8px;z-index:20;display:flex;flex-direction:column;gap:6px;max-height:94vh;overflow-y:auto;';
 document.body.appendChild(bottomLeftPanels);
 
+// 挖掘启用时: 左键挖(球体不转), 右键转动球体; 关闭时恢复默认(左键转 / 右键平移)
+function applyBrushControls() {
+  if (brush.enabled) controls.mouseButtons = { LEFT: null, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.ROTATE };
+  else controls.mouseButtons = { LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.PAN };
+}
+
 const toolGui = new GUI({ title: '⛏ 挖掘工具', container: bottomLeftPanels });
-toolGui.add(brush, 'enabled').name('启用(关=切焦点)').listen();
+toolGui.add(brush, 'enabled').name('启用(左键挖/右键转)').listen().onChange(applyBrushControls);
 toolGui.add(brush, 'size', 0.005, 0.2, 0.001).name('刷子大小(角半径)');
 toolGui.add(brush, 'depth', 0.05, 1.0, 0.05).name('深度');
 toolGui.add(brush, 'falloff', ['smooth', 'linear', 'sharp']).name('边缘过渡');
 toolGui.add(brush, 'mode', ['dig', 'raise']).name('模式(dig/raise)');
+toolGui.add(brush, 'dryLand').name('陆地挖坑不露海(仅影响新挖)');
 toolGui.add({ undo: undoEdit }, 'undo').name('撤销 (Ctrl+Z)');
 toolGui.add({ redo: redoEdit }, 'redo').name('重做 (Ctrl+Shift+Z)');
 toolGui.add(brush, '_clearEdits').name('清空所有 edits');
@@ -752,7 +760,7 @@ function tryDig(force = false) {
     if (ang < brush.size * 0.4) return false;
   }
   const depth = brush.mode === 'raise' ? -brush.depth : brush.depth;
-  fe.planet.applyEdit(localPos, brush.size, depth, brush.falloff);
+  fe.planet.applyEdit(localPos, brush.size, depth, brush.falloff, brush.dryLand);
   _lastDigDir = dir;
   _redoStack.set(fb, []);   // 新 edit 清 redo
   saveEdits(fb, fe.planet);
@@ -768,7 +776,8 @@ addEventListener('wheel', (e) => {
 }, { passive: true });
 renderer.domElement.addEventListener('pointerdown', (e) => {
   _downXY = { x: e.clientX, y: e.clientY };
-  if (brush.enabled && !charMode) { _brushDown = true; _lastDigDir = null; }
+  // 只有鼠标左键(button 0)才挖; 右键留给 OrbitControls 转动球体(见 applyBrushControls)
+  if (brush.enabled && !charMode && e.button === 0) { _brushDown = true; _lastDigDir = null; }
 });
 renderer.domElement.addEventListener('pointermove', (e) => {
   _mouseNDC.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
@@ -1036,7 +1045,10 @@ function applyDetailRebuild() {
   e.planet.rebuild();
   disposeOcean(e);                       // 海洋(颜色/半径/开关可能都变了)重建
   e.ocean = makeOcean(b);
-  if (e.ocean) { e.ocean.position.copy(e.planet.position); scene.add(e.ocean); }
+  if (e.ocean) {
+    e.ocean.position.copy(e.planet.position); scene.add(e.ocean);
+    setOceanLandMask(e.ocean, e.planet);   // 陆地遮罩重算
+  }
 }
 
 // 有水的天体建一个半透明海洋球(半径=海平面处; 颜色取该天体的地形海洋色)。无水返回 null。
@@ -1072,7 +1084,10 @@ function addDetail(body) {
   const planet = new Planet(planetParamsFor(body));
   scene.add(planet);
   const ocean = makeOcean(body);       // 海洋是独立 mesh 加到 scene(不做 Planet 子节点, 因 rebuild 会 clear)
-  if (ocean) scene.add(ocean);
+  if (ocean) {
+    scene.add(ocean);
+    setOceanLandMask(ocean, planet);   // 陆地遮罩: 陆地方向不画海(陆地本就无海, 挖坑也不露海)
+  }
   const e = { planet, ocean };
   detailMap.set(body, e);
   loadEdits(body, planet);             // 从 localStorage 恢复上次挖掘
@@ -1131,7 +1146,6 @@ function manageDetail() {
       e.ocean.position.copy(e.planet.position);
       e.ocean.visible = camDistTo(b) < b.radius * ATMO_DIST;   // 近距才画水面(远处地形海洋色兜底)
       e.ocean.material.uniforms.uSunDir.value.copy(starBody.pos).sub(b.pos).normalize();
-      setOceanDryZones(e.ocean, e.planet.params.edits);        // 陆地挖掘坑不露海水
     }
   }
 }

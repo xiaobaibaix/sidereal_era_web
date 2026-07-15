@@ -8,7 +8,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
 import GUI from 'lil-gui';
 import { Planet } from '../../src/planet.js';
-import { createOcean, setOceanDryZones, createAtmospherePass, createCompositePass, createGodrayPass, createTransmittanceLUT } from '../../src/effects.js';
+import { createOcean, setOceanLandMask, createAtmospherePass, createCompositePass, createGodrayPass, createTransmittanceLUT } from '../../src/effects.js';
 import { PlanetWalker } from './character.js';
 import { ExcavatorSystem } from '../../src/excavators.js';
 
@@ -289,6 +289,7 @@ scene.add(planet);
 // 海洋(场景内) + 大气(深度感知全屏后处理, 不加入场景)
 const ocean = createOcean();
 scene.add(ocean);
+setOceanLandMask(ocean, planet);   // 陆地遮罩: 陆地方向不画海(陆地本就无海, 挖坑也不露海)
 const atmoPass = createAtmospherePass();
 
 // 自动施工: 挖掘机/运土车 车队(挖掘区 → 搬运 → 填埋区, 循环)
@@ -501,6 +502,7 @@ function rebuild() {
   controls.maxDistance = Math.max(8000, params.radius * 40);
   controls.update();
   layoutEffects();
+  setOceanLandMask(ocean, planet);   // 重新计算海洋陆地遮罩(地形/海平面变了)
 }
 
 // ----------------------------------------------------------------------------
@@ -898,6 +900,7 @@ const brush = {
   depth: 0.3,
   falloff: 'smooth',
   mode: 'dig',
+  dryLand: true,   // 陆地挖坑不露海(干坑露泥土); 关=挖成"湖"(坑内保留海洋色)。逐次挖掘独立记录
 };
 
 const _brushRaycaster = new THREE.Raycaster();
@@ -1034,15 +1037,16 @@ function tryDig(force = false) {
     if (ang < brush.size * 0.4) return false;
   }
   const depth = brush.mode === 'raise' ? -brush.depth : brush.depth;
-  planet.applyEdit(localPos, brush.size, depth, brush.falloff);
+  planet.applyEdit(localPos, brush.size, depth, brush.falloff, brush.dryLand);
   _lastDigDir = dir;
   _redoStack = [];   // 新 edit 清 redo
   saveEdits();
   return true;
 }
 
-renderer.domElement.addEventListener('pointerdown', () => {
-  if (brush.enabled && !characterMode) { _brushDown = true; _lastDigDir = null; }
+renderer.domElement.addEventListener('pointerdown', (e) => {
+  // 只有鼠标左键(button 0)才挖; 右键留给 OrbitControls 转动球体(见 applyBrushControls)
+  if (brush.enabled && !characterMode && e.button === 0) { _brushDown = true; _lastDigDir = null; }
 });
 renderer.domElement.addEventListener('pointermove', (e) => {
   _mouseNDC.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
@@ -1070,12 +1074,19 @@ const bottomLeftPanels = document.createElement('div');
 bottomLeftPanels.style.cssText = 'position:fixed;left:8px;bottom:8px;z-index:20;display:flex;flex-direction:column;gap:6px;max-height:94vh;overflow-y:auto;';
 document.body.appendChild(bottomLeftPanels);
 
+// 挖掘启用时: 左键挖(球体不转), 右键转动球体; 关闭时恢复默认(左键转 / 右键平移)
+function applyBrushControls() {
+  if (brush.enabled) controls.mouseButtons = { LEFT: null, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.ROTATE };
+  else controls.mouseButtons = { LEFT: THREE.MOUSE.ROTATE, MIDDLE: THREE.MOUSE.DOLLY, RIGHT: THREE.MOUSE.PAN };
+}
+
 const toolGui = new GUI({ title: '⛏ 挖掘工具', container: bottomLeftPanels });
-toolGui.add(brush, 'enabled').name('启用').listen();
+toolGui.add(brush, 'enabled').name('启用(左键挖/右键转)').listen().onChange(applyBrushControls);
 toolGui.add(brush, 'size', 0.005, 0.2, 0.001).name('刷子大小(角半径)');
 toolGui.add(brush, 'depth', 0.05, 1.0, 0.05).name('深度');
 toolGui.add(brush, 'falloff', ['smooth', 'linear', 'sharp']).name('边缘过渡');
 toolGui.add(brush, 'mode', ['dig', 'raise']).name('模式');
+toolGui.add(brush, 'dryLand').name('陆地挖坑不露海(仅影响新挖)');
 toolGui.add({ undo: undoEdit }, 'undo').name('撤销 (Ctrl+Z)');
 toolGui.add({ redo: redoEdit }, 'redo').name('重做 (Ctrl+Shift+Z)');
 toolGui.add({ clear: () => {
@@ -1177,7 +1188,6 @@ function animate() {
   if (characterMode) walker.update(dt);           // 角色始终更新(输入由 active 门控)
   if (brush.enabled && _digHeld && _charDigActive()) tryDig(false);   // 角色模式: 按住 F 连续挖(在 planet.update 前, 本帧即生效)
   excavators.update(dt, mainCam());               // 挖机+卡车(状态机 + 地形提交节流 + 实例矩阵 + 头顶标记)
-  setOceanDryZones(ocean, planet.params.edits);   // 陆地挖掘坑不露海水
   if (excavators.running) {
     const pct = (excavators.progress() * 100).toFixed(0);
     exTool.status = excavators.allDone()

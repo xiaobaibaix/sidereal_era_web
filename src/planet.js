@@ -15,7 +15,7 @@ const TERRAIN_KEYS = [
   // 可调调色板(缺省时 terrain.js 用默认色)
   'colOceanShallow', 'colOceanDeep', 'colBeach', 'colDry', 'colWet',
   'colColdDry', 'colColdWet', 'colRock', 'colSnow',
-  // 编辑列表(挖掘/抬升等运行时修改, terrain.heightAt 会叠加在噪声之上)
+  // 编辑列表(挖掘/抬升等运行时修改, terrain.heightAt 会叠加在噪声之上; 每条自带 dry 标记)
   'edits',
 ];
 
@@ -144,12 +144,13 @@ export class Planet extends THREE.Group {
   // radius: 角半径(弧度, 球面上刷子范围)
   // depth: 0..1, 在 heightAt 中 ×maxHeight 才是实际高度
   // falloff: 'smooth' | 'linear' | 'sharp'
-  applyEdit(localPos, radius, depth, falloff) {
+  // dry: 是否"干坑"(挖到海平面下露泥土/不显海)。默认 true; 传 false = "湖"(坑内保留海洋色)
+  applyEdit(localPos, radius, depth, falloff, dry = true) {
     if (!this.params.edits) this.params.edits = [];
     const dir = localPos.clone().normalize();
     this.params.edits.push({
       pos: [dir.x, dir.y, dir.z],
-      radius, depth, falloff: falloff || 'smooth',
+      radius, depth, falloff: falloff || 'smooth', dry,
     });
     // 主线程 terrain 也要刷新(_buildNoise 重建闭包, heightAt 才会读到新 edits)
     this._buildNoise();
@@ -172,6 +173,7 @@ export class Planet extends THREE.Group {
   }
 
   heightAt(x, y, z) { return this.terrain.heightAt(x, y, z); }
+  baseHeightAt(x, y, z) { return this.terrain.baseHeightAt(x, y, z); }   // 无 edits 的原始高度(判断天然陆/海)
   colorFor(h, x, y, z) { return this.terrain.colorFor(h, x, y, z); }
 
   displace(dir) {
