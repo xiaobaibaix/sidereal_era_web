@@ -11,6 +11,12 @@ import { Planet } from '../../src/planet.js';
 import { createOcean, setOceanLandMask, createAtmospherePass, createCompositePass, createGodrayPass, createTransmittanceLUT } from '../../src/effects.js';
 import { PlanetWalker } from './character.js';
 import { ExcavatorSystem } from '../../src/excavators.js';
+import { createFactory } from '../../src/factory/factory.js';
+import gameData from '../../src/factory/data/gamedata.js';
+import { createMiningSystem } from '../../src/factory/systems/mining.js';
+import { placeBuilding, demolish } from '../../src/factory/systems/placement.js';
+import { createFactoryRenderer } from '../../src/factory/render/factory_render.js';
+import { pick as anchorPick } from '../../src/factory/core/anchor.js';
 
 // ----------------------------------------------------------------------------
 // 参数
@@ -294,6 +300,13 @@ const atmoPass = createAtmospherePass();
 
 // 自动施工: 挖掘机/运土车 车队(挖掘区 → 搬运 → 填埋区, 循环)
 const excavators = new ExcavatorSystem(planet, scene);
+
+// 工厂系统(ECS): 采矿 → (后续)物流/生产/科技/行星发动机。M1: 采矿。
+const factory = createFactory({ planet, data: gameData });
+factory.addSystem('mining', createMiningSystem());
+const factoryRenderer = createFactoryRenderer(scene, planet, { size: 1 });
+let _facAcc = 0;               // 工厂固定步长累加器
+const FAC_FIXED = 0.05;        // 20Hz 模拟步
 
 // 场景渲染目标(带深度纹理), 供大气 pass 采样。主画面 + 小窗各一张。
 function makeSceneRT(w, h) {
@@ -1172,6 +1185,54 @@ _exApplyTuning();
 // (设区/暂停/恢复)也持久化到手动挖掘用的同一个 localStorage → 真正"一份缓存"。
 excavators.onChange = () => saveEdits();
 
+// ============================================================================
+// 工厂面板(M1: 放置/拆除采矿机)+ 点选放置
+// ============================================================================
+const fpTool = { mode: '关闭', status: '待命' };
+let _fpDown = null;
+const fpGui = new GUI({ title: '🏭 工厂', container: bottomLeftPanels });
+fpGui.add(fpTool, 'mode', ['关闭', '放置矿机', '拆除']).name('模式').listen()
+  .onChange((v) => {
+    if (v !== '关闭') {   // 进入工厂放置 → 关掉手动刷子与挖机选区, 避免抢点击
+      brush.enabled = false; applyBrushControls();
+      exTool.mode = '关闭';
+    }
+  });
+fpGui.add(fpTool, 'status').name('状态').listen().disable();
+
+renderer.domElement.addEventListener('pointerdown', (e) => { if (fpTool.mode !== '关闭' && e.button === 0) _fpDown = { x: e.clientX, y: e.clientY }; });
+renderer.domElement.addEventListener('pointerup', (e) => {
+  if (fpTool.mode === '关闭' || !_fpDown) { _fpDown = null; return; }
+  const moved = Math.hypot(e.clientX - _fpDown.x, e.clientY - _fpDown.y);
+  _fpDown = null;
+  if (moved > 5) return;   // 拖动 = 轨道旋转
+  const d = anchorPick(e.clientX, e.clientY, mainCam(), planet);
+  if (!d) return;
+  const dir = [d.x, d.y, d.z];
+  if (fpTool.mode === '放置矿机') {
+    placeBuilding(factory.world, factory.ctx, 'miner', dir);
+    fpTool.status = '已放置采矿机';
+  } else if (fpTool.mode === '拆除') {
+    const eid = factory.spatial.nearest(dir);
+    if (eid != null) { demolish(factory.world, factory.ctx, eid); fpTool.status = '已拆除'; }
+  }
+});
+
+// 面板状态: 矿机数 + 各资源总量(每帧刷新)
+const _oreNames = { overburden: '废土', stone: '石', iron_ore: '铁', copper_ore: '铜' };
+function updateFactoryStatus() {
+  const w = factory.world;
+  let miners = 0; const totals = {};
+  for (const e of w.query('Miner', 'Inventory')) {
+    miners++;
+    const inv = w.get(e, 'Inventory');
+    for (const k in inv.items) totals[k] = (totals[k] || 0) + inv.items[k];
+  }
+  if (miners === 0) { if (fpTool.mode === '关闭') fpTool.status = '待命'; return; }
+  const parts = Object.keys(totals).map((k) => `${_oreNames[k] || k}:${totals[k].toFixed(0)}`);
+  fpTool.status = `矿机${miners} · ${parts.join(' ') || '空'}`;
+}
+
 function animate() {
   requestAnimationFrame(animate);
   const dt = Math.min(clock.getDelta(), 0.05);   // 限制步长, 防止掉帧时穿地
@@ -1195,6 +1256,13 @@ function animate() {
       ? `完工 100%`
       : `施工 ${pct}% · 挖机${excavators.excavators.length} 卡车${excavators.trucks.length}`;
   }
+
+  // 工厂固定步长模拟(在 planet.update 前, 采矿的地形提交本帧即生效)
+  _facAcc += dt;
+  let _fg = 0;
+  while (_facAcc >= FAC_FIXED && _fg < 5) { factory.tick(FAC_FIXED); _facAcc -= FAC_FIXED; _fg++; }
+  factoryRenderer.update(factory.world);
+  updateFactoryStatus();
 
   atmoPass.uniforms.uTime.value = clock.elapsedTime;   // 云飘动(云已并入大气 pass)
   updateClips();                                  // 动态近/远面, 消除 z-fighting
