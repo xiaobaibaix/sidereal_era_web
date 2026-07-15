@@ -484,9 +484,12 @@ const brush = {
     }
   },
 };
-const toolGui = new GUI({ title: '⛏ 挖掘工具' });
-toolGui.domElement.parentElement.style.left = '0px';
-toolGui.domElement.parentElement.style.right = 'auto';
+// 左下角面板容器: 手动挖掘 + 挖机 两个面板都挂这里, 竖直堆叠、整体可滚动
+const bottomLeftPanels = document.createElement('div');
+bottomLeftPanels.style.cssText = 'position:fixed;left:8px;bottom:8px;z-index:20;display:flex;flex-direction:column;gap:6px;max-height:94vh;overflow-y:auto;';
+document.body.appendChild(bottomLeftPanels);
+
+const toolGui = new GUI({ title: '⛏ 挖掘工具', container: bottomLeftPanels });
 toolGui.add(brush, 'enabled').name('启用(关=切焦点)').listen();
 toolGui.add(brush, 'size', 0.005, 0.2, 0.001).name('刷子大小(角半径)');
 toolGui.add(brush, 'depth', 0.05, 1.0, 0.05).name('深度');
@@ -1505,8 +1508,7 @@ renderer.domElement.addEventListener('pointerup', (e) => {
   else if (exTool.mode === '选填埋区') { excavators.setFillZone(dir, exTool.fillRadius); exTool.status = '填埋区已设'; }
 });
 
-const exGui = new GUI({ title: '🚜 挖掘机 (自动施工)' });
-Object.assign(exGui.domElement.style, { position: 'fixed', left: '8px', right: 'auto', top: 'auto', bottom: '8px', maxHeight: '46vh', overflowY: 'auto' });
+const exGui = new GUI({ title: '🚜 挖掘机 (自动施工)', container: bottomLeftPanels });
 exGui.add(exTool, 'mode', ['关闭', '选挖掘区', '选填埋区']).name('点选模式').listen()
   .onChange((v) => { _exPickActive = (v !== '关闭'); if (_exPickActive) brush.enabled = false; });
 exGui.add(exTool, 'digRadius', 0.01, 0.25, 0.005).name('挖掘区半径');
