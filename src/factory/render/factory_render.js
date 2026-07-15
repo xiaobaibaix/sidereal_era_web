@@ -90,6 +90,11 @@ const BASE_COLOR = {
   miner: 0xc9a24a, warehouse: 0x9fb6c9, truck: 0xd9c15a,
   smelter: 0xb56a4a, assembler: 0x7f8aa0,
 };
+// 各建筑的可点击半径(世界单位, 略大于模型底座, 便于点选)。点击拾取 + 范围可视化共用同一数据。
+const MESH_PICK_R = {
+  miner: 2.6, smelter: 3.2, assembler: 3.4, warehouse: 5.2,
+};
+const DEFAULT_PICK_R = 3.0;
 
 export function createFactoryRenderer(scene, planet, opts = {}) {
   const size = opts.size || 1;
@@ -136,6 +141,30 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
     g.count++;
   }
 
+  // ---- 可点击范围可视化(切平面圆环, 半径 = 建筑 pick 半径) ----
+  const SEG = 48;
+  const ringPos = new Float32Array((SEG + 1) * 3);
+  for (let i = 0; i <= SEG; i++) {   // 单位圆在 XZ 平面(y=0), worldMatrix 会把它贴到地表切平面
+    const t = (i / SEG) * Math.PI * 2;
+    ringPos[i * 3] = Math.cos(t); ringPos[i * 3 + 1] = 0; ringPos[i * 3 + 2] = Math.sin(t);
+  }
+  const ringGeo = new THREE.BufferGeometry();
+  ringGeo.setAttribute('position', new THREE.BufferAttribute(ringPos, 3));
+  const ringMat = new THREE.LineBasicMaterial({ color: 0x5ad1ff, transparent: true, opacity: 0.9, depthTest: false, depthWrite: false });
+  const ringGroup = new THREE.Group();
+  ringGroup.visible = false;
+  ringGroup.renderOrder = 999;
+  scene.add(ringGroup);
+  const ringPool = [];
+  function ensureRings(n) {
+    while (ringPool.length < n) {
+      const l = new THREE.LineLoop(ringGeo, ringMat);
+      l.frustumCulled = false; l.matrixAutoUpdate = false; l.renderOrder = 999;
+      ringGroup.add(l); ringPool.push(l);
+    }
+  }
+  const pickR = (mesh) => MESH_PICK_R[mesh] || DEFAULT_PICK_R;
+
   return {
     groups,
     setPlanet(p) { planet = p; },
@@ -173,6 +202,35 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
         g.mesh.instanceMatrix.needsUpdate = true;
         if (g.mesh.instanceColor) g.mesh.instanceColor.needsUpdate = true;
       }
+
+      // 可点击范围圆环(仅在开启时): 每个建筑一个环, 半径 = 其 pick 半径
+      if (ringGroup.visible) {
+        let i = 0;
+        for (const e of world.query('Building', 'Anchor')) {
+          const a = world.get(e, 'Anchor');
+          const b = world.get(e, 'Building');
+          ensureRings(i + 1);
+          worldMatrix(a.dir, 0, planet, _m, pickR(b.mesh));
+          ringPool[i].matrix.copy(_m);
+          ringPool[i].visible = true;
+          i++;
+        }
+        for (; i < ringPool.length; i++) ringPool[i].visible = false;
+      }
+    },
+    showPickRanges(on) { ringGroup.visible = !!on; },
+    // 按方向精确拾取建筑: 只命中"点击方向落在其 pick 圆环内"的建筑, 取最近的一个(未命中 null)
+    pickBuilding(world, dir) {
+      const R = planet.params.radius;
+      let best = null, bestDot = -2;
+      for (const e of world.query('Building', 'Anchor')) {
+        const a = world.get(e, 'Anchor');
+        const b = world.get(e, 'Building');
+        const cosR = Math.cos(pickR(b.mesh) / R);   // 世界半径 → 角半径
+        const dot = dir[0] * a.dir[0] + dir[1] * a.dir[1] + dir[2] * a.dir[2];
+        if (dot >= cosR && dot > bestDot) { bestDot = dot; best = e; }
+      }
+      return best;
     },
     // 屏幕拾取: 用已配置好的 raycaster 命中最近的建筑/agent, 返回其实体 id(未命中 null)
     pickEntity(raycaster) {
@@ -194,6 +252,7 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
         const g = groups[name];
         scene.remove(g.mesh); g.geo.dispose(); g.mat.dispose();
       }
+      scene.remove(ringGroup); ringGeo.dispose(); ringMat.dispose();
     },
   };
 }

@@ -1196,7 +1196,7 @@ excavators.onChange = () => saveEdits();
 // ============================================================================
 // 工厂面板(M1: 放置/拆除采矿机)+ 点选放置
 // ============================================================================
-const fpTool = { mode: '关闭', haulerCount: 3, spawnHaulers() { doSpawnHaulers(); }, status: '待命' };
+const fpTool = { mode: '关闭', haulerCount: 3, spawnHaulers() { doSpawnHaulers(); }, showRanges: false, status: '待命' };
 let _fpDown = null;
 const fpGui = new GUI({ title: '🏭 工厂', container: bottomLeftPanels });
 fpGui.add(fpTool, 'mode', ['关闭', '放置矿机', '放置冶炼炉', '放置制造台', '放置仓库', '拆除']).name('模式').listen()
@@ -1208,6 +1208,7 @@ fpGui.add(fpTool, 'mode', ['关闭', '放置矿机', '放置冶炼炉', '放置�
   });
 fpGui.add(fpTool, 'haulerCount', 1, 20, 1).name('运输车数量');
 fpGui.add(fpTool, 'spawnHaulers').name('生成运输车');
+fpGui.add(fpTool, 'showRanges').name('显示可点击范围').onChange((v) => factoryRenderer.showPickRanges(v));
 fpGui.add(fpTool, 'status').name('状态').listen().disable();
 
 // 在首个矿机方向(否则第一个仓库, 否则 [0,1,0])附近生成一批卡车
@@ -1254,22 +1255,17 @@ renderer.domElement.addEventListener('pointerup', (e) => {
 let _inspDown = null;
 function inspectIdle() { return fpTool.mode === '关闭' && !brush.enabled && exTool.mode === '关闭'; }
 
-// 拾取被点的建筑/agent: 先试精确射线(能选中运输车), 再退回"点地表 → 最近建筑(角距离阈值内)", 后者更好点中。
+// 拾取被点的建筑/agent: 先按地表方向精确命中"点击落在其圆环内"的建筑(与可视化范围一致),
+// 再退回射线(可点中运输车)。不再用宽松角阈值, 点选更精确。
 function pickFactoryEntity(clientX, clientY) {
+  const d = anchorPick(clientX, clientY, mainCam(), planet);
+  if (d) {
+    const b = factoryRenderer.pickBuilding(factory.world, [d.x, d.y, d.z]);
+    if (b != null) return b;
+  }
   _facNdc.set((clientX / innerWidth) * 2 - 1, -(clientY / innerHeight) * 2 + 1);
   _facRay.setFromCamera(_facNdc, mainCam());
-  const hit = factoryRenderer.pickEntity(_facRay);
-  if (hit != null) return hit;
-  const d = anchorPick(clientX, clientY, mainCam(), planet);
-  if (!d) return null;
-  const dir = [d.x, d.y, d.z];
-  const eid = factory.spatial.nearest(dir, (e) => factory.world.has(e, 'Building'));
-  if (eid == null) return null;
-  const a = factory.world.get(eid, 'Anchor');
-  if (!a) return null;
-  const dot = dir[0] * a.dir[0] + dir[1] * a.dir[1] + dir[2] * a.dir[2];
-  const ang = Math.acos(Math.max(-1, Math.min(1, dot)));
-  return ang < 0.07 ? eid : null;   // ~4° 内算点中该建筑
+  return factoryRenderer.pickEntity(_facRay);
 }
 
 renderer.domElement.addEventListener('pointerdown', (e) => { if (inspectIdle() && e.button === 0) _inspDown = { x: e.clientX, y: e.clientY }; });
