@@ -789,11 +789,11 @@ renderer.domElement.addEventListener('pointerup', (e) => {
   // brush 启用 + 单击(非拖动): 挖一次
   if (brush.enabled) { tryDig(true); return; }
 
-  // 否则: 原行为(切焦点)
+  // 否则: 原行为(切焦点)。已锁定的天体再点击 → 忽略(避免重复锁定把相机拉回 R×8)
   const hits = _raycaster.intersectObjects(entries.map((en) => en.mesh), false);
   if (hits.length) {
     const e2 = entries.find((en) => en.mesh === hits[0].object);
-    if (e2) setFocus(e2.body);
+    if (e2 && e2.body !== focusBody()) setFocus(e2.body);
   }
 });
 
@@ -1288,7 +1288,7 @@ fPre.add({ f: () => savePreset() }, 'f').name('▸ 保存当前行星为预设')
 refreshPresetDropdown();
 fPre.add({ f: () => deletePreset() }, 'f').name('删除选中预设');
 fPre.add({ f: () => exportCfg() }, 'f').name('导出当前配置(下载 .json)');
-fPre.add({ f: () => importCfg() }, 'f').name('导入配置(上传 → 当前行星)');
+fPre.add({ f: () => importCfg() }, 'f').name('导入配置(.json, 兼容 planet_system)');
 
 function refreshPresetDropdown() {
   const names = Object.keys(store.presets);
@@ -1338,7 +1338,29 @@ function exportCfg() {
   a.click();
   URL.revokeObjectURL(url);
 }
-// 从 .json 文件导入配置到当前聚焦行星(同样保留本行星种子)
+// 把 planet_system 导出的"扁平 params"转成太阳系 cfg(地形/LOD/颜色; atm/cloud 沿用当前行星的)。
+// planet_system 用绝对 maxHeight/nearRadius, 太阳系用相对 body.radius 的比例, 这里做换算。
+// 单顶层种子架构下无法与源行星逐位一致, 但频率/强度/海平面/颜色一致, 风格相同; 用源 continentSeed 尽量贴近形状。
+function planetSystemToCfg(p, baseCfg) {
+  const cfg = JSON.parse(JSON.stringify(baseCfg));   // 保留 atm / cloud / gas 等太阳系专有字段
+  const t = cfg.tune;
+  const R = p.radius || 100;
+  t.gas = false;                                     // planet_system 是地形行星
+  if (p.maxHeight != null) t.maxHeightFrac = p.maxHeight / R;
+  if (p.nearRadius != null) t.nearRadiusFrac = p.nearRadius / R;
+  const copy = ['seaLevel', 'maxLevel', 'splitFactor', 'patchResolution', 'frustumMargin', 'splitBudget',
+    'mergeHysteresis', 'horizonCulling', 'continentFreq', 'continentOctaves', 'mountainFreq',
+    'mountainStrength', 'warpStrength', 'plateStrength', 'useClimate'];
+  for (const k of copy) if (p[k] != null) t[k] = p[k];
+  const cols = ['colOceanShallow', 'colOceanDeep', 'colBeach', 'colDry', 'colWet', 'colColdDry', 'colColdWet', 'colRock', 'colSnow'];
+  for (const c of cols) if (Array.isArray(p[c])) t[c] = p[c].slice();
+  if (p.continentSeed != null) t.seed = p.continentSeed | 0;
+  return cfg;
+}
+
+// 从 .json 文件导入配置到当前聚焦行星。同时兼容:
+//   - 太阳系原生格式({tune, atm, cloud}) → 保留本行星种子;
+//   - planet_system 扁平格式(顶层含 continentFreq/maxHeight 等) → 自动换算, 用源种子。
 function importCfg() {
   const inp = document.createElement('input');
   inp.type = 'file'; inp.accept = 'application/json,.json';
@@ -1348,11 +1370,19 @@ function importCfg() {
     const r = new FileReader();
     r.onload = () => {
       try {
-        const cfg = JSON.parse(r.result);
+        const raw = JSON.parse(r.result);
         const b = focusBody();
-        if (!b || !cfg.tune) throw new Error('配置缺少 tune 字段');
-        const keepSeed = (b.cfg && b.cfg.tune.seed != null) ? b.cfg.tune.seed : hashSeed(b.name);
-        cfg.tune.seed = keepSeed;
+        if (!b) throw new Error('请先聚焦一颗行星');
+        let cfg;
+        if (raw && raw.tune) {                       // 太阳系原生格式: 保留本行星种子
+          cfg = raw;
+          const keepSeed = (b.cfg && b.cfg.tune.seed != null) ? b.cfg.tune.seed : hashSeed(b.name);
+          cfg.tune.seed = keepSeed;
+        } else if (raw && (raw.continentFreq != null || raw.continentSeed != null || raw.maxHeight != null)) {
+          cfg = planetSystemToCfg(raw, ensureCfg(b));   // planet_system 扁平格式 → 换算
+        } else {
+          throw new Error('无法识别的配置格式(既非太阳系 cfg 也非 planet_system 参数)');
+        }
         b.cfg = cfg;
         editingBody = b;
         cfgRestore(cfg);

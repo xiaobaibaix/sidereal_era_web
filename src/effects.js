@@ -73,7 +73,7 @@ export function setOceanDryZones(ocean, edits) {
   if (Array.isArray(edits)) {
     for (let i = 0; i < edits.length && n < OCEAN_DRY_MAX; i++) {
       const e = edits[i];
-      if (e && e.type === 'level' && e.dry) {
+      if (e && e.type === 'level') {
         u.uDryZones.value[n].set(e.pos[0], e.pos[1], e.pos[2], Math.cos(e.radius));
         n++;
       }

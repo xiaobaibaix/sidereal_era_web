@@ -79,9 +79,12 @@ export function makeTerrain(p) {
   const edits = Array.isArray(p.edits) ? p.edits.map((e) => ({
     type: e.type || 'sub',
     pos: e.pos, radius: e.radius,
-    depth: e.depth, level: e.level, progress: e.progress,
+    depth: e.depth, level: e.level, progress: e.progress, dry: e.dry,
     falloff: e.falloff || 'smooth',
   })) : [];
+  // 开挖坑(level 整平编辑): 坑内即便挖到海平面以下, 也露泥土/岩石而非海洋色。预算 cos(角半径)。
+  const dryEdits = edits.filter((e) => e.type === 'level').map((e) => ({ pos: e.pos, cosR: Math.cos(e.radius) }));
+  const DUG_COLOR = p.colDug || [0.34, 0.27, 0.19];   // 开挖坑底泥土色
 
   // 可调调色板(缺省回退到原硬编码值 → 不传颜色的调用者行为不变)
   const C = {
@@ -157,6 +160,15 @@ export function makeTerrain(p) {
   function colorFor(h, x, y, z) {
     // 海洋: 深浅水渐变
     if (h < sea) {
+      // 若落在陆地开挖坑内 → 露出泥土(即便挖到海平面下也不是海)
+      if (dryEdits.length) {
+        const len = Math.hypot(x, y, z) || 1;
+        const ux = x / len, uy = y / len, uz = z / len;
+        for (let i = 0; i < dryEdits.length; i++) {
+          const e = dryEdits[i];
+          if (ux * e.pos[0] + uy * e.pos[1] + uz * e.pos[2] >= e.cosR) return DUG_COLOR;
+        }
+      }
       const d = clamp01((sea - h) / 0.3);
       return lerp3(C.oceanShallow, C.oceanDeep, d);
     }
