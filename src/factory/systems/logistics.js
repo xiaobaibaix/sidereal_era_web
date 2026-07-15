@@ -46,6 +46,15 @@ function nearestProviderWith(world, item, fromDir, exclude) {
   return best;
 }
 
+// 系统中是否有任何生产建筑消费该物品(有消费者的物品不该被搬进仓库囤死)
+function anyRequesterWants(world, item) {
+  for (const e of world.query('Requester')) {
+    const req = world.get(e, 'Requester');
+    if (req.needs && req.needs[item] > 0) return true;
+  }
+  return false;
+}
+
 // item 的目的地: 优先"仍需该物品且有空位的 Requester", 否则"有空位的 Storage"; 就近。
 function sinkForItem(world, item, fromDir) {
   let best = null, bd = -2;
@@ -80,11 +89,18 @@ function findJob(world, fromDir) {
       if (P != null) return { source: P, sink: R, item };
     }
   }
-  // 2) 余量归仓: 供应方有货 且 有仓库(或仍缺货的需求方)可收
+  // 2) 余量归仓: 只搬"没有任何生产建筑消费"的物品(废料/成品)进仓库。
+  //    被消费的物品(如矿石/中间件)绝不进仓囤死 —— 留在供应方等需求路由(步骤1)取用, 供应方满了自会限产。
   for (const P of world.query('Provider', 'Inventory', 'Anchor')) {
     const pr = world.get(P, 'Provider');
     const pinv = world.get(P, 'Inventory');
-    const item = offeredItem(pr, pinv);
+    let item = null;
+    for (const it in pinv.items) {
+      if (pinv.items[it] <= 1e-6) continue;
+      if (pr.items !== '*' && !(Array.isArray(pr.items) && pr.items.includes(it))) continue;
+      if (anyRequesterWants(world, it)) continue;   // 有消费者 → 不进仓
+      item = it; break;
+    }
     if (!item) continue;
     const S = sinkForItem(world, item, fromDir);
     if (S != null && S !== P) return { source: P, sink: S, item };
@@ -121,14 +137,21 @@ function stepHauler(world, dt, ctx, e, reg, R, loadRate) {
     case 'load': {
       if (h.source == null || !world.alive(h.source)) { h.state = h.cargoAmt > 0 ? 'to_sink' : 'idle'; return; }
       const inv = world.get(h.source, 'Inventory');
-      const room = cap - h.cargoAmt;
-      if (room <= 1e-6) { toSink(world, h, mv); return; }
+      // 装载上限: 车厢余量; 若目的地是需求方, 只装"补到目标所差的量"(避免把 100 全倒进只要 12 的机器)
+      let limit = cap - h.cargoAmt;
+      const sinkReq = h.sink != null && world.alive(h.sink) ? world.get(h.sink, 'Requester') : null;
+      if (sinkReq && sinkReq.needs && sinkReq.needs[h.item] != null) {
+        const sinkInv = world.get(h.sink, 'Inventory');
+        const gap = sinkReq.needs[h.item] - (sinkInv.items[h.item] || 0) - h.cargoAmt;
+        limit = Math.min(limit, Math.max(0, gap));
+      }
+      if (limit <= 1e-6) { if (h.cargoAmt > 0) toSink(world, h, mv); else h.state = 'idle'; return; }   // 需求方已够: 有货则送, 空车则重新派活
       const avail = inv.items[h.item] || 0;
       if (avail <= 1e-6) {   // 源没这个物品了
         if (h.cargoAmt > 0) toSink(world, h, mv); else h.state = 'idle';
         return;
       }
-      const take = Math.min(loadRate * dt, room, avail);
+      const take = Math.min(loadRate * dt, limit, avail);
       h.cargoAmt += invTake(inv, h.item, take); h.cargoItem = h.item;
       if (h.cargoAmt >= cap - 1e-6) toSink(world, h, mv);
       return;
@@ -141,11 +164,13 @@ function stepHauler(world, dt, ctx, e, reg, R, loadRate) {
     }
     case 'unload': {
       if (h.sink == null || !world.alive(h.sink)) { h.state = 'idle'; return; }
+      if (!h.cargoItem || h.cargoAmt <= 1e-6) { h.cargoAmt = 0; h.cargoItem = null; h.item = null; h.state = 'idle'; return; }  // 空车/无货 → 不写库存
       const inv = world.get(h.sink, 'Inventory');
       const space = invSpace(inv);
       if (space <= 1e-6) return;   // 目的地满, 等
       const put = Math.min(loadRate * dt, h.cargoAmt, space);
-      invAdd(inv, h.cargoItem, put); h.cargoAmt -= put;
+      if (put > 0) invAdd(inv, h.cargoItem, put);
+      h.cargoAmt -= put;
       if (h.cargoAmt <= 1e-6) { h.cargoAmt = 0; h.cargoItem = null; h.item = null; h.state = 'idle'; }
       return;
     }

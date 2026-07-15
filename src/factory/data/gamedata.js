@@ -24,12 +24,12 @@ export const recipes = {
 // 带 noise 的层: 该方向噪声 < threshold 时退回 fallback(即那里没这种矿, 挖到的是石头)。
 // hardness: 需要 machineType.hardnessMax >= 此值才挖得动(科技/机种进阶 gate)。
 export const ore = {
-  fallback: 'stone',
+  fallback: 'iron_ore',   // 缺省到处都有铁 → 任意点位挖开表土后都能持续供矿(冶炼不断供)
   layers: [
-    { item: 'overburden', d: [0.0, 0.12], hardness: 1 },                                              // 表土
-    { item: 'iron_ore', d: [0.12, 0.5], hardness: 2, noise: { freq: 1.0, seed: 11, threshold: 0.45 }, fallback: 'stone' },
-    { item: 'copper_ore', d: [0.5, 0.9], hardness: 3, noise: { freq: 1.3, seed: 23, threshold: 0.50 }, fallback: 'stone' },
-    { item: 'stone', d: [0.9, 3.0], hardness: 3 },                                                     // 深层基岩(硬)
+    { item: 'overburden', d: [0.0, 0.06], hardness: 1 },                                              // 薄表土(快速剥离)
+    { item: 'iron_ore', d: [0.06, 0.8], hardness: 1 },                                                 // 浅层铁矿(遍布); mk1 挖到 0.8 后在此持续产铁
+    { item: 'copper_ore', d: [0.8, 1.6], hardness: 3, noise: { freq: 1.1, seed: 23, threshold: 0.5 }, fallback: 'iron_ore' },  // 铜脉(成片), 需 mk2(hardnessMax≥3)
+    { item: 'stone', d: [1.6, 3.0], hardness: 3 },                                                     // 深层基岩(需 mk2)
   ],
 };
 

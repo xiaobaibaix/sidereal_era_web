@@ -51,7 +51,7 @@ for (let i = 0; i < 400 && !ironDir; i++) {
 }
 assert.ok(ironDir, '应能找到含铁方向');
 
-// ---- 采矿: 先出废土 → 挖到铁矿; 硬度阻挡在铜层(hardness3 > mk1 的 2)----
+// ---- 采矿: 先出废土 → 挖到铁矿 → 到极限深度(铜层 hardness3 > mk1 的 2)后转"持续开采"----
 {
   const planet = stubPlanet();
   const ctx = makeCtx(planet);
@@ -63,28 +63,30 @@ assert.ok(ironDir, '应能找到含铁方向');
   const sys = createMiningSystem({ commitEvery: 0.15 });
   world.addSystem('mining', sys);
 
-  // 挖一小会儿(应在表土层) → 有 overburden
-  for (let i = 0; i < 20; i++) world.tick(0.05, ctx);   // 1s, digRate0.05 → dug~0.05 < 0.12 表土
+  // 挖一小会儿(应在表土层[0,0.06]) → 有 overburden, 还没到铁
+  for (let i = 0; i < 20; i++) world.tick(0.05, ctx);   // 1s, digRate0.05 → dug~0.05 < 0.06 表土
   const inv = world.get(e, 'Inventory');
   assert.ok((inv.items.overburden || 0) > 0, '先产出废土');
   assert.ok(!inv.items.iron_ore, '此时还没挖到铁');
 
-  // 继续挖到铁层(dug 越过 0.12)
+  // 继续挖到铁层(dug 越过 0.06)
   for (let i = 0; i < 120; i++) world.tick(0.05, ctx);
   assert.ok((inv.items.iron_ore || 0) > 0, '挖到铁矿层出铁');
 
-  // 一直挖 → 到铜层(0.5, hardness3)被卡住, state=blocked, dugDepth 停在 ~0.5
+  // 一直挖 → 到极限深度 0.8(铜层 hardness3 挖不动), 之后"啃宽矿坑"持续产铁(不再枯竭/blocked)
   for (let i = 0; i < 400; i++) world.tick(0.05, ctx);
   const m = world.get(e, 'Miner');
-  // 若没满仓, 应被硬度卡在铜层
   if (invTotal(inv) < inv.cap) {
-    assert.equal(m.state, 'blocked', '铜层太硬 mk1 挖不动');
-    assert.ok(m.dugDepth >= 0.5 - 1e-3 && m.dugDepth < 0.55, 'dugDepth 卡在铜层上沿');
+    assert.equal(m.state, 'mining', '到极限深度后持续开采, 不 blocked');
+    assert.ok(m.dugDepth >= 0.8 - 1e-6 && m.dugDepth <= 0.8 + 1e-6, 'dugDepth 停在可挖极限 0.8');
+    const before = inv.items.iron_ore || 0;
+    for (let i = 0; i < 40; i++) world.tick(0.05, ctx);
+    assert.ok((inv.items.iron_ore || 0) > before, '持续产出铁矿(可持续)');
   }
-  // 地形坑 edit 深度随挖掘增长
+  // 地形坑 edit 深度随挖掘增长(到极限后不再变深)
   assert.ok(ctx.minerEdits.get(e).depth > 0.1, '坑变深了');
   assert.ok(planet._built > 0, '地形提交被节流触发过');
-  ok('采矿: 废土→铁矿→铜层硬度阻挡 + 坑加深');
+  ok('采矿: 废土→铁矿→极限深度持续开采 + 坑加深');
 }
 
 // ---- 满仓停挖 ----
