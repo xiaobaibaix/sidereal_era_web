@@ -21,6 +21,9 @@ export function placeBuilding(world, ctx, buildingId, dir, yaw = 0) {
       if (!ctx.minerEdits) ctx.minerEdits = new Map();
       ctx.minerEdits.set(e, edit);
     }
+  } else if (b.kind === 'storage') {
+    world.add(e, 'Storage', {});
+    world.add(e, 'Inventory', { items: {}, cap: b.cap != null ? b.cap : Infinity });
   }
 
   if (bus) bus.emit('build', { eid: e, buildingId });

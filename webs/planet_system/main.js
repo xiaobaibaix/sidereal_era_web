@@ -15,6 +15,7 @@ import { createFactory } from '../../src/factory/factory.js';
 import gameData from '../../src/factory/data/gamedata.js';
 import { createMiningSystem } from '../../src/factory/systems/mining.js';
 import { placeBuilding, demolish } from '../../src/factory/systems/placement.js';
+import { createLogisticsSystem, spawnHaulers } from '../../src/factory/systems/logistics.js';
 import { createFactoryRenderer } from '../../src/factory/render/factory_render.js';
 import { pick as anchorPick } from '../../src/factory/core/anchor.js';
 
@@ -304,6 +305,7 @@ const excavators = new ExcavatorSystem(planet, scene);
 // 工厂系统(ECS): 采矿 → (后续)物流/生产/科技/行星发动机。M1: 采矿。
 const factory = createFactory({ planet, data: gameData });
 factory.addSystem('mining', createMiningSystem());
+factory.addSystem('logistics', createLogisticsSystem());   // M2a: 卡车在矿机↔仓库间搬运
 const factoryRenderer = createFactoryRenderer(scene, planet, { size: 1 });
 let _facAcc = 0;               // 工厂固定步长累加器
 const FAC_FIXED = 0.05;        // 20Hz 模拟步
@@ -1188,17 +1190,32 @@ excavators.onChange = () => saveEdits();
 // ============================================================================
 // 工厂面板(M1: 放置/拆除采矿机)+ 点选放置
 // ============================================================================
-const fpTool = { mode: '关闭', status: '待命' };
+const fpTool = { mode: '关闭', haulerCount: 3, spawnHaulers() { doSpawnHaulers(); }, status: '待命' };
 let _fpDown = null;
 const fpGui = new GUI({ title: '🏭 工厂', container: bottomLeftPanels });
-fpGui.add(fpTool, 'mode', ['关闭', '放置矿机', '拆除']).name('模式').listen()
+fpGui.add(fpTool, 'mode', ['关闭', '放置矿机', '放置仓库', '拆除']).name('模式').listen()
   .onChange((v) => {
     if (v !== '关闭') {   // 进入工厂放置 → 关掉手动刷子与挖机选区, 避免抢点击
       brush.enabled = false; applyBrushControls();
       exTool.mode = '关闭';
     }
   });
+fpGui.add(fpTool, 'haulerCount', 1, 20, 1).name('运输车数量');
+fpGui.add(fpTool, 'spawnHaulers').name('生成运输车');
 fpGui.add(fpTool, 'status').name('状态').listen().disable();
+
+// 在首个矿机方向(否则第一个仓库, 否则 [0,1,0])附近生成一批卡车
+function doSpawnHaulers() {
+  let nearDir = [0, 1, 0];
+  const firstMiner = factory.world.query('Miner', 'Anchor').next().value;
+  if (firstMiner != null) { const a = factory.world.get(firstMiner, 'Anchor'); nearDir = [...a.dir]; }
+  else {
+    const firstWh = factory.world.query('Storage', 'Anchor').next().value;
+    if (firstWh != null) { const a = factory.world.get(firstWh, 'Anchor'); nearDir = [...a.dir]; }
+  }
+  spawnHaulers(factory.world, factory.ctx, fpTool.haulerCount, 'hauler_mk1', nearDir);
+  fpTool.status = `已生成 ${fpTool.haulerCount} 辆运输车`;
+}
 
 renderer.domElement.addEventListener('pointerdown', (e) => { if (fpTool.mode !== '关闭' && e.button === 0) _fpDown = { x: e.clientX, y: e.clientY }; });
 renderer.domElement.addEventListener('pointerup', (e) => {
@@ -1212,6 +1229,9 @@ renderer.domElement.addEventListener('pointerup', (e) => {
   if (fpTool.mode === '放置矿机') {
     placeBuilding(factory.world, factory.ctx, 'miner', dir);
     fpTool.status = '已放置采矿机';
+  } else if (fpTool.mode === '放置仓库') {
+    placeBuilding(factory.world, factory.ctx, 'warehouse', dir);
+    fpTool.status = '已放置仓库';
   } else if (fpTool.mode === '拆除') {
     const eid = factory.spatial.nearest(dir);
     if (eid != null) { demolish(factory.world, factory.ctx, eid); fpTool.status = '已拆除'; }
@@ -1228,9 +1248,17 @@ function updateFactoryStatus() {
     const inv = w.get(e, 'Inventory');
     for (const k in inv.items) totals[k] = (totals[k] || 0) + inv.items[k];
   }
-  if (miners === 0) { if (fpTool.mode === '关闭') fpTool.status = '待命'; return; }
+  // 仓库存量并入总量; 统计仓库/卡车数
+  let warehouses = 0;
+  for (const e of w.query('Storage', 'Inventory')) {
+    warehouses++;
+    const inv = w.get(e, 'Inventory');
+    for (const k in inv.items) totals[k] = (totals[k] || 0) + inv.items[k];
+  }
+  const haulers = w.count('Hauler');
+  if (miners === 0 && warehouses === 0 && haulers === 0) { if (fpTool.mode === '关闭') fpTool.status = '待命'; return; }
   const parts = Object.keys(totals).map((k) => `${_oreNames[k] || k}:${totals[k].toFixed(0)}`);
-  fpTool.status = `矿机${miners} · ${parts.join(' ') || '空'}`;
+  fpTool.status = `矿${miners} 仓${warehouses} 车${haulers} · ${parts.join(' ') || '空'}`;
 }
 
 function animate() {

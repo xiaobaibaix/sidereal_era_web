@@ -29,6 +29,27 @@ export function worldMatrix(dir, yaw, planet, outMatrix, scale = 1) {
   return outMatrix;
 }
 
+// 移动 agent 的世界矩阵: up=径向 dir, forward=fwd 投影到切平面(行进朝向), right=up×forward。
+// fwd 可为任意方向(会去掉径向分量并归一); 若 fwd 与 dir 共线则退回任意切向。
+export function worldMatrixHeading(dir, fwd, planet, outMatrix, scale = 1) {
+  _n.set(dir[0] !== undefined ? dir[0] : dir.x, dir[1] !== undefined ? dir[1] : dir.y, dir[2] !== undefined ? dir[2] : dir.z).normalize();
+  _f.set(fwd[0] !== undefined ? fwd[0] : fwd.x, fwd[1] !== undefined ? fwd[1] : fwd.y, fwd[2] !== undefined ? fwd[2] : fwd.z);
+  _f.addScaledVector(_n, -_f.dot(_n));       // 去掉径向分量 → 落到切平面
+  if (_f.lengthSq() < 1e-12) {               // fwd 与 dir 共线 → 取任意切向
+    if (Math.abs(_n.y) < 0.99) _t1.set(0, 1, 0); else _t1.set(1, 0, 0);
+    _f.crossVectors(_t1, _n);
+  }
+  _f.normalize();
+  _r.crossVectors(_n, _f).normalize();
+  outMatrix.makeBasis(_r, _n, _f);           // x=right, y=up(径向), z=forward
+  if (scale !== 1) outMatrix.scale(_scale.set(scale, scale, scale));
+  const p = planet.params;
+  const rr = p.radius + planet.heightAt(_n.x, _n.y, _n.z) * p.maxHeight;
+  _pos.copy(_n).multiplyScalar(rr).add(planet.position);
+  outMatrix.setPosition(_pos);
+  return outMatrix;
+}
+
 // 地表落地半径(供放置/碰撞用)
 export function groundRadius(dir, planet) {
   const p = planet.params;

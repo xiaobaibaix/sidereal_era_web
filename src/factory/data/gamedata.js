@@ -25,10 +25,13 @@ export const ore = {
 export const machineTypes = {
   // kind=miner: 驻扎啃地形; digRate=每秒挖深(depth 单位); hardnessMax=可挖硬度; yield=每 depth 单位产出数量
   miner_mk1: { kind: 'miner', mesh: 'miner', tier: 1, digRate: 0.05, hardnessMax: 2, yield: 100, power: 30 },
+  // kind=hauler: 卡车 agent, 在矿机↔仓库间搬运; speed=表面速度; cap=运力
+  hauler_mk1: { kind: 'hauler', mesh: 'truck', tier: 1, speed: 22, cap: 100, power: 10 },
 };
 
 export const buildings = {
   miner: { name: '采矿机 Mk1', kind: 'miner', machine: 'miner_mk1', mesh: 'miner', digRadius: 0.03, cap: 500 },
+  warehouse: { name: '仓库', kind: 'storage', mesh: 'warehouse', cap: 5000 },
 };
 
 export const gameData = { items, ore, machineTypes, buildings };
