@@ -78,21 +78,50 @@ function buildAssemblerGeometry() {
   return geo;
 }
 
+// 矿场: 宽大的敞口料仓(比其它建筑大, 象征矿石堆场) + 底座圈
+function buildDepotGeometry() {
+  const parts = [];
+  const push = (g, x, y, z) => { g.translate(x, y, z); parts.push(g); };
+  push(new THREE.CylinderGeometry(4.6, 5.2, 1.0, 16), 0, 0.5, 0);   // 底座
+  push(new THREE.CylinderGeometry(4.4, 4.4, 2.6, 16), 0, 2.2, 0);   // 料仓外壁
+  push(new THREE.CylinderGeometry(3.4, 3.4, 2.0, 16), 0, 2.7, 0);   // 内凹开口(暗)
+  const geo = mergeGeometries(parts, false);
+  geo.computeVertexNormals();
+  return geo;
+}
+
+// 挖机: 履带底盘 + 车身 + 驾驶室 + 挖臂(朝 +z)
+function buildExcavatorGeometry() {
+  const parts = [];
+  const push = (g, x, y, z, rx) => { if (rx) g.rotateX(rx); g.translate(x, y, z); parts.push(g); };
+  push(new THREE.BoxGeometry(2.6, 0.5, 3.4), 0, 0.25, 0);          // 底盘
+  push(new THREE.BoxGeometry(2.0, 0.9, 2.4), 0, 0.95, -0.2);       // 车身
+  push(new THREE.BoxGeometry(1.3, 0.9, 1.1), 0, 1.75, -0.7);       // 驾驶室
+  push(new THREE.BoxGeometry(0.35, 0.35, 2.2), 0, 1.2, 1.35, -0.35); // 挖臂(朝 +z)
+  push(new THREE.BoxGeometry(1.0, 0.6, 0.7), 0, 0.6, 2.5);         // 铲斗
+  const geo = mergeGeometries(parts, false);
+  geo.computeVertexNormals();
+  return geo;
+}
+
 const GEO_BUILDERS = {
   miner: buildMinerGeometry,
   warehouse: buildWarehouseGeometry,
   truck: buildTruckGeometry,
   smelter: buildSmelterGeometry,
   assembler: buildAssemblerGeometry,
+  depot: buildDepotGeometry,
+  excavator: buildExcavatorGeometry,
 };
 // 各外形的基础色(未按状态染色时)
 const BASE_COLOR = {
   miner: 0xc9a24a, warehouse: 0x9fb6c9, truck: 0xd9c15a,
   smelter: 0xb56a4a, assembler: 0x7f8aa0,
+  depot: 0x8a7a5a, excavator: 0xe0a52e,
 };
 // 各建筑的可点击半径(世界单位, 略大于模型底座, 便于点选)。点击拾取 + 范围可视化共用同一数据。
 const MESH_PICK_R = {
-  miner: 2.6, smelter: 3.2, assembler: 3.4, warehouse: 5.2,
+  miner: 2.6, smelter: 3.2, assembler: 3.4, warehouse: 5.2, depot: 5.6,
 };
 const DEFAULT_PICK_R = 3.0;
 
@@ -113,6 +142,15 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
   const producerState = {
     working: new THREE.Color(0xffb020), starved: new THREE.Color(0xd0704f),
     output_full: new THREE.Color(0x5ab0ff), idle: new THREE.Color(0x8a8f98),
+  };
+  const excavatorState = {
+    digging: new THREE.Color(0xff8a2d), to_zone: new THREE.Color(0xffd24a),
+    full: new THREE.Color(0x66cc66), idle: new THREE.Color(0x8a8f98),
+  };
+  const minetruckState = {
+    idle: new THREE.Color(0x8a8f98), to_exca: new THREE.Color(0xffe27a),
+    load: new THREE.Color(0xffb74a), to_depot: new THREE.Color(0x9c6b3f),
+    unload: new THREE.Color(0x66cc66),
   };
 
   // 每种外形建一个 InstancedMesh
@@ -165,6 +203,20 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
   }
   const pickR = (mesh) => MESH_PICK_R[mesh] || DEFAULT_PICK_R;
 
+  // ---- 矿场挖掘区圆环(红色, 常显; 复用同一单位圆几何) ----
+  const zoneMat = new THREE.LineBasicMaterial({ color: 0xff5a5a, transparent: true, opacity: 0.85, depthTest: false, depthWrite: false });
+  const zoneGroup = new THREE.Group();
+  zoneGroup.renderOrder = 998;
+  scene.add(zoneGroup);
+  const zonePool = [];
+  function ensureZoneRings(n) {
+    while (zonePool.length < n) {
+      const l = new THREE.LineLoop(ringGeo, zoneMat);
+      l.frustumCulled = false; l.matrixAutoUpdate = false; l.renderOrder = 998;
+      zoneGroup.add(l); zonePool.push(l);
+    }
+  }
+
   return {
     groups,
     setPlanet(p) { planet = p; },
@@ -186,14 +238,20 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
         put(g, _m, color, e);
       }
 
-      // agent(移动): 朝行进方向 + 卡车按状态染色
+      // agent(移动): 朝行进方向 + 按各自状态染色(物流卡车/挖机/采矿卡车)
       for (const e of world.query('Agent', 'Mover')) {
         const ag = world.get(e, 'Agent');
         const mv = world.get(e, 'Mover');
         const g = groups[ag.mesh] || fallbackAgent;
         worldMatrixHeading(mv.dir, mv.fwd || mv.dir, planet, _m, size);
         const h = world.get(e, 'Hauler');
-        put(g, _m, (h && haulerState[h.state]) || g.base, e);
+        const ex = world.get(e, 'Excavator');
+        const mtk = world.get(e, 'MineTruck');
+        let color = g.base;
+        if (h) color = haulerState[h.state] || g.base;
+        else if (ex) color = excavatorState[ex.state] || g.base;
+        else if (mtk) color = minetruckState[mtk.state] || g.base;
+        put(g, _m, color, e);
       }
 
       for (const name in groups) {
@@ -216,6 +274,22 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
           i++;
         }
         for (; i < ringPool.length; i++) ringPool[i].visible = false;
+      }
+
+      // 矿场挖掘区圆环(常显): 已圈定挖掘区的矿场画一个红环, 半径 = 挖掘区角半径 × 星球半径
+      {
+        let i = 0;
+        const R = planet.params.radius;
+        for (const e of world.query('Depot', 'DigZone')) {
+          const z = world.get(e, 'DigZone');
+          if (!z.center) continue;
+          ensureZoneRings(i + 1);
+          worldMatrix(z.center, 0, planet, _m, z.radius * R);   // 角半径→世界半径
+          zonePool[i].matrix.copy(_m);
+          zonePool[i].visible = true;
+          i++;
+        }
+        for (; i < zonePool.length; i++) zonePool[i].visible = false;
       }
     },
     showPickRanges(on) { ringGroup.visible = !!on; },
@@ -252,7 +326,7 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
         const g = groups[name];
         scene.remove(g.mesh); g.geo.dispose(); g.mat.dispose();
       }
-      scene.remove(ringGroup); ringGeo.dispose(); ringMat.dispose();
+      scene.remove(ringGroup); scene.remove(zoneGroup); ringGeo.dispose(); ringMat.dispose(); zoneMat.dispose();
     },
   };
 }

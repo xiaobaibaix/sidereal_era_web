@@ -25,6 +25,12 @@ export function placeBuilding(world, ctx, buildingId, dir, yaw = 0) {
   } else if (b.kind === 'storage') {
     world.add(e, 'Storage', {});
     world.add(e, 'Inventory', { items: {}, cap: b.cap != null ? b.cap : Infinity });
+  } else if (b.kind === 'depot') {
+    // 矿场: 被动容器(自身不挖)。圈定挖掘区(DigZone.center)+挖机+采矿卡车后才有货进来。
+    world.add(e, 'Depot', {});
+    world.add(e, 'Inventory', { items: {}, cap: b.cap != null ? b.cap : Infinity });
+    world.add(e, 'Provider', { items: '*' });   // 对外供应存储的一切
+    world.add(e, 'DigZone', { center: null, radius: b.zoneRadius || 0.05, depth: 0 });
   } else if (b.kind === 'producer') {
     const recipeId = b.recipe || (b.recipes && b.recipes[0]);
     const recipe = registry.recipes[recipeId] || { in: [], out: [] };
@@ -44,18 +50,20 @@ export function placeBuilding(world, ctx, buildingId, dir, yaw = 0) {
   return e;
 }
 
-// 拆除: 移除组件/实体, 回收其地形坑 edit 并失效该区域(地形恢复)
+// 拆除: 移除组件/实体, 回收其地形坑/挖掘区 edit 并失效该区域(地形恢复)
 export function demolish(world, ctx, eid) {
   const { planet, spatial, bus } = ctx;
-  const edit = ctx.minerEdits && ctx.minerEdits.get(eid);
-  if (edit && planet) {
+  const restore = (edit, map) => {
+    if (!edit || !planet) return;
     const i = planet.params.edits.indexOf(edit);
     if (i >= 0) planet.params.edits.splice(i, 1);
-    ctx.minerEdits.delete(eid);
+    if (map) map.delete(eid);
     planet._buildNoise();
     for (const r of planet.roots) planet._invalidateAffected(r, { x: edit.pos[0], y: edit.pos[1], z: edit.pos[2] }, edit.radius);
     planet._editPending = true;
-  }
+  };
+  restore(ctx.minerEdits && ctx.minerEdits.get(eid), ctx.minerEdits);   // 旧直挖矿机的坑
+  restore(ctx.zoneEdits && ctx.zoneEdits.get(eid), ctx.zoneEdits);       // 矿场挖掘区的坑
   if (spatial) spatial.remove(eid);
   world.destroy(eid);
   if (bus) bus.emit('demolish', { eid });
