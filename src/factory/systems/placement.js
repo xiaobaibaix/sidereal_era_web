@@ -15,6 +15,7 @@ export function placeBuilding(world, ctx, buildingId, dir, yaw = 0) {
   if (b.kind === 'miner') {
     world.add(e, 'Miner', { typeId: b.machine || buildingId, dugDepth: 0, state: 'mining', lastItem: null });
     world.add(e, 'Inventory', { items: {}, cap: b.cap != null ? b.cap : Infinity });
+    world.add(e, 'Provider', { items: '*' });   // 矿机对外供应它挖到的一切
     if (planet) {
       const edit = { pos: [dir[0], dir[1], dir[2]], radius: b.digRadius || 0.03, depth: 0, falloff: 'smooth', dry: true };
       planet.params.edits.push(edit);
@@ -24,6 +25,19 @@ export function placeBuilding(world, ctx, buildingId, dir, yaw = 0) {
   } else if (b.kind === 'storage') {
     world.add(e, 'Storage', {});
     world.add(e, 'Inventory', { items: {}, cap: b.cap != null ? b.cap : Infinity });
+  } else if (b.kind === 'producer') {
+    const recipeId = b.recipe || (b.recipes && b.recipes[0]);
+    const recipe = registry.recipes[recipeId] || { in: [], out: [] };
+    world.add(e, 'Producer', { typeId: b.machine || buildingId, recipeId, progress: 0, state: 'idle' });
+    world.add(e, 'Inventory', { items: {}, cap: b.cap != null ? b.cap : Infinity });
+    // 供应: 配方输出物; 需求: 配方输入物, 维持 bufferMult 份缓冲
+    const outIds = [];
+    for (const stack of recipe.out || []) for (const it in stack) outIds.push(it);
+    world.add(e, 'Provider', { items: outIds });
+    const needs = {};
+    const mult = b.bufferMult != null ? b.bufferMult : 4;
+    for (const stack of recipe.in || []) for (const it in stack) needs[it] = (needs[it] || 0) + stack[it] * mult;
+    world.add(e, 'Requester', { needs });
   }
 
   if (bus) bus.emit('build', { eid: e, buildingId });

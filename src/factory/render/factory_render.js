@@ -52,14 +52,43 @@ function buildTruckGeometry() {
   return geo;
 }
 
+// 冶炼炉: 方形炉体 + 烟囱(象征高温冶炼)
+function buildSmelterGeometry() {
+  const parts = [];
+  const push = (g, x, y, z) => { g.translate(x, y, z); parts.push(g); };
+  push(new THREE.BoxGeometry(4.0, 3.2, 4.0), 0, 1.6, 0);          // 炉体
+  push(new THREE.CylinderGeometry(0.7, 0.9, 2.6, 10), 1.1, 4.3, 1.1);  // 烟囱
+  push(new THREE.BoxGeometry(2.2, 0.9, 0.3), 0, 1.0, 2.0);        // 炉门(前壁)
+  const geo = mergeGeometries(parts, false);
+  geo.computeVertexNormals();
+  return geo;
+}
+
+// 制造台: 底座 + 装配平台 + 龙门架(象征机械臂加工)
+function buildAssemblerGeometry() {
+  const parts = [];
+  const push = (g, x, y, z) => { g.translate(x, y, z); parts.push(g); };
+  push(new THREE.BoxGeometry(4.4, 1.0, 4.4), 0, 0.5, 0);          // 底座
+  push(new THREE.BoxGeometry(3.4, 0.8, 3.4), 0, 1.4, 0);          // 装配台面
+  push(new THREE.BoxGeometry(0.4, 2.4, 0.4), -1.6, 2.6, 0);       // 龙门左柱
+  push(new THREE.BoxGeometry(0.4, 2.4, 0.4), 1.6, 2.6, 0);        // 龙门右柱
+  push(new THREE.BoxGeometry(3.8, 0.4, 0.6), 0, 3.7, 0);          // 龙门横梁
+  const geo = mergeGeometries(parts, false);
+  geo.computeVertexNormals();
+  return geo;
+}
+
 const GEO_BUILDERS = {
   miner: buildMinerGeometry,
   warehouse: buildWarehouseGeometry,
   truck: buildTruckGeometry,
+  smelter: buildSmelterGeometry,
+  assembler: buildAssemblerGeometry,
 };
 // 各外形的基础色(未按状态染色时)
 const BASE_COLOR = {
   miner: 0xc9a24a, warehouse: 0x9fb6c9, truck: 0xd9c15a,
+  smelter: 0xb56a4a, assembler: 0x7f8aa0,
 };
 
 export function createFactoryRenderer(scene, planet, opts = {}) {
@@ -75,6 +104,10 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
     idle: new THREE.Color(0x8a8f98), to_src: new THREE.Color(0x5ab0ff),
     load: new THREE.Color(0xffc040), to_sink: new THREE.Color(0x66cc66),
     unload: new THREE.Color(0x66cc66),
+  };
+  const producerState = {
+    working: new THREE.Color(0xffb020), starved: new THREE.Color(0xd0704f),
+    output_full: new THREE.Color(0x5ab0ff), idle: new THREE.Color(0x8a8f98),
   };
 
   // 每种外形建一个 InstancedMesh
@@ -113,7 +146,11 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
         const g = groups[b.mesh] || fallbackBuilding;
         worldMatrix(a.dir, a.yaw || 0, planet, _m, size);
         const miner = world.get(e, 'Miner');
-        put(g, _m, (miner && minerState[miner.state]) || g.base);
+        const prod = world.get(e, 'Producer');
+        let color = g.base;
+        if (miner) color = minerState[miner.state] || g.base;
+        else if (prod) color = producerState[prod.state] || g.base;
+        put(g, _m, color);
       }
 
       // agent(移动): 朝行进方向 + 卡车按状态染色

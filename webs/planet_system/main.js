@@ -14,6 +14,7 @@ import { ExcavatorSystem } from '../../src/excavators.js';
 import { createFactory } from '../../src/factory/factory.js';
 import gameData from '../../src/factory/data/gamedata.js';
 import { createMiningSystem } from '../../src/factory/systems/mining.js';
+import { createProductionSystem } from '../../src/factory/systems/production.js';
 import { placeBuilding, demolish } from '../../src/factory/systems/placement.js';
 import { createLogisticsSystem, spawnHaulers } from '../../src/factory/systems/logistics.js';
 import { createFactoryRenderer } from '../../src/factory/render/factory_render.js';
@@ -305,7 +306,8 @@ const excavators = new ExcavatorSystem(planet, scene);
 // 工厂系统(ECS): 采矿 → (后续)物流/生产/科技/行星发动机。M1: 采矿。
 const factory = createFactory({ planet, data: gameData });
 factory.addSystem('mining', createMiningSystem());
-factory.addSystem('logistics', createLogisticsSystem());   // M2a: 卡车在矿机↔仓库间搬运
+factory.addSystem('production', createProductionSystem());  // M3: 冶炼/制造按配方产出
+factory.addSystem('logistics', createLogisticsSystem());    // M2a: 卡车按供需搬运
 const factoryRenderer = createFactoryRenderer(scene, planet, { size: 1 });
 let _facAcc = 0;               // 工厂固定步长累加器
 const FAC_FIXED = 0.05;        // 20Hz 模拟步
@@ -1193,7 +1195,7 @@ excavators.onChange = () => saveEdits();
 const fpTool = { mode: '关闭', haulerCount: 3, spawnHaulers() { doSpawnHaulers(); }, status: '待命' };
 let _fpDown = null;
 const fpGui = new GUI({ title: '🏭 工厂', container: bottomLeftPanels });
-fpGui.add(fpTool, 'mode', ['关闭', '放置矿机', '放置仓库', '拆除']).name('模式').listen()
+fpGui.add(fpTool, 'mode', ['关闭', '放置矿机', '放置冶炼炉', '放置制造台', '放置仓库', '拆除']).name('模式').listen()
   .onChange((v) => {
     if (v !== '关闭') {   // 进入工厂放置 → 关掉手动刷子与挖机选区, 避免抢点击
       brush.enabled = false; applyBrushControls();
@@ -1229,6 +1231,12 @@ renderer.domElement.addEventListener('pointerup', (e) => {
   if (fpTool.mode === '放置矿机') {
     placeBuilding(factory.world, factory.ctx, 'miner', dir);
     fpTool.status = '已放置采矿机';
+  } else if (fpTool.mode === '放置冶炼炉') {
+    placeBuilding(factory.world, factory.ctx, 'smelter', dir);
+    fpTool.status = '已放置冶炼炉';
+  } else if (fpTool.mode === '放置制造台') {
+    placeBuilding(factory.world, factory.ctx, 'assembler', dir);
+    fpTool.status = '已放置制造台';
   } else if (fpTool.mode === '放置仓库') {
     placeBuilding(factory.world, factory.ctx, 'warehouse', dir);
     fpTool.status = '已放置仓库';
@@ -1238,27 +1246,25 @@ renderer.domElement.addEventListener('pointerup', (e) => {
   }
 });
 
-// 面板状态: 矿机数 + 各资源总量(每帧刷新)
-const _oreNames = { overburden: '废土', stone: '石', iron_ore: '铁', copper_ore: '铜' };
+// 面板状态: 各类建筑数 + 全系统各资源总量(每帧刷新)
+const _oreNames = {
+  overburden: '废土', stone: '石', iron_ore: '铁矿', copper_ore: '铜矿',
+  iron_ingot: '铁锭', copper_ingot: '铜锭', iron_plate: '铁板',
+};
 function updateFactoryStatus() {
   const w = factory.world;
-  let miners = 0; const totals = {};
-  for (const e of w.query('Miner', 'Inventory')) {
-    miners++;
+  const totals = {};
+  for (const e of w.query('Inventory')) {   // 汇总全系统库存(矿机/生产/仓库/在制)
     const inv = w.get(e, 'Inventory');
     for (const k in inv.items) totals[k] = (totals[k] || 0) + inv.items[k];
   }
-  // 仓库存量并入总量; 统计仓库/卡车数
-  let warehouses = 0;
-  for (const e of w.query('Storage', 'Inventory')) {
-    warehouses++;
-    const inv = w.get(e, 'Inventory');
-    for (const k in inv.items) totals[k] = (totals[k] || 0) + inv.items[k];
-  }
+  const miners = w.count('Miner');
+  const producers = w.count('Producer');
+  const warehouses = w.count('Storage');
   const haulers = w.count('Hauler');
-  if (miners === 0 && warehouses === 0 && haulers === 0) { if (fpTool.mode === '关闭') fpTool.status = '待命'; return; }
+  if (miners === 0 && producers === 0 && warehouses === 0 && haulers === 0) { if (fpTool.mode === '关闭') fpTool.status = '待命'; return; }
   const parts = Object.keys(totals).map((k) => `${_oreNames[k] || k}:${totals[k].toFixed(0)}`);
-  fpTool.status = `矿${miners} 仓${warehouses} 车${haulers} · ${parts.join(' ') || '空'}`;
+  fpTool.status = `矿${miners} 厂${producers} 仓${warehouses} 车${haulers} · ${parts.join(' ') || '空'}`;
 }
 
 function animate() {

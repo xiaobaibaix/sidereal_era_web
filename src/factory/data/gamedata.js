@@ -7,6 +7,17 @@ export const items = {
   stone: { name: '石头', stack: 200, color: 0x808088 },
   iron_ore: { name: '铁矿', stack: 100, tags: ['ore'], color: 0xb0663c },
   copper_ore: { name: '铜矿', stack: 100, tags: ['ore'], color: 0x2e8f6f },
+  // 冶炼/制造产物(M3 生产链)
+  iron_ingot: { name: '铁锭', stack: 100, tags: ['ingot'], color: 0xd8d2cc },
+  copper_ingot: { name: '铜锭', stack: 100, tags: ['ingot'], color: 0xd98b52 },
+  iron_plate: { name: '铁板', stack: 100, tags: ['part'], color: 0xa9b4c2 },
+};
+
+// 配方(数据驱动生产) —— in/out 是 { 物品: 数量 } 栈的数组; time=每次产出耗时(秒); building=可执行的建筑类型。
+export const recipes = {
+  smelt_iron: { name: '冶炼铁锭', in: [{ iron_ore: 2 }], out: [{ iron_ingot: 1 }], time: 1.5, building: 'smelter', power: 90 },
+  smelt_copper: { name: '冶炼铜锭', in: [{ copper_ore: 2 }], out: [{ copper_ingot: 1 }], time: 1.5, building: 'smelter', power: 90 },
+  make_plate: { name: '压制铁板', in: [{ iron_ingot: 2 }], out: [{ iron_plate: 1 }], time: 2.0, building: 'assembler', power: 120 },
 };
 
 // 分层矿柱: 从地表往下按"挖掘深度(与 applyEdit 的 depth 同单位, 0..~2)"分层。
@@ -27,12 +38,18 @@ export const machineTypes = {
   miner_mk1: { kind: 'miner', mesh: 'miner', tier: 1, digRate: 0.05, hardnessMax: 2, yield: 100, power: 30 },
   // kind=hauler: 卡车 agent, 在矿机↔仓库间搬运; speed=表面速度; cap=运力
   hauler_mk1: { kind: 'hauler', mesh: 'truck', tier: 1, speed: 22, cap: 100, power: 10 },
+  // kind=producer: 按配方把输入变输出(M3)
+  smelter_mk1: { kind: 'producer', mesh: 'smelter', tier: 1, power: 90 },
+  assembler_mk1: { kind: 'producer', mesh: 'assembler', tier: 1, power: 120 },
 };
 
 export const buildings = {
   miner: { name: '采矿机 Mk1', kind: 'miner', machine: 'miner_mk1', mesh: 'miner', digRadius: 0.03, cap: 500 },
   warehouse: { name: '仓库', kind: 'storage', mesh: 'warehouse', cap: 5000 },
+  // 生产建筑: recipe=默认配方; recipes=可选配方列表; cap=库存(输入缓冲+输出); bufferMult=输入缓冲维持的配方份数
+  smelter: { name: '冶炼炉', kind: 'producer', machine: 'smelter_mk1', mesh: 'smelter', recipe: 'smelt_iron', recipes: ['smelt_iron', 'smelt_copper'], cap: 300, bufferMult: 6 },
+  assembler: { name: '制造台', kind: 'producer', machine: 'assembler_mk1', mesh: 'assembler', recipe: 'make_plate', recipes: ['make_plate'], cap: 300, bufferMult: 6 },
 };
 
-export const gameData = { items, ore, machineTypes, buildings };
+export const gameData = { items, ore, recipes, machineTypes, buildings };
 export default gameData;
