@@ -44,6 +44,11 @@ export function placeBuilding(world, ctx, buildingId, dir, yaw = 0) {
     const mult = b.bufferMult != null ? b.bufferMult : 4;
     for (const stack of recipe.in || []) for (const it in stack) needs[it] = (needs[it] || 0) + stack[it] * mult;
     world.add(e, 'Requester', { needs });
+    if (b.power > 0) world.add(e, 'PowerNeed', { demand: b.power, sat: 1 });   // 需供电(sat 由 power 系统每 tick 覆写; 无 power 系统时保持 1)
+  } else if (b.kind === 'tower') {
+    world.add(e, 'PowerTower', { range: b.range || 0.12 });
+  } else if (b.kind === 'generator') {
+    world.add(e, 'PowerGen', { output: b.output || 100 });
   }
 
   if (bus) bus.emit('build', { eid: e, buildingId });

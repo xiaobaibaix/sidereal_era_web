@@ -15,6 +15,7 @@ import { createFactory } from '../../src/factory/factory.js';
 import gameData from '../../src/factory/data/gamedata.js';
 import { createMiningCrewSystem, setDigZone, spawnExcavators, spawnMineTrucks } from '../../src/factory/systems/mining_crew.js';
 import { createProductionSystem } from '../../src/factory/systems/production.js';
+import { createPowerSystem } from '../../src/factory/systems/power.js';
 import { placeBuilding, demolish } from '../../src/factory/systems/placement.js';
 import { createLogisticsSystem, spawnHaulers } from '../../src/factory/systems/logistics.js';
 import { createFactoryRenderer } from '../../src/factory/render/factory_render.js';
@@ -307,10 +308,11 @@ const excavators = new ExcavatorSystem(planet, scene);
 // 工厂系统(ECS): 采矿 → (后续)物流/生产/科技/行星发动机。M1: 采矿。
 const factory = createFactory({ planet, data: gameData });
 factory.addSystem('mining_crew', createMiningCrewSystem());  // 矿场小队: 挖机在挖掘区挖 → 采矿卡车运进矿场
-factory.addSystem('production', createProductionSystem());  // M3: 冶炼/制造按配方产出
+factory.addSystem('power', createPowerSystem());            // M4: 输电塔组网 + 供需满足率(须在 production 前)
+factory.addSystem('production', createProductionSystem());  // M3: 冶炼/制造按配方产出(缺电降速)
 factory.addSystem('logistics', createLogisticsSystem());    // M2a: 卡车按供需搬运
 const factoryRenderer = createFactoryRenderer(scene, planet, { size: 1 });
-const inspector = createInspector({ getWorld: () => factory.world, registry: factory.registry });
+const inspector = createInspector({ getWorld: () => factory.world, registry: factory.registry, getPower: () => factory.ctx.power });
 const _facRay = new THREE.Raycaster();       // 点击拾取建筑/agent 用
 const _facNdc = new THREE.Vector2();
 let _facAcc = 0;               // 工厂固定步长累加器
@@ -1206,7 +1208,7 @@ const fpTool = {
 };
 let _fpDown = null;
 const fpGui = new GUI({ title: '🏭 工厂', container: bottomLeftPanels });
-fpGui.add(fpTool, 'mode', ['关闭', '放置矿场', '圈定挖掘区', '放置冶炼炉', '放置制造台', '放置仓库', '拆除']).name('模式').listen()
+fpGui.add(fpTool, 'mode', ['关闭', '放置矿场', '圈定挖掘区', '放置冶炼炉', '放置制造台', '放置仓库', '放置输电塔', '放置发电机', '拆除']).name('模式').listen()
   .onChange((v) => {
     if (v !== '关闭') {   // 进入工厂放置 → 关掉手动刷子与挖机选区, 避免抢点击
       brush.enabled = false; applyBrushControls();
@@ -1280,6 +1282,12 @@ renderer.domElement.addEventListener('pointerup', (e) => {
   } else if (fpTool.mode === '放置仓库') {
     placeBuilding(factory.world, factory.ctx, 'warehouse', dir);
     fpTool.status = '已放置仓库';
+  } else if (fpTool.mode === '放置输电塔') {
+    placeBuilding(factory.world, factory.ctx, 'power_tower', dir);
+    fpTool.status = '已放置输电塔';
+  } else if (fpTool.mode === '放置发电机') {
+    placeBuilding(factory.world, factory.ctx, 'generator', dir);
+    fpTool.status = '已放置发电机';
   } else if (fpTool.mode === '拆除') {
     const eid = factory.spatial.nearest(dir);
     if (eid != null) { if (inspector.selected() === eid) inspector.hide(); demolish(factory.world, factory.ctx, eid); fpTool.status = '已拆除'; }
@@ -1367,6 +1375,7 @@ function animate() {
   while (_facAcc >= FAC_FIXED && _fg < 5) { factory.tick(FAC_FIXED); _facAcc -= FAC_FIXED; _fg++; }
   factoryRenderer.setSelected(inspector.selected());   // 选中建筑高亮
   factoryRenderer.update(factory.world);
+  factoryRenderer.setPowerLines(factory.ctx.power && factory.ctx.power.links);   // 电力连线
   inspector.update();                                  // 属性面板数值刷新
   updateFactoryStatus();
 

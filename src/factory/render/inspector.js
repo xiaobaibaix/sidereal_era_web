@@ -10,19 +10,19 @@ const ITEM_ICON = {
   overburden: 'soil-pile', stone: 'stone-ore', iron_ore: 'iron-ore', copper_ore: 'copper-ore',
   iron_ingot: 'iron-plate', copper_ingot: 'copper-plate', iron_plate: 'steel-plate',
 };
-const MESH_ICON = { miner: 'mining-drill', smelter: 'smelter', assembler: 'assembler-1', warehouse: 'storage-1', truck: 'logistic-drone', depot: 'storage-tank', excavator: 'mining-drill' };
+const MESH_ICON = { miner: 'mining-drill', smelter: 'smelter', assembler: 'assembler-1', warehouse: 'storage-1', truck: 'logistic-drone', depot: 'storage-tank', excavator: 'mining-drill', tower: 'tesla-coil', generator: 'wind-turbine' };
 
 const MINER_STATE = { mining: '开采中', full: '满仓待运', blocked: '受阻(需更高级钻机)', idle: '空闲' };
-const PROD_STATE = { working: '生产中', starved: '缺原料', output_full: '产物已满', idle: '空闲' };
+const PROD_STATE = { working: '生产中', starved: '缺原料', output_full: '产物已满', no_power: '缺电停机', idle: '空闲' };
 const HAUL_STATE = { idle: '待命', to_src: '前往取货', load: '装载中', to_sink: '前往卸货', unload: '卸货中' };
 const EXCA_STATE = { digging: '开采中', to_zone: '前往挖点', full: '满仓待运', idle: '空闲(未圈定挖掘区?)' };
 const MINETRUCK_STATE = { idle: '待命', to_exca: '前往挖机', load: '装载中', to_depot: '运往矿场', unload: '卸货中' };
-const STATE_COLOR = { mining: '#ffc040', working: '#ffc040', digging: '#ff8a2d', load: '#ffc040', full: '#66cc66', to_sink: '#66cc66', unload: '#66cc66', to_depot: '#9c6b3f', to_src: '#5ab0ff', to_exca: '#ffe27a', to_zone: '#ffd24a', starved: '#d0704f', blocked: '#d0413f', output_full: '#5ab0ff', idle: '#8a8f98' };
+const STATE_COLOR = { mining: '#ffc040', working: '#ffc040', digging: '#ff8a2d', load: '#ffc040', full: '#66cc66', to_sink: '#66cc66', unload: '#66cc66', to_depot: '#9c6b3f', to_src: '#5ab0ff', to_exca: '#ffe27a', to_zone: '#ffd24a', starved: '#d0704f', blocked: '#d0413f', output_full: '#5ab0ff', no_power: '#50606f', idle: '#8a8f98' };
 
 const itemIconUrl = (id) => (ITEM_ICON[id] ? ICON_BASE + ITEM_ICON[id] + '.webp' : null);
 const meshIconUrl = (m) => (MESH_ICON[m] ? ICON_BASE + MESH_ICON[m] + '.webp' : null);
 
-export function createInspector({ getWorld, registry }) {
+export function createInspector({ getWorld, registry, getPower }) {
   const itemName = (id) => (registry.items[id] && registry.items[id].name) || id;
 
   const el = document.createElement('div');
@@ -156,6 +156,9 @@ export function createInspector({ getWorld, registry }) {
       const prod = world.get(eid, 'Producer');
       const storage = world.get(eid, 'Storage');
       const hauler = world.get(eid, 'Hauler');
+      const tower = world.get(eid, 'PowerTower');
+      const gen = world.get(eid, 'PowerGen');
+      const powerNeed = world.get(eid, 'PowerNeed');
       const inv = world.get(eid, 'Inventory');
       const lines = [];
       const stateLine = (label, s, map) => `<div style="margin:2px 0"><span style="color:#9aa0a8">${label}</span> <b style="color:${STATE_COLOR[s] || '#e8eaed'}">${(map && map[s]) || s}</b></div>`;
@@ -181,6 +184,17 @@ export function createInspector({ getWorld, registry }) {
         lines.push(stateLine('状态', minetruck.state, MINETRUCK_STATE));
         const cargo = minetruck.cargoAmt > 0 ? `${itemName(minetruck.cargoItem)} ${Math.round(minetruck.cargoAmt)} / ${minetruck.cap}` : `空 / ${minetruck.cap}`;
         lines.push(kv('载货', cargo));
+      } else if (tower) {
+        const grid = getPower && getPower() && getPower().towerGrid ? getPower().towerGrid.get(eid) : null;
+        lines.push(kv('覆盖半径', tower.range.toFixed(3)));
+        if (grid) {
+          const pct = grid.demand > 0 ? Math.round(grid.sat * 100) : 100;
+          lines.push(kv('电网供电', `${grid.supply.toFixed(0)}`));
+          lines.push(kv('电网用电', `${grid.demand.toFixed(0)}`));
+          lines.push(kv('满足率', `${pct}%`));
+        }
+      } else if (gen) {
+        lines.push(kv('发电功率', `${gen.output.toFixed(0)}`));
       } else if (miner) {
         const mt = registry.machineTypes[miner.typeId] || {};
         const rate = (mt.digRate || 0) * (mt.yield || 0);
@@ -193,6 +207,10 @@ export function createInspector({ getWorld, registry }) {
         const pct = recipe.time ? Math.min(100, (prod.progress / recipe.time) * 100) : 0;
         lines.push(stateLine('状态', prod.state, PROD_STATE));
         lines.push(kv('配方', recipe.name || prod.recipeId));
+        if (powerNeed) {
+          const sp = Math.round((powerNeed.sat != null ? powerNeed.sat : 0) * 100);
+          lines.push(kv('供电', `<b style="color:${sp >= 100 ? '#66cc66' : sp > 0 ? '#ffc040' : '#d0413f'}">${sp}%</b> (需 ${powerNeed.demand})`));
+        }
         lines.push(`<div style="margin:4px 0;height:8px;background:rgba(255,255,255,0.1);border-radius:4px;overflow:hidden"><div style="height:100%;width:${pct.toFixed(0)}%;background:#ffc040;transition:width .1s"></div></div>`);
       } else if (hauler) {
         lines.push(stateLine('状态', hauler.state, HAUL_STATE));
@@ -214,5 +232,5 @@ export function createInspector({ getWorld, registry }) {
 }
 
 function kindLabel(kind) {
-  return { depot: '矿场', miner: '采矿', producer: '生产', storage: '存储' }[kind] || kind || '';
+  return { depot: '矿场', miner: '采矿', producer: '生产', storage: '存储', tower: '输电', generator: '发电' }[kind] || kind || '';
 }

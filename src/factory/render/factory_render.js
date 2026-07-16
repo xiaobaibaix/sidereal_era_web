@@ -104,6 +104,35 @@ function buildExcavatorGeometry() {
   return geo;
 }
 
+// 输电塔: 上宽下窄的塔身 + 顶部横担(高, 便于连线)
+function buildTowerGeometry() {
+  const parts = [];
+  const push = (g, x, y, z) => { g.translate(x, y, z); parts.push(g); };
+  push(new THREE.BoxGeometry(1.6, 0.4, 1.6), 0, 0.2, 0);          // 底座
+  push(new THREE.CylinderGeometry(0.28, 0.6, 6.0, 6), 0, 3.2, 0); // 塔身
+  push(new THREE.BoxGeometry(3.0, 0.35, 0.35), 0, 6.1, 0);        // 顶部横担
+  push(new THREE.BoxGeometry(0.35, 0.35, 3.0), 0, 6.1, 0);
+  const geo = mergeGeometries(parts, false);
+  geo.computeVertexNormals();
+  return geo;
+}
+
+// 发电机: 塔柱 + 机舱 + 三叶(风力发电)
+function buildGeneratorGeometry() {
+  const parts = [];
+  const push = (g, x, y, z, rz) => { if (rz) g.rotateZ(rz); g.translate(x, y, z); parts.push(g); };
+  push(new THREE.CylinderGeometry(0.3, 0.5, 5.5, 8), 0, 2.75, 0);   // 塔柱
+  push(new THREE.BoxGeometry(1.2, 0.8, 1.6), 0, 5.6, 0.2);          // 机舱
+  for (let i = 0; i < 3; i++) {                                     // 三叶
+    const b = new THREE.BoxGeometry(0.25, 3.0, 0.12);
+    b.translate(0, 1.5, 0); b.rotateZ((i * 2 * Math.PI) / 3);
+    b.translate(0, 5.6, 1.05); parts.push(b);
+  }
+  const geo = mergeGeometries(parts, false);
+  geo.computeVertexNormals();
+  return geo;
+}
+
 const GEO_BUILDERS = {
   miner: buildMinerGeometry,
   warehouse: buildWarehouseGeometry,
@@ -112,16 +141,19 @@ const GEO_BUILDERS = {
   assembler: buildAssemblerGeometry,
   depot: buildDepotGeometry,
   excavator: buildExcavatorGeometry,
+  tower: buildTowerGeometry,
+  generator: buildGeneratorGeometry,
 };
 // 各外形的基础色(未按状态染色时)
 const BASE_COLOR = {
   miner: 0xc9a24a, warehouse: 0x9fb6c9, truck: 0xd9c15a,
   smelter: 0xb56a4a, assembler: 0x7f8aa0,
   depot: 0x8a7a5a, excavator: 0xe0a52e,
+  tower: 0x9fb0c0, generator: 0xdfe6ec,
 };
 // 各建筑的可点击半径(世界单位, 略大于模型底座, 便于点选)。点击拾取 + 范围可视化共用同一数据。
 const MESH_PICK_R = {
-  miner: 2.6, smelter: 3.2, assembler: 3.4, warehouse: 5.2, depot: 5.6,
+  miner: 2.6, smelter: 3.2, assembler: 3.4, warehouse: 5.2, depot: 5.6, tower: 2.2, generator: 2.6,
 };
 const DEFAULT_PICK_R = 3.0;
 
@@ -141,7 +173,7 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
   };
   const producerState = {
     working: new THREE.Color(0xffb020), starved: new THREE.Color(0xd0704f),
-    output_full: new THREE.Color(0x5ab0ff), idle: new THREE.Color(0x8a8f98),
+    output_full: new THREE.Color(0x5ab0ff), no_power: new THREE.Color(0x50555f), idle: new THREE.Color(0x8a8f98),
   };
   const excavatorState = {
     digging: new THREE.Color(0xff8a2d), to_zone: new THREE.Color(0xffd24a),
@@ -215,6 +247,23 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
       l.frustumCulled = false; l.matrixAutoUpdate = false; l.renderOrder = 998;
       zoneGroup.add(l); zonePool.push(l);
     }
+  }
+
+  // ---- 电力连线(塔↔塔 / 塔↔建筑, 悬于地表上方) ----
+  const POWER_MAX = 2048;   // 最多端点数
+  const powerPos = new Float32Array(POWER_MAX * 3);
+  const powerGeo = new THREE.BufferGeometry();
+  powerGeo.setAttribute('position', new THREE.BufferAttribute(powerPos, 3));
+  const powerMat = new THREE.LineBasicMaterial({ color: 0x66e0ff, transparent: true, opacity: 0.7, depthTest: false, depthWrite: false });
+  const powerLines = new THREE.LineSegments(powerGeo, powerMat);
+  powerLines.frustumCulled = false; powerLines.renderOrder = 997;
+  scene.add(powerLines);
+  const _pp = new THREE.Vector3();
+  const POWER_LIFT = 5.0;   // 连线悬空高度(读作架空电线)
+  function surfacePos(dir, out) {
+    const p = planet.params;
+    const rr = p.radius + planet.heightAt(dir[0], dir[1], dir[2]) * p.maxHeight + POWER_LIFT;
+    return out.set(dir[0], dir[1], dir[2]).multiplyScalar(rr).add(planet.position);
   }
 
   return {
@@ -293,6 +342,19 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
       }
     },
     showPickRanges(on) { ringGroup.visible = !!on; },
+    // 更新电力连线; links = [[dirA, dirB], ...](单位方向数组), 由 power 系统写入 ctx.power.links
+    setPowerLines(links) {
+      let n = 0;
+      if (links) {
+        for (const seg of links) {
+          if (n + 2 > POWER_MAX) break;
+          surfacePos(seg[0], _pp); powerPos[n * 3] = _pp.x; powerPos[n * 3 + 1] = _pp.y; powerPos[n * 3 + 2] = _pp.z; n++;
+          surfacePos(seg[1], _pp); powerPos[n * 3] = _pp.x; powerPos[n * 3 + 1] = _pp.y; powerPos[n * 3 + 2] = _pp.z; n++;
+        }
+      }
+      powerGeo.setDrawRange(0, n);
+      powerGeo.attributes.position.needsUpdate = true;
+    },
     // 按方向精确拾取建筑: 只命中"点击方向落在其 pick 圆环内"的建筑, 取最近的一个(未命中 null)
     pickBuilding(world, dir) {
       const R = planet.params.radius;
@@ -326,7 +388,8 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
         const g = groups[name];
         scene.remove(g.mesh); g.geo.dispose(); g.mat.dispose();
       }
-      scene.remove(ringGroup); scene.remove(zoneGroup); ringGeo.dispose(); ringMat.dispose(); zoneMat.dispose();
+      scene.remove(ringGroup); scene.remove(zoneGroup); scene.remove(powerLines);
+      ringGeo.dispose(); ringMat.dispose(); zoneMat.dispose(); powerGeo.dispose(); powerMat.dispose();
     },
   };
 }

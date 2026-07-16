@@ -53,8 +53,11 @@ export const buildings = {
   miner: { name: '采矿机 Mk1', kind: 'miner', machine: 'miner_mk1', mesh: 'miner', digRadius: 0.03, cap: 500 },   // 旧直挖矿机(遗留, UI 已改用矿场)
   warehouse: { name: '仓库', kind: 'storage', mesh: 'warehouse', cap: 5000 },
   // 生产建筑: recipe=默认配方; recipes=可选配方列表; cap=库存(输入缓冲+输出); bufferMult=输入缓冲维持的配方份数
-  smelter: { name: '冶炼炉', kind: 'producer', machine: 'smelter_mk1', mesh: 'smelter', recipe: 'smelt_iron', recipes: ['smelt_iron', 'smelt_copper'], cap: 300, bufferMult: 6 },
-  assembler: { name: '制造台', kind: 'producer', machine: 'assembler_mk1', mesh: 'assembler', recipe: 'make_plate', recipes: ['make_plate'], cap: 300, bufferMult: 6 },
+  smelter: { name: '冶炼炉', kind: 'producer', machine: 'smelter_mk1', mesh: 'smelter', recipe: 'smelt_iron', recipes: ['smelt_iron', 'smelt_copper'], cap: 300, bufferMult: 6, power: 90 },
+  assembler: { name: '制造台', kind: 'producer', machine: 'assembler_mk1', mesh: 'assembler', recipe: 'make_plate', recipes: ['make_plate'], cap: 300, bufferMult: 6, power: 120 },
+  // 电力(M4): 输电塔覆盖一片区域(range=角半径), 覆盖内建筑自动接入; 塔与塔覆盖相交则并入同一电网。
+  power_tower: { name: '输电塔', kind: 'tower', mesh: 'tower', range: 0.14 },
+  generator: { name: '风力发电机', kind: 'generator', mesh: 'generator', output: 200 },
 };
 
 export const gameData = { items, ore, recipes, machineTypes, buildings };
