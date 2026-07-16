@@ -11,6 +11,8 @@ import { Body, NBodySystem } from './nbody.js';
 import { Planet } from '../../src/planet.js';       // 复用主项目的 LOD 地形行星(近距详细表现)
 import { PlanetWalker } from '../planet_system/character.js';   // 复用主项目的登陆行星角色控制器
 import { ExcavatorSystem } from '../../src/excavators.js';       // 挖机/卡车自动施工车队
+import { createFactoryApp } from '../../src/factory/app.js';       // 工厂系统集成(与 planet_system 共用)
+import { escapeInfo } from '../../src/factory/systems/escape.js';  // 逃逸判据(M8)
 import { createAtmospherePass, createCloudPass, createOcean, setOceanLandMask, createGasGiant } from '../../src/effects.js';   // 复用深度感知大气 + 体积云 + 海洋
 
 // ----------------------------------------------------------------------------
@@ -789,11 +791,13 @@ renderer.domElement.addEventListener('pointerleave', () => {
 renderer.domElement.addEventListener('pointerup', (e) => {
   _brushDown = false; _lastDigDir = null;
   if (_exPickActive) { _downXY = null; return; }   // 挖掘机选区模式: 点击交给施工面板处理, 不切焦点/不刷子
+  if (typeof factoryModeActive === 'function' && factoryModeActive()) { _downXY = null; return; }   // 工厂放置/点火模式: 交给工厂面板
   if (charMode) return;                 // 角色模式: 点击用于锁定视角
   if (!_downXY) return;
   const moved = Math.hypot(e.clientX - _downXY.x, e.clientY - _downXY.y);
   _downXY = null;
   if (moved > 5) return;                // 拖动旋转(或拖拽挖), pointermove 已处理 dig
+  if (factoryApp && factoryApp.fpTool.mode === '关闭' && factoryApp.hitTest(e.clientX, e.clientY) != null) return;   // 点到工厂建筑 → 查看属性, 不切焦点
   _pointer.set((e.clientX / innerWidth) * 2 - 1, -(e.clientY / innerHeight) * 2 + 1);
   _mouseNDC.copy(_pointer);             // 同步 NDC 给 ring 更新
   _raycaster.setFromCamera(_pointer, camera);
@@ -1543,6 +1547,64 @@ exGui.add({ f: () => { if (excavators) excavators.clearAgents(); exTool.status =
 exGui.add({ f: () => { if (excavators) excavators.clearAll(); exTool.mode = '关闭'; _exPickActive = false; exTool.status = '已恢复地形'; } }, 'f').name('↺ 恢复地形/清区域');
 exGui.add(exTool, 'status').name('状态').listen().disable();
 
+// ============================================================================
+// 工厂系统(绑定到聚焦的地形行星) + 行星逃逸(M8)
+//   在聚焦的地形行星上建造整条产线 → 造行星发动机 → 点火 → 推力写入该行星 body.externalAcc
+//   → N-body 轨道被推动 → 达到逃逸能量则脱离恒星。
+// ============================================================================
+let factoryApp = null, facBody = null, facPlanet = null, _escaped = false, _escBanner = null;
+const facTool = { thrustGain: 0.02, escape: '未点火' };
+function factoryModeActive() { return !!(factoryApp && factoryApp.fpTool.mode !== '关闭'); }
+function ensureFactory() {
+  const b = focusBody();
+  const terrain = b && b.type !== 'star' && !tuneFor(b).gas;
+  if (!factoryApp) {
+    if (!terrain) return;
+    const fe = detailMap.get(b) || addDetail(b);
+    if (!fe || !fe.planet) return;
+    facBody = b; facPlanet = fe.planet;
+    factoryApp = createFactoryApp({
+      scene, renderer, container: bottomLeftPanels,
+      getPlanet: () => facPlanet, getCamera: renderCam,
+      onModeActivate: () => { brush.enabled = false; applyBrushControls(); exTool.mode = '关闭'; _exPickActive = false; },
+      isInspectIdle: () => !brush.enabled && exTool.mode === '关闭' && !_exPickActive && !charMode,
+      planetMass: 1,
+    });
+    // 净推力 → 聚焦行星 externalAcc(乘可调增益); engine 系统每 tick 调用
+    factoryApp.factory.ctx.applyThrust = (acc) => { if (facBody) facBody.externalAcc.set(acc[0] * facTool.thrustGain, acc[1] * facTool.thrustGain, acc[2] * facTool.thrustGain); };
+    const fg = new GUI({ title: '🌍 行星逃逸', container: bottomLeftPanels });
+    fg.add(facTool, 'thrustGain', 0, 0.2, 0.001).name('推力增益');
+    fg.add(facTool, 'escape').name('逃逸状态').listen().disable();
+    return;
+  }
+  // 未放任何建筑前, 允许把工厂改绑到当前聚焦的地形行星
+  if (terrain && b !== facBody && factoryApp.factory.world.count('Building') === 0) {
+    const fe = detailMap.get(b) || addDetail(b);
+    if (fe && fe.planet) { facBody.externalAcc.set(0, 0, 0); facBody = b; facPlanet = fe.planet; factoryApp.setPlanet(fe.planet); }
+  }
+}
+function updateEscape() {
+  if (!facBody) return;
+  const mu = system.G * starBody.mass;
+  const rp = [facBody.pos.x - starBody.pos.x, facBody.pos.y - starBody.pos.y, facBody.pos.z - starBody.pos.z];
+  const rv = [facBody.vel.x - starBody.vel.x, facBody.vel.y - starBody.vel.y, facBody.vel.z - starBody.vel.z];
+  const info = escapeInfo({ relPos: rp, relVel: rv, mu });
+  if (info.escaped) {
+    facTool.escape = `✅ 已脱离! ε=${info.energy.toExponential(2)}`;
+    if (!_escaped) { _escaped = true; showEscapeBanner(); }
+  } else {
+    facTool.escape = `v/vesc ${info.ratio.toFixed(3)} · ε ${info.energy.toExponential(2)}`;
+  }
+}
+function showEscapeBanner() {
+  if (_escBanner) return;
+  _escBanner = document.createElement('div');
+  _escBanner.style.cssText = 'position:fixed;left:50%;top:22%;transform:translate(-50%,-50%);z-index:80;padding:20px 32px;border-radius:14px;background:rgba(10,30,20,0.94);color:#9effc0;font:600 20px/1.5 -apple-system,system-ui,sans-serif;box-shadow:0 12px 48px rgba(0,0,0,0.6);border:1px solid rgba(120,255,180,0.5);text-align:center;cursor:pointer;';
+  _escBanner.innerHTML = `🚀 ${facBody.name} 已飞出恒星引力束缚!<br><span style="font-size:13px;color:#cfe9d8">行星发动机推动行星逃逸太阳系 — 目标达成 (点击关闭)</span>`;
+  _escBanner.onclick = () => { _escBanner.remove(); _escBanner = null; };
+  document.body.appendChild(_escBanner);
+}
+
 function animate() {
   requestAnimationFrame(animate);
   const dt = Math.min(clock.getDelta(), 0.05);
@@ -1600,6 +1662,9 @@ function animate() {
     excavators.excaMarker.count = 0; excavators.truckMarker.count = 0;
     excavators.digRing.visible = false; excavators.fillRing.visible = false;
   }
+  // 工厂(绑定聚焦地形行星): 固定步长模拟 + 渲染 + 推力→轨道 + 逃逸判定
+  ensureFactory();
+  if (factoryApp) { factoryApp.tick(dt); updateEscape(); }
   updateRender();
 
   // 场景 → HDR RT(带深度)。角色模式下用角色相机渲染整条管线。

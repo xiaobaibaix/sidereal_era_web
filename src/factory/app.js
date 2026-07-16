@@ -1,0 +1,266 @@
+// 工厂 App 集成模块 —— 把"工厂系统 + 渲染 + 属性面板 + 建造面板 + 点选/点火 + toast"打包,
+// 供 planet_system 与 solar_system 共用(避免两处重复上百行 UI)。
+//
+// 用法:
+//   const app = createFactoryApp({ scene, renderer, container, getPlanet, getCamera, onModeActivate, isInspectIdle });
+//   app.factory.ctx.applyThrust = (acc)=>{...};   // solar 里把推力接到聚焦行星 body.externalAcc
+//   // animate 里:  app.tick(dt);
+//   // 换聚焦行星:   app.setPlanet(newPlanet);
+//
+// 依赖注入(与宿主解耦):
+//   getPlanet()        当前详细地形行星(点选 anchorPick + 渲染用)
+//   getCamera()        当前主渲染相机(点选用)
+//   onModeActivate()   进入某放置模式时调用(宿主关掉自己的手动挖掘/挖机选区, 避免抢点击)
+//   isInspectIdle()    是否允许"点击查看属性"(宿主: 未在手动挖掘/挖机选区时)
+
+import * as THREE from 'three';
+import GUI from 'lil-gui';
+import { createFactory } from './factory.js';
+import gameData from './data/gamedata.js';
+import { createMiningCrewSystem, setDigZone, spawnExcavators, spawnMineTrucks } from './systems/mining_crew.js';
+import { createProductionSystem } from './systems/production.js';
+import { createPowerSystem } from './systems/power.js';
+import { createResearchSystem } from './systems/research.js';
+import { createConstructionSystem } from './systems/construction.js';
+import { createEngineSystem } from './systems/engine.js';
+import { createLogisticsSystem, spawnHaulers } from './systems/logistics.js';
+import { placeBuilding, demolish } from './systems/placement.js';
+import { createFactoryRenderer } from './render/factory_render.js';
+import { createInspector } from './render/inspector.js';
+import { pick as anchorPick } from './core/anchor.js';
+
+export function createFactoryApp(opts) {
+  const {
+    scene, renderer, container,
+    getPlanet, getCamera,
+    onModeActivate = () => {},
+    isInspectIdle = () => true,
+    planetMass = 1e6, size = 1,
+  } = opts;
+
+  const factory = createFactory({ planet: getPlanet(), data: gameData });
+  factory.addSystem('mining_crew', createMiningCrewSystem());   // 矿场小队: 挖机挖 → 采矿车运进矿场
+  factory.addSystem('power', createPowerSystem());              // M4: 输电塔组网 + 供需满足率(须在 production 前)
+  factory.addSystem('production', createProductionSystem());    // M3: 冶炼/制造按配方产出(缺电降速)
+  factory.addSystem('construction', createConstructionSystem());// M6: 行星发动机分阶段建造
+  factory.addSystem('engine', createEngineSystem());            // M7: 点火燃烧→推力(经 ctx.applyThrust)
+  factory.addSystem('logistics', createLogisticsSystem());      // M2a: 卡车按供需搬运
+  factory.addSystem('research', createResearchSystem());        // M5: 研究站→发展度→解锁科技
+  factory.ctx.planetMass = planetMass;
+
+  const factoryRenderer = createFactoryRenderer(scene, getPlanet(), { size });
+  const inspector = createInspector({ getWorld: () => factory.world, registry: factory.registry, getPower: () => factory.ctx.power });
+  const _ray = new THREE.Raycaster();
+  const _ndc = new THREE.Vector2();
+  let _acc = 0; const FIXED = 0.05;
+
+  // ---- toast(顶部居中一次性提示) ----
+  const toastEl = document.createElement('div');
+  toastEl.style.cssText = 'position:fixed;left:50%;top:64px;transform:translateX(-50%);z-index:60;display:none;padding:10px 16px;border-radius:10px;font:13px/1.4 -apple-system,system-ui,sans-serif;box-shadow:0 8px 28px rgba(0,0,0,0.5);pointer-events:none;max-width:70vw;text-align:center;';
+  document.body.appendChild(toastEl);
+  let _toastTimer = 0;
+  function showToast(msg, warn) {
+    toastEl.textContent = msg;
+    toastEl.style.color = warn ? '#ffd7d0' : '#dbeafe';
+    toastEl.style.background = warn ? 'rgba(44,22,20,0.95)' : 'rgba(20,26,34,0.95)';
+    toastEl.style.border = `1px solid ${warn ? 'rgba(255,120,100,0.55)' : 'rgba(120,180,255,0.45)'}`;
+    toastEl.style.display = 'block';
+    clearTimeout(_toastTimer);
+    _toastTimer = setTimeout(() => { toastEl.style.display = 'none'; }, 2600);
+  }
+
+  // ---- 建造面板 ----
+  const fpTool = {
+    mode: '关闭',
+    excavatorCount: 3, spawnExcavators() { doSpawnExcavators(); },
+    mineTruckCount: 3, spawnMineTrucks() { doSpawnMineTrucks(); },
+    haulerCount: 3, spawnHaulers() { doSpawnHaulers(); },
+    showRanges: false, status: '待命',
+  };
+  let _fpDown = null;
+  const fpGui = new GUI({ title: '🏭 工厂', container });
+  fpGui.add(fpTool, 'mode', ['关闭', '放置矿场', '圈定挖掘区', '放置冶炼炉', '放置制造台', '放置研究站', '放置仓库', '放置输电塔', '放置发电机', '放置发动机', '点火发动机', '拆除']).name('模式').listen()
+    .onChange((v) => { if (v !== '关闭') onModeActivate(); });
+  fpGui.add(fpTool, 'excavatorCount', 1, 20, 1).name('挖机数量');
+  fpGui.add(fpTool, 'spawnExcavators').name('生成挖机');
+  fpGui.add(fpTool, 'mineTruckCount', 1, 20, 1).name('采矿车数量');
+  fpGui.add(fpTool, 'spawnMineTrucks').name('生成采矿车');
+  fpGui.add(fpTool, 'haulerCount', 1, 20, 1).name('物流车数量');
+  fpGui.add(fpTool, 'spawnHaulers').name('生成物流车');
+  fpGui.add(fpTool, 'showRanges').name('显示可点击范围').onChange((v) => factoryRenderer.showPickRanges(v));
+  fpGui.add(fpTool, 'status').name('状态').listen().disable();
+
+  // ---- 科技面板 ----
+  const techTool = { dev: '0', status: '放置研究站并送入铁锭以提升发展度' };
+  const techGui = new GUI({ title: '🔬 科技', container });
+  techGui.add(techTool, 'dev').name('发展度').listen().disable();
+  techGui.add(techTool, 'status').name('科技').listen().disable();
+  function updateResearchStatus() {
+    const colony = factory.ctx.colony;
+    techTool.dev = (colony ? colony.dev : 0).toFixed(0);
+    const tech = factory.registry.tech || {};
+    const parts = [];
+    for (const id in tech) {
+      const t = tech[id];
+      const done = colony && colony.researched && colony.researched.has(id);
+      parts.push(`${t.name}${done ? '✓' : `✗(需${(t.require && t.require.dev) || 0})`}`);
+    }
+    if (parts.length) techTool.status = parts.join(' · ');
+  }
+
+  function firstDepotWithZone() {
+    let any = null;
+    for (const e of factory.world.query('Depot', 'DigZone')) {
+      if (any == null) any = e;
+      if (factory.world.get(e, 'DigZone').center) return e;
+    }
+    return any;
+  }
+  function doSpawnExcavators() {
+    const depot = firstDepotWithZone();
+    if (depot == null) { showToast('请先放置矿场', true); return; }
+    if (!factory.world.get(depot, 'DigZone').center) { showToast('请先圈定挖掘区(模式选「圈定挖掘区」点矿场旁)', true); return; }
+    spawnExcavators(factory.world, factory.ctx, fpTool.excavatorCount, depot);
+    showToast(`已生成 ${fpTool.excavatorCount} 台挖机`, false);
+  }
+  function doSpawnMineTrucks() {
+    const depot = firstDepotWithZone();
+    if (depot == null) { showToast('请先放置矿场', true); return; }
+    spawnMineTrucks(factory.world, factory.ctx, fpTool.mineTruckCount, depot);
+    showToast(`已生成 ${fpTool.mineTruckCount} 辆采矿车`, false);
+  }
+  function doSpawnHaulers() {
+    let nearDir = [0, 1, 0];
+    const depot = factory.world.query('Depot', 'Anchor').next().value;
+    if (depot != null) nearDir = [...factory.world.get(depot, 'Anchor').dir];
+    else { const wh = factory.world.query('Storage', 'Anchor').next().value; if (wh != null) nearDir = [...factory.world.get(wh, 'Anchor').dir]; }
+    spawnHaulers(factory.world, factory.ctx, fpTool.haulerCount, 'hauler_mk1', nearDir);
+    showToast(`已生成 ${fpTool.haulerCount} 辆物流车`, false);
+  }
+
+  function requiredTechFor(buildingId) {
+    const tech = factory.registry.tech || {};
+    for (const id in tech) { const t = tech[id]; if (t.unlock && t.unlock.buildings && t.unlock.buildings.includes(buildingId)) return t; }
+    return null;
+  }
+  function tryPlace(buildingId, dir, okMsg) {
+    const b = factory.registry.buildings[buildingId];
+    if (b && b.locked && !factory.registry.isUnlocked(buildingId)) {
+      const t = requiredTechFor(buildingId);
+      showToast(`${b.name}未解锁${t ? ` · 需研究「${t.name}」(发展度 ${(t.require && t.require.dev) || 0})` : ''}`, true);
+      return null;
+    }
+    const e = placeBuilding(factory.world, factory.ctx, buildingId, dir);
+    if (e != null && okMsg) showToast(okMsg, false);
+    return e;
+  }
+
+  // 事件 toast
+  const _engineStageName = { site: '选址平整', frame: '骨架搭建', core: '核心组装', commission: '调试' };
+  factory.bus.on('engine_stage', (p) => showToast(`行星发动机: 进入「${_engineStageName[p.stage] || p.stage}」阶段`, false));
+  factory.bus.on('engine_built', () => showToast('🚀 行星发动机建成! 切「点火发动机」点它即可点火', false));
+  factory.bus.on('tech', (p) => showToast(`🔬 科技解锁: ${(p.tech && p.tech.name) || p.id}`, false));
+
+  // ---- 放置/点火 点选 ----
+  const dom = renderer.domElement;
+  const onPlaceDown = (e) => { if (fpTool.mode !== '关闭' && e.button === 0) _fpDown = { x: e.clientX, y: e.clientY }; };
+  const onPlaceUp = (e) => {
+    if (fpTool.mode === '关闭' || !_fpDown) { _fpDown = null; return; }
+    const moved = Math.hypot(e.clientX - _fpDown.x, e.clientY - _fpDown.y);
+    _fpDown = null;
+    if (moved > 5) return;
+    const d = anchorPick(e.clientX, e.clientY, getCamera(), getPlanet());
+    if (!d) return;
+    const dir = [d.x, d.y, d.z];
+    const m = fpTool.mode;
+    if (m === '放置矿场') tryPlace('depot', dir, '已放置矿场 · 请圈定挖掘区并生成挖机/采矿车');
+    else if (m === '圈定挖掘区') {
+      const depot = factory.spatial.nearest(dir, (id) => factory.world.has(id, 'Depot'));
+      if (depot == null) { showToast('附近没有矿场, 请先放置矿场', true); return; }
+      setDigZone(factory.world, factory.ctx, depot, dir);
+      showToast('已圈定挖掘区 · 生成挖机+采矿车即可开采', false);
+    } else if (m === '放置冶炼炉') tryPlace('smelter', dir, '已放置冶炼炉');
+    else if (m === '放置制造台') tryPlace('assembler', dir, '已放置制造台');
+    else if (m === '放置研究站') tryPlace('lab', dir, '已放置研究站 · 送铁锭进来提升发展度');
+    else if (m === '放置仓库') tryPlace('warehouse', dir, '已放置仓库');
+    else if (m === '放置输电塔') tryPlace('power_tower', dir, '已放置输电塔');
+    else if (m === '放置发电机') tryPlace('generator', dir, '已放置发电机');
+    else if (m === '放置发动机') tryPlace('engine_site', dir, '已开建行星发动机 · 依阶段自动索取建材(铁板)');
+    else if (m === '点火发动机') {
+      const eng = factoryRenderer.pickBuilding(factory.world, dir);
+      if (eng == null || !factory.world.has(eng, 'Construction')) { showToast('请点选一台行星发动机', true); return; }
+      const con = factory.world.get(eng, 'Construction');
+      if (!con.built) { showToast('发动机尚未建成, 无法点火', true); return; }
+      if (con.ignited) { showToast('该发动机已点火', false); return; }
+      con.ignited = true;
+      showToast('🔥 行星发动机点火! 燃烧废料/矿石产生推力(需物流持续供料)', false);
+    } else if (m === '拆除') {
+      const eid = factory.spatial.nearest(dir);
+      if (eid != null) { if (inspector.selected() === eid) inspector.hide(); demolish(factory.world, factory.ctx, eid); showToast('已拆除', false); }
+    }
+  };
+
+  // ---- 点击查看属性 ----
+  let _inspDown = null;
+  const canInspect = () => fpTool.mode === '关闭' && isInspectIdle();
+  function pickEntity(clientX, clientY) {
+    const d = anchorPick(clientX, clientY, getCamera(), getPlanet());
+    if (d) { const b = factoryRenderer.pickBuilding(factory.world, [d.x, d.y, d.z]); if (b != null) return b; }
+    _ndc.set((clientX / innerWidth) * 2 - 1, -(clientY / innerHeight) * 2 + 1);
+    _ray.setFromCamera(_ndc, getCamera());
+    return factoryRenderer.pickEntity(_ray);
+  }
+  const onInspectDown = (e) => { if (canInspect() && e.button === 0) _inspDown = { x: e.clientX, y: e.clientY }; };
+  const onInspectUp = (e) => {
+    if (!_inspDown) return;
+    const moved = Math.hypot(e.clientX - _inspDown.x, e.clientY - _inspDown.y);
+    _inspDown = null;
+    if (moved > 5 || !canInspect()) return;
+    const eid = pickEntity(e.clientX, e.clientY);
+    if (eid != null) inspector.show(eid); else inspector.hide();
+  };
+  const onKey = (e) => { if (e.key === 'Escape') inspector.hide(); };
+  dom.addEventListener('pointerdown', onPlaceDown);
+  dom.addEventListener('pointerup', onPlaceUp);
+  dom.addEventListener('pointerdown', onInspectDown);
+  dom.addEventListener('pointerup', onInspectUp);
+  window.addEventListener('keydown', onKey);
+
+  // ---- 状态 ----
+  const _oreNames = { overburden: '废土', stone: '石', iron_ore: '铁矿', copper_ore: '铜矿', iron_ingot: '铁锭', copper_ingot: '铜锭', iron_plate: '铁板' };
+  function updateFactoryStatus() {
+    const w = factory.world;
+    const totals = {};
+    for (const e of w.query('Inventory')) { const inv = w.get(e, 'Inventory'); for (const k in inv.items) totals[k] = (totals[k] || 0) + inv.items[k]; }
+    const depots = w.count('Depot'), producers = w.count('Producer'), warehouses = w.count('Storage');
+    const excavators = w.count('Excavator'), trucks = w.count('MineTruck') + w.count('Hauler');
+    const total = depots + producers + warehouses + excavators + trucks + w.count('Construction');
+    if (total === 0) { if (fpTool.mode === '关闭') fpTool.status = '待命'; return; }
+    const parts = Object.keys(totals).map((k) => `${_oreNames[k] || k}:${totals[k].toFixed(0)}`);
+    fpTool.status = `矿场${depots} 厂${producers} 仓${warehouses} 挖机${excavators} 车${trucks} · ${parts.join(' ') || '空'}`;
+  }
+
+  return {
+    factory, renderer: factoryRenderer, inspector, fpTool, showToast,
+    // 该屏幕点是否命中工厂建筑/agent(宿主用来在放置/查看时让出点击, 不误触发相机聚焦切换)
+    hitTest: (clientX, clientY) => pickEntity(clientX, clientY),
+    setPlanet(planet) { factory.setPlanet(planet); factoryRenderer.setPlanet(planet); },
+    // 固定步长模拟 + 渲染 + 面板刷新。宿主在 animate 里、行星 LOD 更新前调用。
+    tick(dt) {
+      _acc += dt; let n = 0;
+      while (_acc >= FIXED && n < 5) { factory.tick(FIXED); _acc -= FIXED; n++; }
+      factoryRenderer.setSelected(inspector.selected());
+      factoryRenderer.update(factory.world);
+      factoryRenderer.setPowerLines(factory.ctx.power && factory.ctx.power.links);
+      inspector.update();
+      updateFactoryStatus();
+      updateResearchStatus();
+    },
+    dispose() {
+      dom.removeEventListener('pointerdown', onPlaceDown); dom.removeEventListener('pointerup', onPlaceUp);
+      dom.removeEventListener('pointerdown', onInspectDown); dom.removeEventListener('pointerup', onInspectUp);
+      window.removeEventListener('keydown', onKey);
+      fpGui.destroy(); techGui.destroy(); inspector.dispose(); factoryRenderer.dispose(); toastEl.remove();
+    },
+  };
+}
