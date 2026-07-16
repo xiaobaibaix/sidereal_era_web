@@ -3,6 +3,7 @@
 
 import { createBelt } from './belt.js';
 import { midPortDir } from './inserter.js';
+import { norm } from '../core/sphere.js';
 
 // 放置一个建筑; 返回实体 id(失败返回 null)
 export function placeBuilding(world, ctx, buildingId, dir, yaw = 0) {
@@ -108,6 +109,38 @@ export function placeInserter(world, ctx, from, to, opts = {}) {
   world.add(e, 'Building', { typeId: buildingId, mesh: (b && b.mesh) || mt.mesh || 'inserter' });
   world.add(e, 'Inserter', { from, to, rate, filter, carry: null, charge: 0 });
   if (spatial) spatial.insert(e, dir);
+  if (bus) bus.emit('build', { eid: e, buildingId });
+  return e;
+}
+
+// 放置一个分流器(单点放置)。dir 为球面方向; opts: { buildingId, ins:[beltId], outs:[beltId], mode, filters, rate }。
+// dir 缺省时用入/出带端点中点。返回实体 id(失败返回 null)。
+export function placeSplitter(world, ctx, dir = null, opts = {}) {
+  const { registry, spatial, bus } = ctx;
+  const buildingId = opts.buildingId || 'splitter';
+  const b = registry.buildings[buildingId];
+  if (b && b.locked && !(registry.isUnlocked && registry.isUnlocked(buildingId))) return null;
+  const mt = registry.machineTypes[(b && b.machine) || 'splitter_mk1'] || {};
+  const ins = opts.ins ? [...opts.ins] : [];
+  const outs = opts.outs ? [...opts.outs] : [];
+  const mode = opts.mode || 'balance';
+  const rate = opts.rate != null ? opts.rate : (mt.rate != null ? mt.rate : 8);
+
+  // 锚点: 优先给定 dir; 否则取相连带端点中点
+  let anchor = dir;
+  if (!anchor) {
+    const acc = [0, 0, 0]; let cnt = 0;
+    const addEnd = (beltId, end) => { const bl = world.get(beltId, 'Belt'); if (bl) { const p = bl[end]; acc[0] += p[0]; acc[1] += p[1]; acc[2] += p[2]; cnt++; } };
+    for (const id of ins) addEnd(id, 'to');       // 入带的头端接分流器
+    for (const id of outs) addEnd(id, 'from');     // 出带的尾端接分流器
+    anchor = cnt > 0 ? norm(acc) : [0, 1, 0];
+  }
+
+  const e = world.create();
+  world.add(e, 'Anchor', { dir: [anchor[0], anchor[1], anchor[2]], yaw: opts.yaw || 0 });
+  world.add(e, 'Building', { typeId: buildingId, mesh: (b && b.mesh) || mt.mesh || 'splitter' });
+  world.add(e, 'Splitter', { ins, outs, mode, filters: opts.filters || {}, rate, rr: 0, rrIn: 0, charge: 0 });
+  if (spatial) spatial.insert(e, anchor);
   if (bus) bus.emit('build', { eid: e, buildingId });
   return e;
 }
