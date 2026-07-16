@@ -9,6 +9,7 @@ class Registry {
   constructor() {
     for (const c of CATS) this[c] = {};   // id -> def
     this.ore = { layers: [] };            // 分层矿柱规则(见 oreColumn)
+    this.unlocked = new Set();            // 已解锁的建筑/配方 id(locked 的须经科技解锁)
   }
 
   // 合并加载一批数据(可多次调用叠加)
@@ -16,9 +17,19 @@ class Registry {
     if (!data) return this;
     for (const c of CATS) if (data[c]) Object.assign(this[c], data[c]);
     if (data.ore) this.ore = data.ore;
+    this._initUnlocked();
     this.validate();
     return this;
   }
+
+  // 非 locked 的建筑/配方默认解锁; locked 的等科技解锁
+  _initUnlocked() {
+    for (const id in this.buildings) if (!this.buildings[id].locked) this.unlocked.add(id);
+    for (const id in this.recipes) if (!this.recipes[id].locked) this.unlocked.add(id);
+  }
+  isUnlocked(id) { return this.unlocked.has(id); }
+  unlock(ids) { for (const id of (ids || [])) this.unlocked.add(id); return this; }
+  unlockAll() { for (const id in this.buildings) this.unlocked.add(id); for (const id in this.recipes) this.unlocked.add(id); return this; }
 
   // 某建筑类型可用的配方对象数组
   recipesFor(buildingTypeId) {

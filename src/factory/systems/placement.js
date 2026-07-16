@@ -6,6 +6,7 @@ export function placeBuilding(world, ctx, buildingId, dir, yaw = 0) {
   const { planet, registry, spatial, bus } = ctx;
   const b = registry.buildings[buildingId];
   if (!b) return null;
+  if (b.locked && !(registry.isUnlocked && registry.isUnlocked(buildingId))) return null;   // 科技未解锁
 
   const e = world.create();
   world.add(e, 'Anchor', { dir: [dir[0], dir[1], dir[2]], yaw: yaw || 0 });
@@ -49,6 +50,12 @@ export function placeBuilding(world, ctx, buildingId, dir, yaw = 0) {
     world.add(e, 'PowerTower', { range: b.range || 0.12 });
   } else if (b.kind === 'generator') {
     world.add(e, 'PowerGen', { output: b.output || 100 });
+  } else if (b.kind === 'lab') {
+    // 研究站: 消耗 input(如铁锭) → 提升发展度。是 input 的需求方(物流会送料)。
+    world.add(e, 'Lab', { input: b.input, inRate: b.inRate || 1, devPerUnit: b.devPerUnit || 1, state: 'idle', rate: 0 });
+    world.add(e, 'Inventory', { items: {}, cap: b.cap != null ? b.cap : 100 });
+    const mult = b.bufferMult != null ? b.bufferMult : 10;
+    world.add(e, 'Requester', { needs: { [b.input]: (b.inRate || 1) * mult } });
   }
 
   if (bus) bus.emit('build', { eid: e, buildingId });

@@ -133,6 +133,18 @@ function buildGeneratorGeometry() {
   return geo;
 }
 
+// 研究站: 基座 + 半球穹顶 + 天线(象征科研)
+function buildLabGeometry() {
+  const parts = [];
+  const push = (g, x, y, z) => { g.translate(x, y, z); parts.push(g); };
+  push(new THREE.BoxGeometry(4.0, 1.6, 4.0), 0, 0.8, 0);                                 // 基座
+  push(new THREE.SphereGeometry(2.0, 16, 8, 0, Math.PI * 2, 0, Math.PI / 2), 0, 1.6, 0); // 穹顶(半球)
+  push(new THREE.CylinderGeometry(0.08, 0.08, 1.8, 6), 0, 4.4, 0);                        // 天线
+  const geo = mergeGeometries(parts, false);
+  geo.computeVertexNormals();
+  return geo;
+}
+
 const GEO_BUILDERS = {
   miner: buildMinerGeometry,
   warehouse: buildWarehouseGeometry,
@@ -143,17 +155,18 @@ const GEO_BUILDERS = {
   excavator: buildExcavatorGeometry,
   tower: buildTowerGeometry,
   generator: buildGeneratorGeometry,
+  lab: buildLabGeometry,
 };
 // 各外形的基础色(未按状态染色时)
 const BASE_COLOR = {
   miner: 0xc9a24a, warehouse: 0x9fb6c9, truck: 0xd9c15a,
   smelter: 0xb56a4a, assembler: 0x7f8aa0,
   depot: 0x8a7a5a, excavator: 0xe0a52e,
-  tower: 0x9fb0c0, generator: 0xdfe6ec,
+  tower: 0x9fb0c0, generator: 0xdfe6ec, lab: 0x6fae9f,
 };
 // 各建筑的可点击半径(世界单位, 略大于模型底座, 便于点选)。点击拾取 + 范围可视化共用同一数据。
 const MESH_PICK_R = {
-  miner: 2.6, smelter: 3.2, assembler: 3.4, warehouse: 5.2, depot: 5.6, tower: 2.2, generator: 2.6,
+  miner: 2.6, smelter: 3.2, assembler: 3.4, warehouse: 5.2, depot: 5.6, tower: 2.2, generator: 2.6, lab: 3.4,
 };
 const DEFAULT_PICK_R = 3.0;
 
@@ -174,6 +187,9 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
   const producerState = {
     working: new THREE.Color(0xffb020), starved: new THREE.Color(0xd0704f),
     output_full: new THREE.Color(0x5ab0ff), no_power: new THREE.Color(0x50555f), idle: new THREE.Color(0x8a8f98),
+  };
+  const labState = {
+    researching: new THREE.Color(0x4fd0c0), starved: new THREE.Color(0xd0704f), idle: new THREE.Color(0x8a8f98),
   };
   const excavatorState = {
     digging: new THREE.Color(0xff8a2d), to_zone: new THREE.Color(0xffd24a),
@@ -281,9 +297,11 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
         worldMatrix(a.dir, a.yaw || 0, planet, _m, size);
         const miner = world.get(e, 'Miner');
         const prod = world.get(e, 'Producer');
+        const lab = world.get(e, 'Lab');
         let color = g.base;
         if (miner) color = minerState[miner.state] || g.base;
         else if (prod) color = producerState[prod.state] || g.base;
+        else if (lab) color = labState[lab.state] || g.base;
         put(g, _m, color, e);
       }
 

@@ -30,7 +30,7 @@ function stubPlanet() {
   };
 }
 function makeCtx(planet) {
-  const registry = createRegistry().load(gameData);
+  const registry = createRegistry().load(gameData).unlockAll();   // 测试: 解锁全部建筑
   return { planet, registry, spatial: createSpatial(), bus: createEventBus(), minerEdits: new Map(), zoneEdits: new Map() };
 }
 

@@ -54,11 +54,20 @@ export const buildings = {
   warehouse: { name: '仓库', kind: 'storage', mesh: 'warehouse', cap: 5000 },
   // 生产建筑: recipe=默认配方; recipes=可选配方列表; cap=库存(输入缓冲+输出); bufferMult=输入缓冲维持的配方份数
   smelter: { name: '冶炼炉', kind: 'producer', machine: 'smelter_mk1', mesh: 'smelter', recipe: 'smelt_iron', recipes: ['smelt_iron', 'smelt_copper'], cap: 300, bufferMult: 6, power: 90 },
-  assembler: { name: '制造台', kind: 'producer', machine: 'assembler_mk1', mesh: 'assembler', recipe: 'make_plate', recipes: ['make_plate'], cap: 300, bufferMult: 6, power: 120 },
+  // 制造台: 科技锁(需"装配技术")。
+  assembler: { name: '制造台', kind: 'producer', machine: 'assembler_mk1', mesh: 'assembler', recipe: 'make_plate', recipes: ['make_plate'], cap: 300, bufferMult: 6, power: 120, locked: true },
   // 电力(M4): 输电塔覆盖一片区域(range=角半径), 覆盖内建筑自动接入; 塔与塔覆盖相交则并入同一电网。
   power_tower: { name: '输电塔', kind: 'tower', mesh: 'tower', range: 0.14 },
   generator: { name: '风力发电机', kind: 'generator', mesh: 'generator', output: 200 },
+  // 研究站(M5): 消耗铁锭 → 提升殖民地发展度(简化"科技水平"占位)。发展度到阈值解锁科技。
+  lab: { name: '研究站', kind: 'lab', mesh: 'lab', input: 'iron_ingot', inRate: 2, devPerUnit: 1, cap: 100, bufferMult: 10 },
 };
 
-export const gameData = { items, ore, recipes, machineTypes, buildings };
+// 科技(M5): 发展度(dev)到阈值(+可选 builtAny)自动解锁; unlock 列出解锁的建筑/配方 id。
+export const tech = {
+  assembly: { name: '装配技术', require: { dev: 40 }, unlock: { buildings: ['assembler'], recipes: ['make_plate'] } },
+  planet_engine: { name: '行星发动机', require: { dev: 150, builtAny: ['assembler'] }, unlock: { buildings: ['engine_site'] } },   // engine_site 于 M6 加入
+};
+
+export const gameData = { items, ore, recipes, machineTypes, buildings, tech };
 export default gameData;

@@ -10,11 +10,12 @@ const ITEM_ICON = {
   overburden: 'soil-pile', stone: 'stone-ore', iron_ore: 'iron-ore', copper_ore: 'copper-ore',
   iron_ingot: 'iron-plate', copper_ingot: 'copper-plate', iron_plate: 'steel-plate',
 };
-const MESH_ICON = { miner: 'mining-drill', smelter: 'smelter', assembler: 'assembler-1', warehouse: 'storage-1', truck: 'logistic-drone', depot: 'storage-tank', excavator: 'mining-drill', tower: 'tesla-coil', generator: 'wind-turbine' };
+const MESH_ICON = { miner: 'mining-drill', smelter: 'smelter', assembler: 'assembler-1', warehouse: 'storage-1', truck: 'logistic-drone', depot: 'storage-tank', excavator: 'mining-drill', tower: 'tesla-coil', generator: 'wind-turbine', lab: 'lab' };
 
 const MINER_STATE = { mining: '开采中', full: '满仓待运', blocked: '受阻(需更高级钻机)', idle: '空闲' };
 const PROD_STATE = { working: '生产中', starved: '缺原料', output_full: '产物已满', no_power: '缺电停机', idle: '空闲' };
 const HAUL_STATE = { idle: '待命', to_src: '前往取货', load: '装载中', to_sink: '前往卸货', unload: '卸货中' };
+const LAB_STATE = { researching: '研究中', starved: '缺原料', idle: '空闲' };
 const EXCA_STATE = { digging: '开采中', to_zone: '前往挖点', full: '满仓待运', idle: '空闲(未圈定挖掘区?)' };
 const MINETRUCK_STATE = { idle: '待命', to_exca: '前往挖机', load: '装载中', to_depot: '运往矿场', unload: '卸货中' };
 const STATE_COLOR = { mining: '#ffc040', working: '#ffc040', digging: '#ff8a2d', load: '#ffc040', full: '#66cc66', to_sink: '#66cc66', unload: '#66cc66', to_depot: '#9c6b3f', to_src: '#5ab0ff', to_exca: '#ffe27a', to_zone: '#ffd24a', starved: '#d0704f', blocked: '#d0413f', output_full: '#5ab0ff', no_power: '#50606f', idle: '#8a8f98' };
@@ -154,6 +155,7 @@ export function createInspector({ getWorld, registry, getPower }) {
       const excavator = world.get(eid, 'Excavator');
       const minetruck = world.get(eid, 'MineTruck');
       const prod = world.get(eid, 'Producer');
+      const lab = world.get(eid, 'Lab');
       const storage = world.get(eid, 'Storage');
       const hauler = world.get(eid, 'Hauler');
       const tower = world.get(eid, 'PowerTower');
@@ -195,6 +197,10 @@ export function createInspector({ getWorld, registry, getPower }) {
         }
       } else if (gen) {
         lines.push(kv('发电功率', `${gen.output.toFixed(0)}`));
+      } else if (lab) {
+        lines.push(stateLine('状态', lab.state, LAB_STATE));
+        lines.push(kv('消耗', `${itemName(lab.input)} ${(lab.inRate || 0).toFixed(1)}/秒`));
+        lines.push(kv('发展贡献', `${(lab.rate * (lab.devPerUnit || 1)).toFixed(1)}/秒`));
       } else if (miner) {
         const mt = registry.machineTypes[miner.typeId] || {};
         const rate = (mt.digRate || 0) * (mt.yield || 0);
@@ -232,5 +238,5 @@ export function createInspector({ getWorld, registry, getPower }) {
 }
 
 function kindLabel(kind) {
-  return { depot: '矿场', miner: '采矿', producer: '生产', storage: '存储', tower: '输电', generator: '发电' }[kind] || kind || '';
+  return { depot: '矿场', miner: '采矿', producer: '生产', storage: '存储', tower: '输电', generator: '发电', lab: '科研' }[kind] || kind || '';
 }
