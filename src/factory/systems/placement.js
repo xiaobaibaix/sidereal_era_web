@@ -64,6 +64,17 @@ export function placeBuilding(world, ctx, buildingId, dir, yaw = 0) {
     world.add(e, 'Construction', { stage: 0, prog: 0, contributed: {}, done: false, built: false });
     world.add(e, 'Inventory', { items: {}, cap: b.cap != null ? b.cap : 1000 });
     world.add(e, 'Requester', { needs: {} });   // 由 construction 按阶段设置
+  } else if (b.kind === 'loadstation') {
+    // 装货站(B2): 缓冲仓 + 对卡车表现为 Provider。带/分拣器填它, 卡车从它取货(远距离起点)。
+    world.add(e, 'Inventory', { items: {}, cap: b.cap != null ? b.cap : 1000 });
+    world.add(e, 'Provider', { items: b.filter || '*' });        // 卡车取货依此过滤; 默认供应一切
+    world.add(e, 'LoadStation', { filter: b.filter || null });
+  } else if (b.kind === 'unloadstation') {
+    // 卸货站(B2): 缓冲仓 + 对卡车表现为 Requester。卡车卸进它, 带/分拣器取走送下游(远距离终点)。
+    world.add(e, 'Inventory', { items: {}, cap: b.cap != null ? b.cap : 1000 });
+    world.add(e, 'Requester', { needs: b.needs || {} });         // 空需求 → 通用卸货(接收任何物品)
+    world.add(e, 'Provider', { items: '*' });                    // 供下游分拣器取走
+    world.add(e, 'UnloadStation', {});
   }
 
   if (bus) bus.emit('build', { eid: e, buildingId });

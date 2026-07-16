@@ -16,8 +16,14 @@ export function createLogisticsSystem(opts = {}) {
   return function logisticsSystem(world, dt, ctx) {
     const reg = ctx.registry;
     const R = ctx.planet ? ctx.planet.params.radius : 100;
+    // 站点模式(B2): 世界中存在装/卸货站时, 卡车只在"装货站→卸货站"间跑;
+    // 否则回退到旧的"任意 Provider→Requester"直连(向后兼容, 现有 M2-M8 不受影响)。
+    const stationMode = world.count('LoadStation') > 0 || world.count('UnloadStation') > 0;
+    const finders = stationMode
+      ? { findJob: findStationJob, sinkForItem: stationSinkForItem }
+      : { findJob, sinkForItem };
     for (const e of world.query('Hauler', 'Mover')) {
-      stepHauler(world, dt, ctx, e, reg, R, LOAD_RATE);
+      stepHauler(world, dt, ctx, e, reg, R, LOAD_RATE, finders);
     }
   };
 }
@@ -76,6 +82,46 @@ function sinkForItem(world, item, fromDir) {
   return best;
 }
 
+// ---- 站点模式(B2): 卡车只认装货站(源) / 卸货站(汇) ----
+const providerOffers = (pr, it) => !pr || pr.items === '*' || (Array.isArray(pr.items) && pr.items.includes(it));
+
+// 卸货站能否接收 item: 有空位; 若配了具体 needs 则须是所需且未补满(否则通用卸货, 任何物品皆收)
+function unloadAccepts(world, U, item) {
+  const inv = world.get(U, 'Inventory');
+  if (!inv || invSpace(inv) <= 1e-6) return false;
+  const req = world.get(U, 'Requester');
+  if (req && req.needs && Object.keys(req.needs).length > 0) {
+    if (!(req.needs[item] > 0)) return false;
+    if ((inv.items[item] || 0) >= req.needs[item] - 1e-6) return false;
+  }
+  return true;
+}
+
+// 离 fromDir 最近、能接收 item 的卸货站
+function stationSinkForItem(world, item, fromDir) {
+  let best = null, bd = -2;
+  for (const U of world.query('UnloadStation', 'Inventory', 'Anchor')) {
+    if (!unloadAccepts(world, U, item)) continue;
+    const d = dot(fromDir, world.get(U, 'Anchor').dir);
+    if (d > bd) { bd = d; best = U; }
+  }
+  return best;
+}
+
+// 站点派活: 找一个有货的装货站, 匹配一个能接收该货的卸货站。返回 { source, sink, item } | null
+function findStationJob(world, fromDir) {
+  for (const L of world.query('LoadStation', 'Inventory', 'Anchor')) {
+    const pr = world.get(L, 'Provider');
+    const inv = world.get(L, 'Inventory');
+    let item = null;
+    for (const it in inv.items) { if (inv.items[it] > 1e-6 && providerOffers(pr, it)) { item = it; break; } }
+    if (!item) continue;
+    const U = stationSinkForItem(world, item, fromDir);
+    if (U != null && U !== L) return { source: L, sink: U, item };
+  }
+  return null;
+}
+
 // 给空车找活: 先喂需求方(有货可取), 再把供应方余量送仓库。返回 { source, sink, item } | null
 function findJob(world, fromDir) {
   // 1) 需求驱动: 某 Requester 缺某物 且 有 Provider 能供 → 送过去
@@ -108,7 +154,7 @@ function findJob(world, fromDir) {
   return null;
 }
 
-function stepHauler(world, dt, ctx, e, reg, R, loadRate) {
+function stepHauler(world, dt, ctx, e, reg, R, loadRate, finders) {
   const h = world.get(e, 'Hauler');
   const mv = world.get(e, 'Mover');
   const mt = reg.machineTypes[h.typeId] || {};
@@ -118,11 +164,11 @@ function stepHauler(world, dt, ctx, e, reg, R, loadRate) {
   switch (h.state) {
     case 'idle': {
       if (h.cargoAmt > 0) {   // 手里还有货 → 找目的地卸掉
-        const s = sinkForItem(world, h.cargoItem, mv.dir);
+        const s = finders.sinkForItem(world, h.cargoItem, mv.dir);
         if (s == null) return;
         h.sink = s; h.item = h.cargoItem; mv.target = anchorDir(world, s); h.state = 'to_sink'; return;
       }
-      const job = findJob(world, mv.dir);
+      const job = finders.findJob(world, mv.dir);
       if (job == null) return;   // 无活可干, 原地待命
       h.source = job.source; h.sink = job.sink; h.item = job.item;
       mv.target = anchorDir(world, job.source); h.state = 'to_src';
@@ -145,19 +191,19 @@ function stepHauler(world, dt, ctx, e, reg, R, loadRate) {
         const gap = sinkReq.needs[h.item] - (sinkInv.items[h.item] || 0) - h.cargoAmt;
         limit = Math.min(limit, Math.max(0, gap));
       }
-      if (limit <= 1e-6) { if (h.cargoAmt > 0) toSink(world, h, mv); else h.state = 'idle'; return; }   // 需求方已够: 有货则送, 空车则重新派活
+      if (limit <= 1e-6) { if (h.cargoAmt > 0) toSink(world, h, mv, finders); else h.state = 'idle'; return; }   // 需求方已够: 有货则送, 空车则重新派活
       const avail = inv.items[h.item] || 0;
       if (avail <= 1e-6) {   // 源没这个物品了
-        if (h.cargoAmt > 0) toSink(world, h, mv); else h.state = 'idle';
+        if (h.cargoAmt > 0) toSink(world, h, mv, finders); else h.state = 'idle';
         return;
       }
       const take = Math.min(loadRate * dt, limit, avail);
       h.cargoAmt += invTake(inv, h.item, take); h.cargoItem = h.item;
-      if (h.cargoAmt >= cap - 1e-6) toSink(world, h, mv);
+      if (h.cargoAmt >= cap - 1e-6) toSink(world, h, mv, finders);
       return;
     }
     case 'to_sink': {
-      if (h.sink == null || !world.alive(h.sink)) { const s = sinkForItem(world, h.cargoItem, mv.dir); if (s == null) return; h.sink = s; mv.target = anchorDir(world, s); }
+      if (h.sink == null || !world.alive(h.sink)) { const s = finders.sinkForItem(world, h.cargoItem, mv.dir); if (s == null) return; h.sink = s; mv.target = anchorDir(world, s); }
       const r = moveToward(mv.dir, mv.target, maxAng); mv.dir = r.dir;
       if (r.arrived) h.state = 'unload'; else mv.fwd = tangentToward(mv.dir, mv.target);
       return;
@@ -179,9 +225,9 @@ function stepHauler(world, dt, ctx, e, reg, R, loadRate) {
 }
 
 // 转入 to_sink: 为当前载货选目的地
-function toSink(world, h, mv) {
+function toSink(world, h, mv, finders) {
   const item = h.cargoItem || h.item;
-  const s = (h.sink != null && world.alive(h.sink)) ? h.sink : sinkForItem(world, item, mv.dir);
+  const s = (h.sink != null && world.alive(h.sink)) ? h.sink : finders.sinkForItem(world, item, mv.dir);
   if (s == null) { h.state = 'idle'; return; }
   h.sink = s; mv.target = anchorDir(world, s); h.state = 'to_sink';
 }
