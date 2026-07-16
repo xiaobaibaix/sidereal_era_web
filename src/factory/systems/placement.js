@@ -56,6 +56,11 @@ export function placeBuilding(world, ctx, buildingId, dir, yaw = 0) {
     world.add(e, 'Inventory', { items: {}, cap: b.cap != null ? b.cap : 100 });
     const mult = b.bufferMult != null ? b.bufferMult : 10;
     world.add(e, 'Requester', { needs: { [b.input]: (b.inRate || 1) * mult } });
+  } else if (b.kind === 'engine') {
+    // 行星发动机: 分阶段建造(construction 系统驱动)。按当前阶段向物流请求建材。
+    world.add(e, 'Construction', { stage: 0, prog: 0, contributed: {}, done: false, built: false });
+    world.add(e, 'Inventory', { items: {}, cap: b.cap != null ? b.cap : 1000 });
+    world.add(e, 'Requester', { needs: {} });   // 由 construction 按阶段设置
   }
 
   if (bus) bus.emit('build', { eid: e, buildingId });

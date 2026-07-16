@@ -10,7 +10,7 @@ const ITEM_ICON = {
   overburden: 'soil-pile', stone: 'stone-ore', iron_ore: 'iron-ore', copper_ore: 'copper-ore',
   iron_ingot: 'iron-plate', copper_ingot: 'copper-plate', iron_plate: 'steel-plate',
 };
-const MESH_ICON = { miner: 'mining-drill', smelter: 'smelter', assembler: 'assembler-1', warehouse: 'storage-1', truck: 'logistic-drone', depot: 'storage-tank', excavator: 'mining-drill', tower: 'tesla-coil', generator: 'wind-turbine', lab: 'lab' };
+const MESH_ICON = { miner: 'mining-drill', smelter: 'smelter', assembler: 'assembler-1', warehouse: 'storage-1', truck: 'logistic-drone', depot: 'storage-tank', excavator: 'mining-drill', tower: 'tesla-coil', generator: 'wind-turbine', lab: 'lab', engine: 'vertical-launching-silo' };
 
 const MINER_STATE = { mining: '开采中', full: '满仓待运', blocked: '受阻(需更高级钻机)', idle: '空闲' };
 const PROD_STATE = { working: '生产中', starved: '缺原料', output_full: '产物已满', no_power: '缺电停机', idle: '空闲' };
@@ -156,6 +156,7 @@ export function createInspector({ getWorld, registry, getPower }) {
       const minetruck = world.get(eid, 'MineTruck');
       const prod = world.get(eid, 'Producer');
       const lab = world.get(eid, 'Lab');
+      const con = world.get(eid, 'Construction');
       const storage = world.get(eid, 'Storage');
       const hauler = world.get(eid, 'Hauler');
       const tower = world.get(eid, 'PowerTower');
@@ -165,8 +166,27 @@ export function createInspector({ getWorld, registry, getPower }) {
       const lines = [];
       const stateLine = (label, s, map) => `<div style="margin:2px 0"><span style="color:#9aa0a8">${label}</span> <b style="color:${STATE_COLOR[s] || '#e8eaed'}">${(map && map[s]) || s}</b></div>`;
       const kv = (k, v) => `<div style="margin:2px 0"><span style="color:#9aa0a8">${k}</span> <span style="font-variant-numeric:tabular-nums">${v}</span></div>`;
+      const bar = (pct, col) => `<div style="margin:4px 0;height:8px;background:rgba(255,255,255,0.1);border-radius:4px;overflow:hidden"><div style="height:100%;width:${Math.max(0, Math.min(100, pct)).toFixed(0)}%;background:${col || '#ffc040'};transition:width .1s"></div></div>`;
 
-      if (depot) {
+      if (con) {
+        const b = registry.buildings[world.get(eid, 'Building').typeId] || {};
+        const stages = b.stages || [];
+        if (con.done) {
+          lines.push(kv('状态', '<b style="color:#66cc66">已建成 · 待点火</b>'));
+          lines.push(bar(100, '#66cc66'));
+        } else {
+          const st = stages[con.stage] || {};
+          lines.push(kv('阶段', `${st.name || st.id || '?'} (${con.stage + 1}/${stages.length})`));
+          if (st.type === 'build' || st.type === 'assemble') {
+            const need = st.in || {};
+            let g = 0, n = 0;
+            for (const it in need) { const got = Math.min(need[it], con.contributed[it] || 0); g += got; n += need[it]; lines.push(kv(itemName(it), `${Math.round(got)} / ${need[it]}`)); }
+            lines.push(bar(n > 0 ? (g / n) * 100 : 0));
+          } else {
+            lines.push(bar(st.time ? (con.prog / st.time) * 100 : 0, '#b08cff'));
+          }
+        }
+      } else if (depot) {
         // 矿场: 挖掘区状态 + 绑定的挖机/采矿车数
         let exc = 0, mtk = 0;
         for (const e of world.query('Excavator')) if (world.get(e, 'Excavator').depot === eid) exc++;
@@ -238,5 +258,5 @@ export function createInspector({ getWorld, registry, getPower }) {
 }
 
 function kindLabel(kind) {
-  return { depot: '矿场', miner: '采矿', producer: '生产', storage: '存储', tower: '输电', generator: '发电', lab: '科研' }[kind] || kind || '';
+  return { depot: '矿场', miner: '采矿', producer: '生产', storage: '存储', tower: '输电', generator: '发电', lab: '科研', engine: '巨构' }[kind] || kind || '';
 }

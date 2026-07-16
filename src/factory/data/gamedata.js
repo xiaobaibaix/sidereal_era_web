@@ -61,6 +61,17 @@ export const buildings = {
   generator: { name: '风力发电机', kind: 'generator', mesh: 'generator', output: 200 },
   // 研究站(M5): 消耗铁锭 → 提升殖民地发展度(简化"科技水平"占位)。发展度到阈值解锁科技。
   lab: { name: '研究站', kind: 'lab', mesh: 'lab', input: 'iron_ingot', inRate: 2, devPerUnit: 1, cap: 100, bufferMult: 10 },
+  // 行星发动机(M6): 科技锁(planet_engine)。分阶段建造 —— 选址平整→骨架投料→核心投料→调试 → 建成(未点火, M7 点火)。
+  //   type: 'level'/'commission' = 计时阶段; 'build'/'assemble' = 投料阶段(in 由物流送达并被吸收)。
+  engine_site: {
+    name: '行星发动机', kind: 'engine', mesh: 'engine', locked: true, cap: 1000,
+    stages: [
+      { id: 'site', name: '选址平整', type: 'level', time: 8, radius: 0.05 },
+      { id: 'frame', name: '骨架搭建', type: 'build', in: { iron_plate: 120 } },
+      { id: 'core', name: '核心组装', type: 'assemble', in: { iron_plate: 200 } },
+      { id: 'commission', name: '调试', type: 'commission', time: 10 },
+    ],
+  },
 };
 
 // 科技(M5): 发展度(dev)到阈值(+可选 builtAny)自动解锁; unlock 列出解锁的建筑/配方 id。

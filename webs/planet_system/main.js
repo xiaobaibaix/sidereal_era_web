@@ -17,6 +17,7 @@ import { createMiningCrewSystem, setDigZone, spawnExcavators, spawnMineTrucks } 
 import { createProductionSystem } from '../../src/factory/systems/production.js';
 import { createPowerSystem } from '../../src/factory/systems/power.js';
 import { createResearchSystem } from '../../src/factory/systems/research.js';
+import { createConstructionSystem } from '../../src/factory/systems/construction.js';
 import { placeBuilding, demolish } from '../../src/factory/systems/placement.js';
 import { createLogisticsSystem, spawnHaulers } from '../../src/factory/systems/logistics.js';
 import { createFactoryRenderer } from '../../src/factory/render/factory_render.js';
@@ -311,6 +312,7 @@ const factory = createFactory({ planet, data: gameData });
 factory.addSystem('mining_crew', createMiningCrewSystem());  // 矿场小队: 挖机在挖掘区挖 → 采矿卡车运进矿场
 factory.addSystem('power', createPowerSystem());            // M4: 输电塔组网 + 供需满足率(须在 production 前)
 factory.addSystem('production', createProductionSystem());  // M3: 冶炼/制造按配方产出(缺电降速)
+factory.addSystem('construction', createConstructionSystem()); // M6: 行星发动机分阶段建造(按阶段请求建材)
 factory.addSystem('logistics', createLogisticsSystem());    // M2a: 卡车按供需搬运
 factory.addSystem('research', createResearchSystem());      // M5: 研究站→发展度→解锁科技
 const factoryRenderer = createFactoryRenderer(scene, planet, { size: 1 });
@@ -1210,7 +1212,7 @@ const fpTool = {
 };
 let _fpDown = null;
 const fpGui = new GUI({ title: '🏭 工厂', container: bottomLeftPanels });
-fpGui.add(fpTool, 'mode', ['关闭', '放置矿场', '圈定挖掘区', '放置冶炼炉', '放置制造台', '放置研究站', '放置仓库', '放置输电塔', '放置发电机', '拆除']).name('模式').listen()
+fpGui.add(fpTool, 'mode', ['关闭', '放置矿场', '圈定挖掘区', '放置冶炼炉', '放置制造台', '放置研究站', '放置仓库', '放置输电塔', '放置发电机', '放置发动机', '拆除']).name('模式').listen()
   .onChange((v) => {
     if (v !== '关闭') {   // 进入工厂放置 → 关掉手动刷子与挖机选区, 避免抢点击
       brush.enabled = false; applyBrushControls();
@@ -1310,6 +1312,12 @@ function tryPlace(buildingId, dir, okMsg) {
   return e;
 }
 
+// 发动机建造事件 → toast
+const _engineStageName = { site: '选址平整', frame: '骨架搭建', core: '核心组装', commission: '调试' };
+factory.bus.on('engine_stage', (p) => showToast(`行星发动机: 进入「${_engineStageName[p.stage] || p.stage}」阶段`, false));
+factory.bus.on('engine_built', () => showToast('🚀 行星发动机建成! (待点火 — 后续里程碑)', false));
+factory.bus.on('tech', (p) => showToast(`🔬 科技解锁: ${(p.tech && p.tech.name) || p.id}`, false));
+
 renderer.domElement.addEventListener('pointerdown', (e) => { if (fpTool.mode !== '关闭' && e.button === 0) _fpDown = { x: e.clientX, y: e.clientY }; });
 renderer.domElement.addEventListener('pointerup', (e) => {
   if (fpTool.mode === '关闭' || !_fpDown) { _fpDown = null; return; }
@@ -1338,6 +1346,8 @@ renderer.domElement.addEventListener('pointerup', (e) => {
     tryPlace('power_tower', dir, '已放置输电塔');
   } else if (fpTool.mode === '放置发电机') {
     tryPlace('generator', dir, '已放置发电机');
+  } else if (fpTool.mode === '放置发动机') {
+    tryPlace('engine_site', dir, '已开建行星发动机 · 依阶段自动索取建材(铁板)');
   } else if (fpTool.mode === '拆除') {
     const eid = factory.spatial.nearest(dir);
     if (eid != null) { if (inspector.selected() === eid) inspector.hide(); demolish(factory.world, factory.ctx, eid); showToast('已拆除', false); }
