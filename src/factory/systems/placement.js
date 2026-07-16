@@ -2,6 +2,7 @@
 // 与渲染/UI 解耦: App 只需 pick 到方向 dir 后调 placeBuilding。
 
 import { createBelt } from './belt.js';
+import { midPortDir } from './inserter.js';
 
 // 放置一个建筑; 返回实体 id(失败返回 null)
 export function placeBuilding(world, ctx, buildingId, dir, yaw = 0) {
@@ -77,6 +78,27 @@ export function placeBelt(world, ctx, from, to, opts = {}) {
   const b = registry.buildings[buildingId];
   if (b && b.locked && !(registry.isUnlocked && registry.isUnlocked(buildingId))) return null;
   return createBelt(world, ctx, from, to, { ...opts, buildingId });
+}
+
+// 放置一个分拣器。from/to 为 Port {kind:'inv'|'belt', eid, role}(取货端/放货端)。
+// opts: { buildingId, rate, filter }。返回实体 id(失败返回 null)。
+export function placeInserter(world, ctx, from, to, opts = {}) {
+  const { registry, spatial, bus } = ctx;
+  const buildingId = opts.buildingId || 'inserter';
+  const b = registry.buildings[buildingId];
+  if (b && b.locked && !(registry.isUnlocked && registry.isUnlocked(buildingId))) return null;
+  const mt = registry.machineTypes[(b && b.machine) || 'inserter_mk1'] || {};
+  const rate = opts.rate != null ? opts.rate : (mt.rate != null ? mt.rate : 4);
+  const filter = opts.filter != null ? opts.filter : null;
+  const dir = midPortDir(world, from, to);
+
+  const e = world.create();
+  world.add(e, 'Anchor', { dir: [dir[0], dir[1], dir[2]], yaw: opts.yaw || 0 });
+  world.add(e, 'Building', { typeId: buildingId, mesh: (b && b.mesh) || mt.mesh || 'inserter' });
+  world.add(e, 'Inserter', { from, to, rate, filter, carry: null, charge: 0 });
+  if (spatial) spatial.insert(e, dir);
+  if (bus) bus.emit('build', { eid: e, buildingId });
+  return e;
 }
 
 // 拆除: 移除组件/实体, 回收其地形坑/挖掘区 edit 并失效该区域(地形恢复)
