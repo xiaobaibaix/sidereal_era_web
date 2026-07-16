@@ -172,8 +172,12 @@ export function createInspector({ getWorld, registry, getPower }) {
         const b = registry.buildings[world.get(eid, 'Building').typeId] || {};
         const stages = b.stages || [];
         if (con.done) {
-          lines.push(kv('状态', '<b style="color:#66cc66">已建成 · 待点火</b>'));
-          lines.push(bar(100, '#66cc66'));
+          const burnLabel = { off: '未点火', burning: '🔥 燃烧中', flameout: '熄火(缺燃料)' };
+          const burnColor = { burning: '#ff8a2d', flameout: '#d0704f', off: '#8a8f98' };
+          lines.push(kv('状态', con.ignited ? '<b style="color:#66cc66">已点火</b>' : '<b style="color:#66cc66">已建成 · 待点火</b>'));
+          lines.push(kv('点火', `<b style="color:${burnColor[con.burn] || '#8a8f98'}">${con.ignited ? (burnLabel[con.burn] || '—') : '未点火'}</b>`));
+          if (con.ignited) lines.push(kv('推力', `${(con.thrust || 0).toFixed(0)}`));
+          lines.push(bar(100, con.ignited && con.burn === 'burning' ? '#ff8a2d' : '#66cc66'));
         } else {
           const st = stages[con.stage] || {};
           lines.push(kv('阶段', `${st.name || st.id || '?'} (${con.stage + 1}/${stages.length})`));

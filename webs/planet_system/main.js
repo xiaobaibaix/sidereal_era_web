@@ -18,6 +18,7 @@ import { createProductionSystem } from '../../src/factory/systems/production.js'
 import { createPowerSystem } from '../../src/factory/systems/power.js';
 import { createResearchSystem } from '../../src/factory/systems/research.js';
 import { createConstructionSystem } from '../../src/factory/systems/construction.js';
+import { createEngineSystem } from '../../src/factory/systems/engine.js';
 import { placeBuilding, demolish } from '../../src/factory/systems/placement.js';
 import { createLogisticsSystem, spawnHaulers } from '../../src/factory/systems/logistics.js';
 import { createFactoryRenderer } from '../../src/factory/render/factory_render.js';
@@ -313,8 +314,10 @@ factory.addSystem('mining_crew', createMiningCrewSystem());  // 矿场小队: �
 factory.addSystem('power', createPowerSystem());            // M4: 输电塔组网 + 供需满足率(须在 production 前)
 factory.addSystem('production', createProductionSystem());  // M3: 冶炼/制造按配方产出(缺电降速)
 factory.addSystem('construction', createConstructionSystem()); // M6: 行星发动机分阶段建造(按阶段请求建材)
+factory.addSystem('engine', createEngineSystem());          // M7: 点火燃烧→推力(planet_system 无轨道, 仅显示; solar 接 nbody)
 factory.addSystem('logistics', createLogisticsSystem());    // M2a: 卡车按供需搬运
 factory.addSystem('research', createResearchSystem());      // M5: 研究站→发展度→解锁科技
+factory.ctx.planetMass = 1e6;                               // 行星质量(推力→加速度用; solar 里用真实质量)
 const factoryRenderer = createFactoryRenderer(scene, planet, { size: 1 });
 const inspector = createInspector({ getWorld: () => factory.world, registry: factory.registry, getPower: () => factory.ctx.power });
 const _facRay = new THREE.Raycaster();       // 点击拾取建筑/agent 用
@@ -1212,7 +1215,7 @@ const fpTool = {
 };
 let _fpDown = null;
 const fpGui = new GUI({ title: '🏭 工厂', container: bottomLeftPanels });
-fpGui.add(fpTool, 'mode', ['关闭', '放置矿场', '圈定挖掘区', '放置冶炼炉', '放置制造台', '放置研究站', '放置仓库', '放置输电塔', '放置发电机', '放置发动机', '拆除']).name('模式').listen()
+fpGui.add(fpTool, 'mode', ['关闭', '放置矿场', '圈定挖掘区', '放置冶炼炉', '放置制造台', '放置研究站', '放置仓库', '放置输电塔', '放置发电机', '放置发动机', '点火发动机', '拆除']).name('模式').listen()
   .onChange((v) => {
     if (v !== '关闭') {   // 进入工厂放置 → 关掉手动刷子与挖机选区, 避免抢点击
       brush.enabled = false; applyBrushControls();
@@ -1348,6 +1351,14 @@ renderer.domElement.addEventListener('pointerup', (e) => {
     tryPlace('generator', dir, '已放置发电机');
   } else if (fpTool.mode === '放置发动机') {
     tryPlace('engine_site', dir, '已开建行星发动机 · 依阶段自动索取建材(铁板)');
+  } else if (fpTool.mode === '点火发动机') {
+    const eng = factoryRenderer.pickBuilding(factory.world, dir);
+    if (eng == null || !factory.world.has(eng, 'Construction')) { showToast('请点选一台行星发动机', true); return; }
+    const con = factory.world.get(eng, 'Construction');
+    if (!con.built) { showToast('发动机尚未建成, 无法点火', true); return; }
+    if (con.ignited) { showToast('该发动机已点火', false); return; }
+    con.ignited = true;
+    showToast('🔥 行星发动机点火! 燃烧废料产生推力(需物流持续供料)', false);
   } else if (fpTool.mode === '拆除') {
     const eid = factory.spatial.nearest(dir);
     if (eid != null) { if (inspector.selected() === eid) inspector.hide(); demolish(factory.world, factory.ctx, eid); showToast('已拆除', false); }

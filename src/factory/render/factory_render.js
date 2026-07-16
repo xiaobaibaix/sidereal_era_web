@@ -299,6 +299,15 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
     return out.set(dir[0], dir[1], dir[2]).multiplyScalar(rr).add(planet.position);
   }
 
+  // ---- 发动机喷流(点火燃烧时): 从喷口朝外(+径向)喷出的羽流锥 ----
+  const jetGeo = new THREE.ConeGeometry(3.2, 14, 14, 1, true);   // 半径3.2 高14; apex 在 +y
+  jetGeo.translate(0, 13 + 7, 0);   // 底(宽)贴喷口(~y13), 尖端朝外(~y27)
+  const jetMat = new THREE.MeshBasicMaterial({ color: 0xffb347, transparent: true, opacity: 0.5, depthWrite: false, side: THREE.DoubleSide });
+  const jetMesh = new THREE.InstancedMesh(jetGeo, jetMat, MAX);
+  jetMesh.frustumCulled = false; jetMesh.count = 0; jetMesh.renderOrder = 996;
+  jetMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  scene.add(jetMesh);
+
   return {
     groups,
     setPlanet(p) { planet = p; },
@@ -345,6 +354,21 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
         g.mesh.count = g.count;
         g.mesh.instanceMatrix.needsUpdate = true;
         if (g.mesh.instanceColor) g.mesh.instanceColor.needsUpdate = true;
+      }
+
+      // 发动机喷流(燃烧中): 从喷口朝外
+      {
+        let j = 0;
+        for (const e of world.query('Construction', 'Anchor')) {
+          if (j >= MAX) break;
+          const con = world.get(e, 'Construction');
+          if (!con.built || con.burn !== 'burning') continue;
+          worldMatrix(world.get(e, 'Anchor').dir, 0, planet, _m, size);
+          jetMesh.setMatrixAt(j, _m);
+          j++;
+        }
+        jetMesh.count = j;
+        jetMesh.instanceMatrix.needsUpdate = true;
       }
 
       // 可点击范围圆环(仅在开启时): 每个建筑一个环, 半径 = 其 pick 半径
@@ -425,8 +449,8 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
         const g = groups[name];
         scene.remove(g.mesh); g.geo.dispose(); g.mat.dispose();
       }
-      scene.remove(ringGroup); scene.remove(zoneGroup); scene.remove(powerLines);
-      ringGeo.dispose(); ringMat.dispose(); zoneMat.dispose(); powerGeo.dispose(); powerMat.dispose();
+      scene.remove(ringGroup); scene.remove(zoneGroup); scene.remove(powerLines); scene.remove(jetMesh);
+      ringGeo.dispose(); ringMat.dispose(); zoneMat.dispose(); powerGeo.dispose(); powerMat.dispose(); jetGeo.dispose(); jetMat.dispose();
     },
   };
 }

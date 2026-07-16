@@ -16,6 +16,7 @@ export class Body {
     this.vel = vel ? vel.clone() : new THREE.Vector3();
     this.acc = new THREE.Vector3();
     this._accOld = new THREE.Vector3();
+    this.externalAcc = new THREE.Vector3();   // 引力之外的外力加速度(如行星发动机推力); 每步叠加进 acc
     this.radius = radius;
     this.color = color;
     this.type = type;              // 'star' | 'planet' | 'moon' | 'asteroid'
@@ -74,6 +75,8 @@ export class NBodySystem {
         bj.acc.x -= sj * dx; bj.acc.y -= sj * dy; bj.acc.z -= sj * dz;
       }
     }
+    // 叠加外力加速度(行星发动机推力等) —— velocity-Verlet 的 a(t)、a(t+dt) 两次都会含
+    for (let i = 0; i < n; i++) b[i].acc.add(b[i].externalAcc);
   }
 
   // 一步 velocity-Verlet:
