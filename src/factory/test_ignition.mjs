@@ -102,4 +102,26 @@ function builtEngine(world, ctx, dir) {
   ok('多台同向合推更强');
 }
 
+// ---- 熄火后补料自动复燃 + 物流按需送料(矿石作燃料) ----
+{
+  const ctx = makeCtx(stubPlanet());
+  const world = createWorld();
+  const e = builtEngine(world, ctx, S.norm([0, 1, 0]));
+  world.get(e, 'Construction').ignited = true;
+  world.addSystem('engine', createEngineSystem());
+
+  world.tick(0.05, ctx);
+  assert.equal(world.get(e, 'Construction').burn, 'flameout', '无料先熄火');
+  // 点火后应索取全部燃料(含常见矿石 iron_ore), 而非仅废料
+  const needs = world.get(e, 'Requester').needs;
+  assert.ok(needs.iron_ore > 0 && needs.overburden > 0, '索取包含常见矿石 iron_ore(不再只要废料)');
+
+  // 补入矿石 → 下一 tick 自动复燃(不是"废了")
+  invAdd(world.get(e, 'Inventory'), 'iron_ore', 100);
+  world.tick(0.05, ctx);
+  assert.equal(world.get(e, 'Construction').burn, 'burning', '补料后自动复燃');
+  assert.ok(world.get(e, 'Construction').thrust > 0, '复燃后恢复推力');
+  ok('熄火后补料自动复燃 + 索取常见矿石作燃料');
+}
+
 console.log(`\nM7 点火 全部通过 (${pass} 组断言)`);

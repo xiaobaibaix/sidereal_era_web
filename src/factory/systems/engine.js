@@ -50,12 +50,13 @@ export function createEngineSystem() {
 }
 
 // 每台发动机的燃料请求(建成点火后向物流索取的反应质量缓冲)
+// 索取"全部可燃反应质量"(废土/石头稀少, 必须也拉常见的矿石作燃料, 否则永远缺料熄火)。
+// burnFuel 会按 fuelItems 顺序优先烧废料, 所以废料仍会被优先消耗。
 function fuelNeeds(b) {
   const buf = b.fuelBuffer || 400;
   const items = (b.fuelItems && b.fuelItems.length) ? b.fuelItems : ['overburden'];
   const needs = {};
-  // 只主动索取前两种(废料), 其余若送来也照烧
-  for (const it of items.slice(0, 2)) needs[it] = buf;
+  for (const it of items) needs[it] = buf;
   return needs;
 }
 

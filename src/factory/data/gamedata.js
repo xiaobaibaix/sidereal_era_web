@@ -72,7 +72,8 @@ export const buildings = {
       { id: 'commission', name: '调试', type: 'commission', time: 10 },
     ],
     // 点火(M7): 燃烧任意反应质量(优先废土/石头), F = ṁ·ve。反作用推行星沿 -发动机方向。
-    burnRate: 40, exhaust: 60, fuelBuffer: 500, fuelItems: ['overburden', 'stone', 'copper_ore', 'iron_ore', 'iron_ingot'],
+    // 燃烧任意原始物质(废料优先, 但废料稀少 → 也烧常见矿石)。不烧铁锭/铁板(留给科研/建造)。
+    burnRate: 40, exhaust: 60, fuelBuffer: 300, fuelItems: ['overburden', 'stone', 'iron_ore', 'copper_ore'],
   },
 };
 
