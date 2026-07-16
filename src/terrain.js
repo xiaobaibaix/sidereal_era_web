@@ -72,6 +72,11 @@ export function makeTerrain(p) {
   const useClimate = p.useClimate;
   const altRange = p.climateAltRange || 1.0;
 
+  // 地表材质(方案B: 顶点级坡度混岩 + 低频颜色扰动, 打破单调色块; 逐顶点在 worker/主线程一致)
+  const slopeRock = p.surfSlopeRock != null ? p.surfSlopeRock : 0.7;      // 陡坡露岩强度(0=关)
+  const colorJitter = p.surfColorJitter != null ? p.surfColorJitter : 0.1; // 同 biome 颜色扰动幅度(0=关)
+  const jitterFreq = p.surfColorFreq != null ? p.surfColorFreq : 6.0;      // 扰动噪声频率(越大越碎)
+
   // 运行时编辑。snapshot 一份避免外部修改影响一致性。
   // 两类:
   //   减量式(默认, 鼠标刷子/填埋区): { pos, radius, depth(0..1, 正=挖/负=抬), falloff }
@@ -104,6 +109,7 @@ export function makeTerrain(p) {
   const noiseM = createNoise3D(mulberry32(mSeed));
   const noiseW = createNoise3D(mulberry32(warpSeed));
   const noiseH = createNoise3D(mulberry32(moSeed));
+  const noiseV = createNoise3D(mulberry32((moSeed ^ 0x5f356495) >>> 0));   // 地表颜色扰动噪声(独立种子, 与湿度解耦)
 
   // 基础地形高度(不含运行时 edits): 用于判断某方向"天然是陆地还是海"。
   function baseHeightAt(x, y, z) {
@@ -163,8 +169,26 @@ export function makeTerrain(p) {
     return h;
   }
 
-  function colorFor(h, x, y, z) {
-    // 海洋: 深浅水渐变
+  // 地表材质后处理(方案B): 陆地色 → 陡坡混岩 + 低频颜色扰动。
+  // slope: 1 - (法线·径向), 平坦≈0, 陡坡→大(由 patchgeom 传入; 缺省 0 = 不混岩)。
+  // 只作用于陆地(海洋/挖坑泥土保持原样, 海面另有 shader)。
+  function surfaceApply(col, slope, x, y, z) {
+    // 陡坡露岩: 缓坡草木、陡坡裸岩, 一下就有"地形感"
+    if (slopeRock > 0 && slope > 0) {
+      const w = smoothstep(0.22, 0.6, slope) * slopeRock;
+      if (w > 0) col = lerp3(col, C.rock, w);
+    }
+    // 低频颜色扰动: 同一 biome 内轻微明暗/色相漂移, 打破纯色块的"塑料感"
+    if (colorJitter > 0) {
+      const v = noiseV(x * jitterFreq, y * jitterFreq, z * jitterFreq);   // [-1,1]
+      const f = 1 + v * colorJitter;
+      col = [clamp01(col[0] * f), clamp01(col[1] * f), clamp01(col[2] * f)];
+    }
+    return col;
+  }
+
+  function colorFor(h, x, y, z, slope) {
+    // 海洋: 深浅水渐变(不做地表材质处理)
     if (h < sea) {
       // 陆地(原始地形高于海平面)被挖到海平面以下 → 露泥土; 但落在"湖"编辑内则保留海洋色。天然海不受影响。
       if (edits.length > 0 && baseHeightAt(x, y, z) >= sea) {
@@ -182,29 +206,34 @@ export function makeTerrain(p) {
       const d = clamp01((sea - h) / 0.3);
       return lerp3(C.oceanShallow, C.oceanDeep, d);
     }
+    // 陆地: 先算 biome 基色, 再统一叠加地表材质处理
+    let col;
     if (!useClimate) {
       const t = clamp01(h);
-      if (t < 0.05) return C.beach;
-      if (t < 0.4) return C.wet;
-      if (t < 0.7) return C.rock;
-      return C.snow;
+      if (t < 0.05) col = C.beach;
+      else if (t < 0.4) col = C.wet;
+      else if (t < 0.7) col = C.rock;
+      else col = C.snow;
+    } else if (h - sea < 0.02) {
+      col = C.beach;                                             // 海岸沙滩
+    } else {
+      // 气候: 温度(海拔+纬度) × 湿度 → 生物群系
+      const alt = clamp01((h - sea) / altRange);
+      const lat = Math.abs(y);                                   // 纬度 0..1
+      const temp = clamp01((1 - alt) * (1 - lat));               // 1=热, 0=冷
+      let moist = noiseH(x * moFreq, y * moFreq, z * moFreq) * 0.5 + 0.5;
+      moist = clamp01(moist * (1 - alt * 0.4));                  // 越高越干
+      if (alt > 0.72 || temp < 0.12) {
+        // 高海拔 / 极寒 → 岩石到雪
+        const s = clamp01((Math.max(alt, 1 - temp) - 0.6) / 0.4);
+        col = lerp3(C.rock, C.snow, s);
+      } else {
+        const cold = lerp3(C.coldDry, C.coldWet, moist);  // 冷: 苔原→针叶林
+        const warm = lerp3(C.dry, C.wet, moist);          // 热: 荒漠→雨林
+        col = lerp3(cold, warm, temp);
+      }
     }
-    // 海岸沙滩
-    if (h - sea < 0.02) return C.beach;
-    // 气候: 温度(海拔+纬度) × 湿度 → 生物群系
-    const alt = clamp01((h - sea) / altRange);
-    const lat = Math.abs(y);                                   // 纬度 0..1
-    const temp = clamp01((1 - alt) * (1 - lat));               // 1=热, 0=冷
-    let moist = noiseH(x * moFreq, y * moFreq, z * moFreq) * 0.5 + 0.5;
-    moist = clamp01(moist * (1 - alt * 0.4));                  // 越高越干
-    // 高海拔 / 极寒 → 岩石到雪
-    if (alt > 0.72 || temp < 0.12) {
-      const s = clamp01((Math.max(alt, 1 - temp) - 0.6) / 0.4);
-      return lerp3(C.rock, C.snow, s);
-    }
-    const cold = lerp3(C.coldDry, C.coldWet, moist);  // 冷: 苔原→针叶林
-    const warm = lerp3(C.dry, C.wet, moist);          // 热: 荒漠→雨林
-    return lerp3(cold, warm, temp);
+    return surfaceApply(col, slope || 0, x, y, z);
   }
 
   return { heightAt, colorFor, baseHeightAt };

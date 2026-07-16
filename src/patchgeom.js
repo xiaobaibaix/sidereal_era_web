@@ -78,10 +78,8 @@ export function buildPatchArrays(A, B, C, N, R, maxHeight, seaLevel, heightAt, c
       const h = heightAt(d[0], d[1], d[2]);
       const rr = R + h * maxHeight;
       pos[k3] = d[0] * rr; pos[k3 + 1] = d[1] * rr; pos[k3 + 2] = d[2] * rr;
-      const c = colorFor(h, d[0], d[1], d[2]);
-      col[k3] = c[0]; col[k3 + 1] = c[1]; col[k3 + 2] = c[2];
 
-      // 有限差分法线
+      // 有限差分法线(先算, 供 colorFor 的坡度混岩用)
       let hax = 1, hay = 0, haz = 0;
       if (Math.abs(d[0]) > 0.9) { hax = 0; hay = 1; haz = 0; }
       let t1x = d[1] * haz - d[2] * hay, t1y = d[2] * hax - d[0] * haz, t1z = d[0] * hay - d[1] * hax;
@@ -97,6 +95,11 @@ export function buildPatchArrays(A, B, C, N, R, maxHeight, seaLevel, heightAt, c
       const nl = 1 / (Math.hypot(nx, ny, nz) || 1); nx *= nl; ny *= nl; nz *= nl;
       if (nx * d[0] + ny * d[1] + nz * d[2] < 0) { nx = -nx; ny = -ny; nz = -nz; }
       nor[k3] = nx; nor[k3 + 1] = ny; nor[k3 + 2] = nz;
+
+      // 坡度混岩: slope = 1 - 法线·径向 (平坦≈0, 陡坡→大), 传给 colorFor 决定裸岩比例
+      const slope = 1 - (nx * d[0] + ny * d[1] + nz * d[2]);
+      const c = colorFor(h, d[0], d[1], d[2], slope);
+      col[k3] = c[0]; col[k3 + 1] = c[1]; col[k3 + 2] = c[2];
     }
   }
 

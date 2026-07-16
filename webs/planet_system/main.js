@@ -34,6 +34,18 @@ const params = {
   // 外观
   showOcean: true,
 
+  // 地表材质(A=shader 细节法线/凹陷/粗糙度, B=顶点坡度混岩/颜色扰动)
+  surfDetail: true,          // 程序化细节总开关(shader)
+  surfDetailStrength: 0.6,   // 细节法线强度
+  surfDetailFreq: 0.5,       // 细节噪声频率(世界系)
+  surfDetailFade: 260,       // 细节淡出距离(相机世界距离)
+  surfCavity: 0.35,          // 凹陷变暗(AO 感)
+  surfRoughVar: 0.3,         // 粗糙度扰动
+  surfSnowSheen: 0.5,        // 雪地光泽(降低亮色粗糙度)
+  surfSlopeRock: 0.7,        // 陡坡露岩(顶点级, 改需重建)
+  surfColorJitter: 0.1,      // 同 biome 颜色扰动(顶点级, 改需重建)
+  surfColorFreq: 6.0,        // 颜色扰动频率(顶点级, 改需重建)
+
   // 大气(瑞利 + 米氏单次散射)
   showAtmosphere: true,
   atmoScale: 1.08,          // 大气顶半径 = radius * atmoScale(≈厚度8%, 接近地球薄大气)
@@ -531,6 +543,31 @@ const fApp = gui.addFolder('外观');
 fApp.add(params, 'showOcean').name('海洋').onChange((v) => { ocean.visible = v; });
 fApp.add(params, 'showAtmosphere').name('大气');
 
+// 地表材质: 把 A(shader) 参数写入 planet.surfaceUniforms(即时生效, 不用重建); B 参数走重建。
+function applySurface() {
+  const u = planet.surfaceUniforms;
+  u.uSurfDetail.value = params.surfDetail ? 1.0 : 0.0;
+  u.uDetailStrength.value = params.surfDetailStrength;
+  u.uDetailFreq.value = params.surfDetailFreq;
+  u.uDetailFade.value = params.surfDetailFade;
+  u.uCavity.value = params.surfCavity;
+  u.uRoughVar.value = params.surfRoughVar;
+  u.uSnowSheen.value = params.surfSnowSheen;
+}
+applySurface();
+
+const fSurf = gui.addFolder('地表材质');
+fSurf.add(params, 'surfDetail').name('程序化细节开关').onChange(applySurface);
+fSurf.add(params, 'surfDetailStrength', 0, 2).name('细节法线强度').onChange(applySurface);
+fSurf.add(params, 'surfDetailFreq', 0.05, 2.0).name('细节频率').onChange(applySurface);
+fSurf.add(params, 'surfDetailFade', 40, 1000).name('细节淡出距离').onChange(applySurface);
+fSurf.add(params, 'surfCavity', 0, 1).name('凹陷变暗(AO感)').onChange(applySurface);
+fSurf.add(params, 'surfRoughVar', 0, 1).name('粗糙度扰动').onChange(applySurface);
+fSurf.add(params, 'surfSnowSheen', 0, 1).name('雪地光泽').onChange(applySurface);
+fSurf.add(params, 'surfSlopeRock', 0, 1).name('陡坡露岩(重建)').onFinishChange(rebuild);
+fSurf.add(params, 'surfColorJitter', 0, 0.4).name('颜色扰动(重建)').onFinishChange(rebuild);
+fSurf.add(params, 'surfColorFreq', 1, 20).name('颜色扰动频率(重建)').onFinishChange(rebuild);
+
 const fSun = gui.addFolder('太阳');
 fSun.add(params, 'sunElevation', -20, 90).name('仰角°').onChange(updateSun);
 const sunAzCtrl = fSun.add(params, 'sunAzimuth', 0, 360).name('方位角°').onChange(updateSun);
@@ -640,7 +677,8 @@ function applyParams(src) {
   planet.setWireframe(params.wireframe);
   if (walker) { walker.speed = params.walkSpeed; walker.invertY = params.invertY; }
   updateSun();
-  rebuild();          // 重建地形 + layoutEffects(海洋/大气全部 uniform)
+  applySurface();     // 地表材质 shader uniform(A)
+  rebuild();          // 重建地形(含 B 顶点材质) + layoutEffects(海洋/大气全部 uniform)
   layoutInset();
 }
 function loadParams() {

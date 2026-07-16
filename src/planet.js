@@ -12,6 +12,8 @@ const TERRAIN_KEYS = [
   'mountainSeed', 'mountainFreq', 'mountainOctaves', 'mountainStrength', 'seaLevel',
   'warpSeed', 'warpStrength', 'warpFreq', 'plateSeed', 'plateFreq', 'plateStrength',
   'moistureSeed', 'moistureFreq', 'useClimate', 'climateAltRange',
+  // 地表材质(方案B, 顶点级坡度混岩 + 颜色扰动; worker 需一致故列入)
+  'surfSlopeRock', 'surfColorJitter', 'surfColorFreq',
   // 可调调色板(缺省时 terrain.js 用默认色)
   'colOceanShallow', 'colOceanDeep', 'colBeach', 'colDry', 'colWet',
   'colColdDry', 'colColdWet', 'colRock', 'colSnow',
@@ -106,12 +108,24 @@ export class Planet extends THREE.Group {
       vertexColors: true, roughness: 0.9, metalness: 0.0, side: THREE.FrontSide,
       polygonOffsetFactor: 1, polygonOffsetUnits: 1,
     });
+    // 方案A: 程序化地表材质(细节法线 + 凹陷 AO + 粗糙度扰动 + 雪地光泽), 全部走 uniform 可调/可关。
+    // 用 onBeforeCompile 注入进标准材质 → 保留 three.js 的光照/阴影/LOD 管线; 不需要贴图/UV。
+    this.surfaceUniforms = {
+      uSurfDetail: { value: 1.0 },      // 主开关(0=关, 退回原顶点色标准材质)
+      uDetailStrength: { value: 0.6 },  // 细节法线扰动强度(微凹凸的明暗)
+      uDetailFreq: { value: 0.5 },      // 细节噪声频率(世界系; 越大凹凸越细)
+      uDetailFade: { value: 260.0 },    // 细节淡出距离(相机世界距离, 远处不显以免闪烁)
+      uCavity: { value: 0.35 },         // 凹陷变暗(AO 感; 沟壑更暗)
+      uRoughVar: { value: 0.3 },        // 粗糙度随机扰动幅度
+      uSnowSheen: { value: 0.5 },       // 亮色(雪)降低粗糙度 → 一点光泽
+    };
+    this._installSurfaceShader(this.material);
     this.wireMaterial = new THREE.LineBasicMaterial({ color: 0xffffff });
     this._wire = false;
     this._solidColor = 0x05070d;
 
     this._heightCb = (x, y, z) => this.heightAt(x, y, z);
-    this._colorCb = (h, x, y, z) => this.colorFor(h, x, y, z);
+    this._colorCb = (h, x, y, z, slope) => this.colorFor(h, x, y, z, slope);
 
     this._gen = 0;
     this._pool = getPool();     // 共享 worker 池
@@ -126,6 +140,83 @@ export class Planet extends THREE.Group {
 
     this._buildNoise();
     this._buildRoots();
+  }
+
+  // 方案A: 往标准材质里注入程序化地表细节(细节法线/凹陷/粗糙度/雪地光泽)。
+  // 全程序化(value-noise fBm), 无贴图无 UV; 按相机距离淡出, 远处退回原始外观。
+  _installSurfaceShader(material) {
+    const uniforms = this.surfaceUniforms;
+    material.onBeforeCompile = (shader) => {
+      Object.assign(shader.uniforms, uniforms);   // 复用同一批 uniform 对象引用 → GUI 改 .value 即时生效
+
+      // ---- 顶点: 传世界坐标 + 世界法线给片元 ----
+      shader.vertexShader = shader.vertexShader
+        .replace('#include <common>', `#include <common>
+      varying vec3 vSurfWPos;
+      varying vec3 vSurfWNrm;`)
+        .replace('#include <beginnormal_vertex>', `#include <beginnormal_vertex>
+      vSurfWNrm = normalize(mat3(modelMatrix) * objectNormal);`)
+        .replace('#include <begin_vertex>', `#include <begin_vertex>
+      vSurfWPos = (modelMatrix * vec4(transformed, 1.0)).xyz;`);
+
+      // ---- 片元: 程序化噪声 + 细节法线 + 凹陷 + 粗糙度 ----
+      shader.fragmentShader = shader.fragmentShader
+        .replace('#include <common>', `#include <common>
+      varying vec3 vSurfWPos;
+      varying vec3 vSurfWNrm;
+      uniform float uSurfDetail;
+      uniform float uDetailStrength;
+      uniform float uDetailFreq;
+      uniform float uDetailFade;
+      uniform float uCavity;
+      uniform float uRoughVar;
+      uniform float uSnowSheen;
+      // value noise + fBm(世界系锚定, 相机移动不"沸腾")
+      float sHash(vec3 p){ p = fract(p * 0.3183099 + 0.1); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }
+      float sNoise(vec3 x){
+        vec3 i = floor(x); vec3 f = fract(x); f = f * f * (3.0 - 2.0 * f);
+        return mix(mix(mix(sHash(i + vec3(0,0,0)), sHash(i + vec3(1,0,0)), f.x),
+                       mix(sHash(i + vec3(0,1,0)), sHash(i + vec3(1,1,0)), f.x), f.y),
+                   mix(mix(sHash(i + vec3(0,0,1)), sHash(i + vec3(1,0,1)), f.x),
+                       mix(sHash(i + vec3(0,1,1)), sHash(i + vec3(1,1,1)), f.x), f.y), f.z);
+      }
+      float sFbm(vec3 p){ float s = 0.0, a = 0.5; for (int i = 0; i < 4; i++){ s += a * sNoise(p); p *= 2.02; a *= 0.5; } return s; }
+      // 全局(每像素)缓存: 淡出系数 / 强度 / 中心 bump 高度
+      float _surfAmt = 0.0;
+      float _surfH = 0.0;`)
+        .replace('#include <color_fragment>', `#include <color_fragment>
+      {
+        float dist = length(cameraPosition - vSurfWPos);
+        float fade = 1.0 - smoothstep(uDetailFade * 0.45, uDetailFade, dist);
+        _surfAmt = uSurfDetail * fade;
+        _surfH = sFbm(vSurfWPos * uDetailFreq);
+        // 凹陷变暗(AO 感): bump 低处更暗
+        diffuseColor.rgb *= mix(1.0, mix(1.0 - uCavity, 1.0, _surfH), _surfAmt);
+      }`)
+        .replace('#include <roughnessmap_fragment>', `#include <roughnessmap_fragment>
+      {
+        float lum = dot(diffuseColor.rgb, vec3(0.299, 0.587, 0.114));
+        float snow = smoothstep(0.72, 0.95, lum);
+        roughnessFactor = mix(roughnessFactor, 0.5, snow * uSnowSheen * _surfAmt);
+        roughnessFactor = clamp(roughnessFactor + (_surfH - 0.5) * uRoughVar * _surfAmt, 0.05, 1.0);
+      }`)
+        .replace('#include <normal_fragment_maps>', `#include <normal_fragment_maps>
+      if (_surfAmt > 0.001) {
+        vec3 wp = vSurfWPos;
+        vec3 gN = normalize(vSurfWNrm);
+        float e = 0.1 / max(uDetailFreq, 1e-3);                 // 梯度步长(随特征尺寸缩放)
+        vec3 grad = vec3(
+          sFbm((wp + vec3(e, 0.0, 0.0)) * uDetailFreq) - _surfH,
+          sFbm((wp + vec3(0.0, e, 0.0)) * uDetailFreq) - _surfH,
+          sFbm((wp + vec3(0.0, 0.0, e)) * uDetailFreq) - _surfH
+        ) / e;
+        vec3 gt = grad - dot(grad, gN) * gN;                    // 投影到切平面
+        vec3 wPerturbed = normalize(gN - uDetailStrength * _surfAmt * gt);
+        normal = normalize((viewMatrix * vec4(wPerturbed, 0.0)).xyz);   // 世界法线 → 视图空间(标准材质的 normal 用视图系)
+      }`);
+    };
+    // 稳定的程序缓存键(避免与其它标准材质变体串用同一 program)
+    material.customProgramCacheKey = () => 'planet-surface-v1';
   }
 
   // 从 params 快照出地形相关字段(传给 worker + 构建主线程 terrain)
@@ -174,7 +265,7 @@ export class Planet extends THREE.Group {
 
   heightAt(x, y, z) { return this.terrain.heightAt(x, y, z); }
   baseHeightAt(x, y, z) { return this.terrain.baseHeightAt(x, y, z); }   // 无 edits 的原始高度(判断天然陆/海)
-  colorFor(h, x, y, z) { return this.terrain.colorFor(h, x, y, z); }
+  colorFor(h, x, y, z, slope) { return this.terrain.colorFor(h, x, y, z, slope); }
 
   displace(dir) {
     const h = this.heightAt(dir.x, dir.y, dir.z);
