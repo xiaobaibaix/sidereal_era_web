@@ -1255,16 +1255,16 @@ function firstDepotWithZone() {
 }
 function doSpawnExcavators() {
   const depot = firstDepotWithZone();
-  if (depot == null) { fpTool.status = '请先放置矿场'; return; }
-  if (!factory.world.get(depot, 'DigZone').center) { fpTool.status = '请先圈定挖掘区'; return; }
+  if (depot == null) { showToast('请先放置矿场', true); return; }
+  if (!factory.world.get(depot, 'DigZone').center) { showToast('请先圈定挖掘区(模式选「圈定挖掘区」点矿场旁)', true); return; }
   spawnExcavators(factory.world, factory.ctx, fpTool.excavatorCount, depot);
-  fpTool.status = `已生成 ${fpTool.excavatorCount} 台挖机`;
+  showToast(`已生成 ${fpTool.excavatorCount} 台挖机`, false);
 }
 function doSpawnMineTrucks() {
   const depot = firstDepotWithZone();
-  if (depot == null) { fpTool.status = '请先放置矿场'; return; }
+  if (depot == null) { showToast('请先放置矿场', true); return; }
   spawnMineTrucks(factory.world, factory.ctx, fpTool.mineTruckCount, depot);
-  fpTool.status = `已生成 ${fpTool.mineTruckCount} 辆采矿车`;
+  showToast(`已生成 ${fpTool.mineTruckCount} 辆采矿车`, false);
 }
 // 物流车在首个矿场(否则仓库, 否则 [0,1,0])附近生成
 function doSpawnHaulers() {
@@ -1273,7 +1273,41 @@ function doSpawnHaulers() {
   if (depot != null) nearDir = [...factory.world.get(depot, 'Anchor').dir];
   else { const wh = factory.world.query('Storage', 'Anchor').next().value; if (wh != null) nearDir = [...factory.world.get(wh, 'Anchor').dir]; }
   spawnHaulers(factory.world, factory.ctx, fpTool.haulerCount, 'hauler_mk1', nearDir);
-  fpTool.status = `已生成 ${fpTool.haulerCount} 辆物流车`;
+  showToast(`已生成 ${fpTool.haulerCount} 辆物流车`, false);
+}
+
+// 顶部居中浮动提示(toast): 放置反馈 / 科技未解锁等。注意 fpTool.status 每帧被 updateFactoryStatus 覆盖,
+// 故一次性反馈必须用 toast, 否则一闪即逝看不到。
+const toastEl = document.createElement('div');
+toastEl.style.cssText = 'position:fixed;left:50%;top:64px;transform:translateX(-50%);z-index:60;display:none;padding:10px 16px;border-radius:10px;font:13px/1.4 -apple-system,system-ui,sans-serif;box-shadow:0 8px 28px rgba(0,0,0,0.5);pointer-events:none;max-width:70vw;text-align:center;';
+document.body.appendChild(toastEl);
+let _toastTimer = 0;
+function showToast(msg, warn) {
+  toastEl.textContent = msg;
+  toastEl.style.color = warn ? '#ffd7d0' : '#dbeafe';
+  toastEl.style.background = warn ? 'rgba(44,22,20,0.95)' : 'rgba(20,26,34,0.95)';
+  toastEl.style.border = `1px solid ${warn ? 'rgba(255,120,100,0.55)' : 'rgba(120,180,255,0.45)'}`;
+  toastEl.style.display = 'block';
+  clearTimeout(_toastTimer);
+  _toastTimer = setTimeout(() => { toastEl.style.display = 'none'; }, 2600);
+}
+// 该建筑被哪个科技解锁(找 unlock.buildings 含它的 tech)
+function requiredTechFor(buildingId) {
+  const tech = factory.registry.tech || {};
+  for (const id in tech) { const t = tech[id]; if (t.unlock && t.unlock.buildings && t.unlock.buildings.includes(buildingId)) return t; }
+  return null;
+}
+// 统一放置入口: 锁定时弹提示并返回 null; 成功可弹确认
+function tryPlace(buildingId, dir, okMsg) {
+  const b = factory.registry.buildings[buildingId];
+  if (b && b.locked && !factory.registry.isUnlocked(buildingId)) {
+    const t = requiredTechFor(buildingId);
+    showToast(`${b.name}未解锁${t ? ` · 需研究「${t.name}」(发展度 ${(t.require && t.require.dev) || 0})` : ''}`, true);
+    return null;
+  }
+  const e = placeBuilding(factory.world, factory.ctx, buildingId, dir);
+  if (e != null && okMsg) showToast(okMsg, false);
+  return e;
 }
 
 renderer.domElement.addEventListener('pointerdown', (e) => { if (fpTool.mode !== '关闭' && e.button === 0) _fpDown = { x: e.clientX, y: e.clientY }; });
@@ -1286,34 +1320,27 @@ renderer.domElement.addEventListener('pointerup', (e) => {
   if (!d) return;
   const dir = [d.x, d.y, d.z];
   if (fpTool.mode === '放置矿场') {
-    placeBuilding(factory.world, factory.ctx, 'depot', dir);
-    fpTool.status = '已放置矿场 · 请圈定挖掘区并生成挖机/采矿车';
+    tryPlace('depot', dir, '已放置矿场 · 请圈定挖掘区并生成挖机/采矿车');
   } else if (fpTool.mode === '圈定挖掘区') {
     const depot = factory.spatial.nearest(dir, (e) => factory.world.has(e, 'Depot'));
-    if (depot == null) { fpTool.status = '附近没有矿场, 请先放置矿场'; return; }
+    if (depot == null) { showToast('附近没有矿场, 请先放置矿场', true); return; }
     setDigZone(factory.world, factory.ctx, depot, dir);
-    fpTool.status = '已圈定挖掘区 · 生成挖机+采矿车即可开采';
+    showToast('已圈定挖掘区 · 生成挖机+采矿车即可开采', false);
   } else if (fpTool.mode === '放置冶炼炉') {
-    placeBuilding(factory.world, factory.ctx, 'smelter', dir);
-    fpTool.status = '已放置冶炼炉';
+    tryPlace('smelter', dir, '已放置冶炼炉');
   } else if (fpTool.mode === '放置制造台') {
-    const a = placeBuilding(factory.world, factory.ctx, 'assembler', dir);
-    fpTool.status = a != null ? '已放置制造台' : '制造台未解锁 · 需研究「装配技术」(发展度 40)';
+    tryPlace('assembler', dir, '已放置制造台');
   } else if (fpTool.mode === '放置研究站') {
-    placeBuilding(factory.world, factory.ctx, 'lab', dir);
-    fpTool.status = '已放置研究站 · 送铁锭进来提升发展度';
+    tryPlace('lab', dir, '已放置研究站 · 送铁锭进来提升发展度');
   } else if (fpTool.mode === '放置仓库') {
-    placeBuilding(factory.world, factory.ctx, 'warehouse', dir);
-    fpTool.status = '已放置仓库';
+    tryPlace('warehouse', dir, '已放置仓库');
   } else if (fpTool.mode === '放置输电塔') {
-    placeBuilding(factory.world, factory.ctx, 'power_tower', dir);
-    fpTool.status = '已放置输电塔';
+    tryPlace('power_tower', dir, '已放置输电塔');
   } else if (fpTool.mode === '放置发电机') {
-    placeBuilding(factory.world, factory.ctx, 'generator', dir);
-    fpTool.status = '已放置发电机';
+    tryPlace('generator', dir, '已放置发电机');
   } else if (fpTool.mode === '拆除') {
     const eid = factory.spatial.nearest(dir);
-    if (eid != null) { if (inspector.selected() === eid) inspector.hide(); demolish(factory.world, factory.ctx, eid); fpTool.status = '已拆除'; }
+    if (eid != null) { if (inspector.selected() === eid) inspector.hide(); demolish(factory.world, factory.ctx, eid); showToast('已拆除', false); }
   }
 });
 
