@@ -1,6 +1,8 @@
 // 建造 / 拆除 —— 把建筑数据组装成实体(组件),并处理挖机的地形坑 edit。
 // 与渲染/UI 解耦: App 只需 pick 到方向 dir 后调 placeBuilding。
 
+import { createBelt } from './belt.js';
+
 // 放置一个建筑; 返回实体 id(失败返回 null)
 export function placeBuilding(world, ctx, buildingId, dir, yaw = 0) {
   const { planet, registry, spatial, bus } = ctx;
@@ -65,6 +67,16 @@ export function placeBuilding(world, ctx, buildingId, dir, yaw = 0) {
 
   if (bus) bus.emit('build', { eid: e, buildingId });
   return e;
+}
+
+// 放置一条传送带(两点放置)。from/to 为球面单位方向; opts 透传给 createBelt(buildingId/outPort/inPort 等)。
+// 返回带实体 id(失败返回 null, 例如科技未解锁)。
+export function placeBelt(world, ctx, from, to, opts = {}) {
+  const { registry } = ctx;
+  const buildingId = opts.buildingId || 'belt';
+  const b = registry.buildings[buildingId];
+  if (b && b.locked && !(registry.isUnlocked && registry.isUnlocked(buildingId))) return null;
+  return createBelt(world, ctx, from, to, { ...opts, buildingId });
 }
 
 // 拆除: 移除组件/实体, 回收其地形坑/挖掘区 edit 并失效该区域(地形恢复)
