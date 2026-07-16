@@ -24,6 +24,9 @@ import { createResearchSystem } from './systems/research.js';
 import { createConstructionSystem } from './systems/construction.js';
 import { createEngineSystem } from './systems/engine.js';
 import { createLogisticsSystem, spawnHaulers } from './systems/logistics.js';
+import { createBeltSystem } from './systems/belt.js';
+import { createInserterSystem } from './systems/inserter.js';
+import { createSplitterSystem } from './systems/splitter.js';
 import { placeBuilding, demolish } from './systems/placement.js';
 import { createFactoryRenderer } from './render/factory_render.js';
 import { createInspector } from './render/inspector.js';
@@ -39,13 +42,19 @@ export function createFactoryApp(opts) {
   } = opts;
 
   const factory = createFactory({ planet: getPlanet(), data: gameData });
-  factory.addSystem('mining_crew', createMiningCrewSystem());   // 矿场小队: 挖机挖 → 采矿车运进矿场
-  factory.addSystem('power', createPowerSystem());              // M4: 输电塔组网 + 供需满足率(须在 production 前)
-  factory.addSystem('production', createProductionSystem());    // M3: 冶炼/制造按配方产出(缺电降速)
-  factory.addSystem('construction', createConstructionSystem());// M6: 行星发动机分阶段建造
-  factory.addSystem('engine', createEngineSystem());            // M7: 点火燃烧→推力(经 ctx.applyThrust)
-  factory.addSystem('logistics', createLogisticsSystem());      // M2a: 卡车按供需搬运
-  factory.addSystem('research', createResearchSystem());        // M5: 研究站→发展度→解锁科技
+  // tick 顺序(见《物流升级》设计 D.5): 先生产, 再"上带→带前进→分流→下带", 然后站间卡车, 最后科研/发动机。
+  // 单向数据流, 天然无环: 先把货放上带 → 带走一格 → 分流 → 下带 → 卡车站间搬。
+  factory.addSystem('mining_crew', createMiningCrewSystem());        // 矿场小队: 挖机挖 → 采矿车运进矿场
+  factory.addSystem('power', createPowerSystem());                   // M4: 输电塔组网 + 供需满足率(须在 production 前)
+  factory.addSystem('production', createProductionSystem());         // M3: 冶炼/制造按配方产出(缺电降速)
+  factory.addSystem('construction', createConstructionSystem());     // M6: 行星发动机分阶段建造
+  factory.addSystem('inserter_load', createInserterSystem({ phase: 'load' }));    // B1: 上带分拣器(机器→带), 须在 belt 前
+  factory.addSystem('belt', createBeltSystem());                     // B0: 带上物品前进 + 背压 + 到头投递
+  factory.addSystem('splitter', createSplitterSystem());             // B3: 分流器合流/分流/路由(带之后)
+  factory.addSystem('inserter_unload', createInserterSystem({ phase: 'unload' }));// B1: 下带分拣器(带→机器/站/仓库), 带之后
+  factory.addSystem('logistics', createLogisticsSystem());           // M2a/B2: 卡车(有站点→站间; 无站点→旧直连)
+  factory.addSystem('research', createResearchSystem());             // M5: 研究站→发展度→解锁科技
+  factory.addSystem('engine', createEngineSystem());                 // M7: 点火燃烧→推力(经 ctx.applyThrust)
   factory.ctx.planetMass = planetMass;
 
   const factoryRenderer = createFactoryRenderer(scene, getPlanet(), { size });
