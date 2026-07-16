@@ -29,7 +29,8 @@ export function createEngineSystem() {
       const inv = world.get(e, 'Inventory');
       const rate = b.burnRate || 30;
       const ve = b.exhaust || 50;
-      const burned = burnFuel(inv, rate * dt, b.fuelItems);
+      // 无限燃料(调试): 恒定燃烧, 不消耗库存; 否则从库存烧反应质量
+      const burned = ctx.infiniteFuel ? rate * dt : burnFuel(inv, rate * dt, b.fuelItems);
       if (burned <= 1e-9) { con.burn = 'flameout'; continue; }   // 点了火但没料
 
       con.burn = 'burning';

@@ -124,4 +124,18 @@ function builtEngine(world, ctx, dir) {
   ok('熄火后补料自动复燃 + 索取常见矿石作燃料');
 }
 
+// ---- 调试: 无限燃料 → 空库存也持续推力 ----
+{
+  const ctx = makeCtx(stubPlanet());
+  ctx.infiniteFuel = true;
+  const world = createWorld();
+  const e = builtEngine(world, ctx, S.norm([0, 1, 0]));
+  world.get(e, 'Construction').ignited = true;   // 库存为空
+  world.addSystem('engine', createEngineSystem());
+  world.tick(0.05, ctx);
+  assert.equal(world.get(e, 'Construction').burn, 'burning', '无限燃料 → 恒定燃烧');
+  assert.ok(world.get(e, 'Construction').thrust > 0, '无限燃料 → 空库存也有推力');
+  ok('调试: 无限燃料(空库存持续推力)');
+}
+
 console.log(`\nM7 点火 全部通过 (${pass} 组断言)`);

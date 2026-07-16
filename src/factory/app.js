@@ -95,6 +95,29 @@ export function createFactoryApp(opts) {
   const techGui = new GUI({ title: '🔬 科技', container });
   techGui.add(techTool, 'dev').name('发展度').listen().disable();
   techGui.add(techTool, 'status').name('科技').listen().disable();
+
+  // ---- 🛠 调试面板 ----
+  const dbgTool = {
+    infiniteFuel: false,
+    unlockAll() {
+      factory.registry.unlockAll();
+      const colony = factory.ctx.colony || (factory.ctx.colony = { dev: 0, researched: new Set() });
+      if (!colony.researched) colony.researched = new Set();
+      colony.dev = Math.max(colony.dev, 99999);
+      for (const id in (factory.registry.tech || {})) colony.researched.add(id);
+      showToast('🛠 已解锁全部科技(可放置所有建筑)', false);
+    },
+    buildEngines() {
+      let n = 0;
+      for (const e of factory.world.query('Construction')) { const c = factory.world.get(e, 'Construction'); if (!c.done) { c.stage = 999; c.done = true; c.built = true; n++; } }
+      showToast(n > 0 ? `🛠 ${n} 台行星发动机已立即建成(切「点火发动机」或在属性面板点火)` : '当前没有在建的发动机', n === 0);
+    },
+  };
+  const dbgGui = new GUI({ title: '🛠 调试', container });
+  dbgGui.add(dbgTool, 'unlockAll').name('一键解锁全部科技');
+  dbgGui.add(dbgTool, 'buildEngines').name('一键建成发动机');
+  dbgGui.add(dbgTool, 'infiniteFuel').name('无限燃料').onChange((v) => { factory.ctx.infiniteFuel = v; });
+  dbgGui.close();
   function updateResearchStatus() {
     const colony = factory.ctx.colony;
     techTool.dev = (colony ? colony.dev : 0).toFixed(0);
@@ -260,7 +283,7 @@ export function createFactoryApp(opts) {
       dom.removeEventListener('pointerdown', onPlaceDown); dom.removeEventListener('pointerup', onPlaceUp);
       dom.removeEventListener('pointerdown', onInspectDown); dom.removeEventListener('pointerup', onInspectUp);
       window.removeEventListener('keydown', onKey);
-      fpGui.destroy(); techGui.destroy(); inspector.dispose(); factoryRenderer.dispose(); toastEl.remove();
+      fpGui.destroy(); techGui.destroy(); dbgGui.destroy(); inspector.dispose(); factoryRenderer.dispose(); toastEl.remove();
     },
   };
 }

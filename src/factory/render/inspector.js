@@ -62,7 +62,12 @@ export function createInspector({ getWorld, registry, getPower }) {
   const invWrap = document.createElement('div');   // 库存行(增量复用)
   invWrap.style.cssText = 'display:flex;flex-direction:column;gap:3px;';
 
-  el.append(head, stat, recipeWrap, invTitle, invWrap);
+  // 操作按钮(常驻, 按选中实体显隐; 如发动机的点火/立即建成)
+  const actBtn = document.createElement('button');
+  actBtn.style.cssText = 'display:none;margin-top:10px;width:100%;padding:8px;border:none;border-radius:8px;background:#c8622e;color:#fff;font-size:13px;font-weight:600;cursor:pointer;';
+  actBtn.onclick = () => { if (actBtn._act) actBtn._act(); };
+
+  el.append(head, stat, recipeWrap, invTitle, invWrap, actBtn);
   document.body.appendChild(el);
 
   let eid = null;
@@ -255,6 +260,17 @@ export function createInspector({ getWorld, registry, getPower }) {
       invTitle.textContent = inv ? '库存' : '';
       invTitle.style.display = inv ? '' : 'none';
       if (inv) syncInventory(inv.items); else clearInventory();
+
+      // 操作按钮: 发动机 立即建成(调试) / 点火
+      if (con && !con.done) {
+        actBtn.textContent = '⏩ 立即建成(调试)'; actBtn.style.background = '#3a6ea5'; actBtn.style.display = '';
+        actBtn._act = () => { const c = getWorld().get(eid, 'Construction'); if (c) { c.stage = 999; c.done = true; c.built = true; } };
+      } else if (con && con.done && !con.ignited) {
+        actBtn.textContent = '🔥 点火'; actBtn.style.background = '#c8622e'; actBtn.style.display = '';
+        actBtn._act = () => { const c = getWorld().get(eid, 'Construction'); if (c) c.ignited = true; };
+      } else {
+        actBtn.style.display = 'none'; actBtn._act = null;
+      }
     },
     dispose() { el.remove(); },
   };
