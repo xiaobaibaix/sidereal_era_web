@@ -11,20 +11,20 @@ const ITEM_ICON = {
   iron_ingot: 'iron-plate', copper_ingot: 'copper-plate', iron_plate: 'steel-plate',
 };
 const MESH_ICON = { miner: 'mining-drill', smelter: 'smelter', assembler: 'assembler-1', warehouse: 'storage-1', truck: 'logistic-drone', depot: 'storage-tank', excavator: 'mining-drill', tower: 'tesla-coil', generator: 'wind-turbine', lab: 'lab', engine: 'vertical-launching-silo',
-  belt: 'belt-1', inserter: 'inserter-1', sorter: 'inserter-2', splitter: 'splitter-4dir', station_load: 'logistic-station', station_unload: 'interstellar-logistic-station' };
+  belt: 'belt-1', inserter: 'inserter-1', sorter: 'inserter-2', splitter: 'splitter-4dir', station_load: 'logistic-station', station_unload: 'interstellar-logistic-station', digZone: 'mining-drill' };
 
 const MINER_STATE = { mining: '开采中', full: '满仓待运', blocked: '受阻(需更高级钻机)', idle: '空闲' };
 const PROD_STATE = { working: '生产中', starved: '缺原料', output_full: '产物已满', no_power: '缺电停机', idle: '空闲' };
 const HAUL_STATE = { idle: '待命', to_src: '前往取货', load: '装载中', to_sink: '前往卸货', unload: '卸货中' };
 const LAB_STATE = { researching: '研究中', starved: '缺原料', idle: '空闲' };
-const EXCA_STATE = { digging: '开采中', to_zone: '前往挖点', full: '满仓待运', idle: '空闲(未圈定挖掘区?)' };
+const EXCA_STATE = { digging: '开采中', moving: '前往顶点', seeking: '寻点中', to_zone: '前往挖点', full: '满仓待运', idle: '空闲(范围内无更高顶点)' };
 const MINETRUCK_STATE = { idle: '待命', to_exca: '前往挖机', load: '装载中', to_depot: '运往矿场', unload: '卸货中' };
-const STATE_COLOR = { mining: '#ffc040', working: '#ffc040', digging: '#ff8a2d', load: '#ffc040', full: '#66cc66', to_sink: '#66cc66', unload: '#66cc66', to_depot: '#9c6b3f', to_src: '#5ab0ff', to_exca: '#ffe27a', to_zone: '#ffd24a', starved: '#d0704f', blocked: '#d0413f', output_full: '#5ab0ff', no_power: '#50606f', idle: '#8a8f98' };
+const STATE_COLOR = { mining: '#ffc040', working: '#ffc040', digging: '#ff8a2d', moving: '#ffd24a', seeking: '#ffe27a', load: '#ffc040', full: '#66cc66', to_sink: '#66cc66', unload: '#66cc66', to_depot: '#9c6b3f', to_src: '#5ab0ff', to_exca: '#ffe27a', to_zone: '#ffd24a', starved: '#d0704f', blocked: '#d0413f', output_full: '#5ab0ff', no_power: '#50606f', idle: '#8a8f98' };
 
 const itemIconUrl = (id) => (ITEM_ICON[id] ? ICON_BASE + ITEM_ICON[id] + '.webp' : null);
 const meshIconUrl = (m) => (MESH_ICON[m] ? ICON_BASE + MESH_ICON[m] + '.webp' : null);
 
-export function createInspector({ getWorld, registry, getPower }) {
+export function createInspector({ getWorld, registry, getPower, onAction = () => {} }) {
   const itemName = (id) => (registry.items[id] && registry.items[id].name) || id;
 
   const el = document.createElement('div');
@@ -63,16 +63,56 @@ export function createInspector({ getWorld, registry, getPower }) {
   const invWrap = document.createElement('div');   // 库存行(增量复用)
   invWrap.style.cssText = 'display:flex;flex-direction:column;gap:3px;';
 
-  // 操作按钮(常驻, 按选中实体显隐; 如发动机的点火/立即建成)
-  const actBtn = document.createElement('button');
-  actBtn.style.cssText = 'display:none;margin-top:10px;width:100%;padding:8px;border:none;border-radius:8px;background:#c8622e;color:#fff;font-size:13px;font-weight:600;cursor:pointer;';
-  actBtn.onclick = () => { if (actBtn._act) actBtn._act(); };
+  // 操作按钮区(常驻容器, 仅在 show() 时重建 — update() 不动按钮, 避免点击丢失)
+  const actWrap = document.createElement('div');
+  actWrap.style.cssText = 'display:flex;flex-direction:column;gap:6px;margin-top:10px;';
 
-  el.append(head, stat, recipeWrap, invTitle, invWrap, actBtn);
+  el.append(head, stat, recipeWrap, invTitle, invWrap, actWrap);
   document.body.appendChild(el);
 
   let eid = null;
   const invRows = new Map();   // itemId -> { row, amt }
+  let _actBtns = [];   // 当前 show() 创建的按钮 DOM(show 时整体重建)
+
+  // 在 show() 时整体重建按钮(每帧 update() 不动 → 不会丢点击)。
+  // 用 addEventListener('click', ...) 而非 onclick 属性, 重复绑定时先 removeEventListener 保证幂等。
+  function setActions(list) {
+    for (const old of _actBtns) actWrap.removeChild(old);
+    _actBtns = [];
+    for (const item of list) {
+      const b = document.createElement('button');
+      b.textContent = item.label;
+      b.style.cssText = `width:100%;padding:8px;border:none;border-radius:8px;background:${item.color || '#c8622e'};color:#fff;font-size:13px;font-weight:600;cursor:pointer;`;
+      // 关键: 捕获 item.act 到本次 show() 的闭包 — eid 也是此时捕获, 不受后续帧影响
+      const act = item.act;
+      b.addEventListener('click', (ev) => { ev.stopPropagation(); act(); });
+      actWrap.appendChild(b);
+      _actBtns.push(b);
+    }
+  }
+  function clearActions() {
+    for (const old of _actBtns) actWrap.removeChild(old);
+    _actBtns = [];
+  }
+  // 根据 eid 类型构建操作按钮(在 show() 时调用一次, update() 不重绑)
+  // 关键: 闭包捕获当前 id, 不会被后续帧重写。
+  function buildActionsFor(world, id) {
+    const depot = world.get(id, 'Depot');
+    const con = world.get(id, 'Construction');
+    const actions = [];
+    if (depot) {
+      actions.push(
+        { label: '⛏ 生成挖机 ×3', color: '#c8622e', act: () => onAction(id, 'spawn_excavators', 3) },
+        { label: '🚛 生成采矿车 ×3', color: '#9c6b3f', act: () => onAction(id, 'spawn_minetrucks', 3) },
+      );
+    }
+    if (con && !con.done) {
+      actions.push({ label: '⏩ 立即建成(调试)', color: '#3a6ea5', act: () => { const c = getWorld().get(id, 'Construction'); if (c) { c.stage = 999; c.done = true; c.built = true; } } });
+    } else if (con && con.done && !con.ignited) {
+      actions.push({ label: '🔥 点火', color: '#c8622e', act: () => { const c = getWorld().get(id, 'Construction'); if (c) c.ignited = true; } });
+    }
+    if (actions.length > 0) setActions(actions); else clearActions();
+  }
 
   function smallIcon(url, size = 18) {
     const img = document.createElement('img');
@@ -145,6 +185,8 @@ export function createInspector({ getWorld, registry, getPower }) {
       // 配方行(生产建筑)
       const prod = world.get(id, 'Producer');
       buildRecipeRow(prod ? registry.recipes[prod.recipeId] : null);
+      // 操作按钮(仅 show() 时构建一次, update() 不动 — 避免每帧重绑点击丢失)
+      buildActionsFor(world, id);
       el.style.display = '';
       api.update();
     },
@@ -197,20 +239,69 @@ export function createInspector({ getWorld, registry, getPower }) {
           }
         }
       } else if (depot) {
-        // 矿场: 挖掘区状态 + 绑定的挖机/采矿车数
+        // 矿场: 覆盖范围 + 覆盖挖掘区数 + 绑定的挖机/采矿车数
         let exc = 0, mtk = 0;
         for (const e of world.query('Excavator')) if (world.get(e, 'Excavator').depot === eid) exc++;
         for (const e of world.query('MineTruck')) if (world.get(e, 'MineTruck').depot === eid) mtk++;
-        const hasZone = zone && zone.center;
-        lines.push(kv('挖掘区', hasZone ? `已圈定 (深度 ${zone.depth.toFixed(2)})` : '<b style="color:#d0704f">未圈定</b>'));
+        const zoneEids = depot.coverageZones || [];
+        const hasZone = zoneEids.length > 0;
+        // 聚合覆盖挖掘区的顶点统计
+        let totalV = 0, doneV = 0, lockedV = 0, pendingV = 0, maxDepth = 0;
+        for (const ze of zoneEids) {
+          const zd = world.get(ze, 'DigZone');
+          if (!zd || !zd.vertices) continue;
+          if (zd.depth > maxDepth) maxDepth = zd.depth;
+          for (const v of zd.vertices) {
+            totalV++;
+            if (v.offset >= v.targetOffset - 1e-6) doneV++; else pendingV++;
+            if (v.ownerId != null) lockedV++;
+          }
+        }
+        lines.push(kv('覆盖半径', `${(depot.coverageRadius || 0).toFixed(3)}`));
+        lines.push(kv('覆盖挖掘区', hasZone ? `${zoneEids.length} 个(最深 ${maxDepth.toFixed(2)})` : '<b style="color:#d0704f">无</b>'));
         lines.push(kv('挖机 / 采矿车', `${exc} / ${mtk}`));
-        if (!hasZone) lines.push('<div style="color:#d0704f;margin:2px 0">圈定挖掘区并生成挖机+采矿车后开始产矿</div>');
+        if (hasZone && totalV > 0) lines.push(kv('顶点', `${totalV} 个(平整 ${doneV} · 待平 ${pendingV} · 锁定 ${lockedV})`));
+        if (!hasZone) lines.push('<div style="color:#d0704f;margin:2px 0">在覆盖范围内放置挖掘区并生成挖机+采矿车后开始产矿</div>');
         else if (exc === 0 || mtk === 0) lines.push('<div style="color:#d0704f;margin:2px 0">还需生成挖机与采矿车才会进货</div>');
+      } else if (zone) {
+        // 挖掘区实体(R5 独立): 顶点统计 + 哪些矿场覆盖它
+        let totalV = 0, doneV = 0, pendingV = 0, lockedV = 0;
+        if (zone.vertices) for (const v of zone.vertices) {
+          totalV++;
+          if (v.offset >= v.targetOffset - 1e-6) doneV++; else pendingV++;
+          if (v.ownerId != null) lockedV++;
+        }
+        // 找覆盖它的矿场
+        const a = world.get(eid, 'Anchor');
+        const coveredBy = [];
+        if (a) for (const de of world.query('Depot', 'Anchor')) {
+          const dep = world.get(de, 'Depot');
+          const da = world.get(de, 'Anchor');
+          const ang = Math.acos(Math.max(-1, Math.min(1, da.dir[0]*a.dir[0] + da.dir[1]*a.dir[1] + da.dir[2]*a.dir[2])));
+          if (ang <= (dep.coverageRadius || 0.16)) coveredBy.push(de);
+        }
+        lines.push(kv('最深', `${(zone.depth || 0).toFixed(2)}`));
+        lines.push(kv('顶点', totalV > 0 ? `${totalV} 个(平整 ${doneV} · 待平 ${pendingV} · 锁定 ${lockedV})` : '无'));
+        lines.push(kv('被矿场覆盖', coveredBy.length > 0 ? `${coveredBy.length} 个` : '<b style="color:#d0704f">无</b>'));
+        if (coveredBy.length === 0) lines.push('<div style="color:#d0704f;margin:2px 0">该挖掘区在所有矿场覆盖范围外, 请放置矿场或挪近一些</div>');
       } else if (excavator) {
         const mt = registry.machineTypes[excavator.typeId] || {};
         const rate = (mt.digRate || 0) * (mt.yield || 0);
         lines.push(stateLine('状态', excavator.state, EXCA_STATE));
         lines.push(kv('开采速度', `${rate.toFixed(1)} /秒`));
+        lines.push(kv('挖掘半径', `${(excavator.digReach || 0).toFixed(3)} 弧度`));
+        // 当前锁定的顶点 + 进度(挖到 targetOffset 即平整到 planeH)
+        if (excavator.targetVertex != null && excavator.targetZone != null) {
+          const zd = world.get(excavator.targetZone, 'DigZone');
+          if (zd && zd.vertices) {
+            const v = zd.vertices[excavator.targetVertex];
+            if (v) {
+              const pct = v.targetOffset > 0 ? (v.offset / v.targetOffset) * 100 : 0;
+              lines.push(kv('目标顶点', `#${excavator.targetVertex} · ${v.offset.toFixed(2)} / ${v.targetOffset.toFixed(2)} → 平面 ${zd.planeH.toFixed(2)}`));
+              lines.push(bar(pct, '#ff8a2d'));
+            }
+          }
+        }
         if (excavator.lastItem) lines.push(kv('当前产物', itemName(excavator.lastItem)));
       } else if (minetruck) {
         lines.push(stateLine('状态', minetruck.state, MINETRUCK_STATE));
@@ -281,16 +372,7 @@ export function createInspector({ getWorld, registry, getPower }) {
       invTitle.style.display = inv ? '' : 'none';
       if (inv) syncInventory(inv.items); else clearInventory();
 
-      // 操作按钮: 发动机 立即建成(调试) / 点火
-      if (con && !con.done) {
-        actBtn.textContent = '⏩ 立即建成(调试)'; actBtn.style.background = '#3a6ea5'; actBtn.style.display = '';
-        actBtn._act = () => { const c = getWorld().get(eid, 'Construction'); if (c) { c.stage = 999; c.done = true; c.built = true; } };
-      } else if (con && con.done && !con.ignited) {
-        actBtn.textContent = '🔥 点火'; actBtn.style.background = '#c8622e'; actBtn.style.display = '';
-        actBtn._act = () => { const c = getWorld().get(eid, 'Construction'); if (c) c.ignited = true; };
-      } else {
-        actBtn.style.display = 'none'; actBtn._act = null;
-      }
+      // 操作按钮已在 show() 时构建一次, update() 不再重建(避免每帧重绑导致点击丢失)
     },
     dispose() { el.remove(); },
   };
@@ -299,5 +381,5 @@ export function createInspector({ getWorld, registry, getPower }) {
 
 function kindLabel(kind) {
   return { depot: '矿场', miner: '采矿', producer: '生产', storage: '存储', tower: '输电', generator: '发电', lab: '科研', engine: '巨构',
-    belt: '传送带', inserter: '分拣器', splitter: '分流器', loadstation: '装货站', unloadstation: '卸货站' }[kind] || kind || '';
+    belt: '传送带', inserter: '分拣器', splitter: '分流器', loadstation: '装货站', unloadstation: '卸货站', digzone: '挖掘区' }[kind] || kind || '';
 }

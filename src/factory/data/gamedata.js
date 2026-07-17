@@ -42,7 +42,8 @@ export const machineTypes = {
   smelter_mk1: { kind: 'producer', mesh: 'smelter', tier: 1, power: 90 },
   assembler_mk1: { kind: 'producer', mesh: 'assembler', tier: 1, power: 120 },
   // kind=excavator: 在矿场挖掘区里啃地形产矿, 存入自身缓冲(cap); mine truck 再运到矿场
-  excavator_mk1: { kind: 'excavator', mesh: 'excavator', tier: 1, digRate: 0.05, hardnessMax: 2, yield: 100, speed: 16, cap: 60, power: 30 },
+  // 逐顶点挖掘(B升级): digReach=挖掘臂角半径(挖机能挖多远); digStep=单次目标降低量(视觉上"一点点")
+  excavator_mk1: { kind: 'excavator', mesh: 'excavator', tier: 1, digRate: 0.05, hardnessMax: 2, yield: 100, speed: 16, cap: 60, power: 30, digReach: 0.025, digStep: 0.02 },
   // kind=minetruck: 采矿卡车, 把挖机缓冲运进矿场
   mine_truck_mk1: { kind: 'minetruck', mesh: 'truck', tier: 1, speed: 22, cap: 80, power: 10 },
   // ---- 物流升级(B系列): 传送带 / 分拣器 / 分流器 ----
@@ -56,8 +57,12 @@ export const machineTypes = {
 };
 
 export const buildings = {
-  // 矿场: 被动容器。圈定挖掘区 + 生成挖机(挖) + 采矿卡车(运)后才会存入矿石; 下游物流卡车再从这里取货。
-  depot: { name: '矿场', kind: 'depot', mesh: 'depot', cap: 2000, zoneRadius: 0.05, footprint: [3, 3] },
+  // 矿场: 被动容器。覆盖范围内的挖掘区被自动绑定; 生成挖机(挖) + 采矿卡车(运)后才会存入矿石; 下游物流卡车再从这里取货。
+  // coverageRadius=矿场对**独立放置的挖掘区**的覆盖角半径; 覆盖内的区都可被该矿场的挖机开采。
+  // digResolution=挖掘区顶点网格间距(角弧度); 越小越细越贵。zoneRadius=挖掘区角半径。footprint=网格建造占地。
+  depot: { name: '矿场', kind: 'depot', mesh: 'depot', cap: 2000, coverageRadius: 0.16, zoneRadius: 0.05, digResolution: 0.005, footprint: [3, 3] },
+  // 挖掘区(独立放置): 在矿场 coverageRadius 内即可被该矿场覆盖。多对多 — 一个区可被多个矿场覆盖, 一个矿场可覆盖多个区。
+  dig_zone: { name: '挖掘区', kind: 'digzone', mesh: 'digZone', zoneRadius: 0.05, digResolution: 0.005 },
   miner: { name: '采矿机 Mk1', kind: 'miner', machine: 'miner_mk1', mesh: 'miner', digRadius: 0.03, cap: 500 },   // 旧直挖矿机(遗留, UI 已改用矿场)
   warehouse: { name: '仓库', kind: 'storage', mesh: 'warehouse', cap: 5000, footprint: [2, 2] },
   // 建造平台(网格建造): 平整一块圆区(terrain level 编辑)并生成网格球, 在其中吸附放置建筑。cell=格边长(世界单位), radius=角半径。

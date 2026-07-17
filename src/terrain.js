@@ -87,6 +87,29 @@ export function makeTerrain(p) {
     depth: e.depth, level: e.level, progress: e.progress, dry: e.dry,
     falloff: e.falloff || 'smooth',
   })) : [];
+  // 顶点网格(B升级·逐顶点挖掘): 每个矿场挖掘区一组离散顶点; heightAt 用"progress 加权整平"把
+  // 它们叠加到高度场上 → 挖机改某顶点 offset 即"该方向逐渐下沉到 planeH", 视觉上一点一点下降。
+  //   - center: zone 中心方向(单位向量)
+  //   - cosRadiusPad: cos(radius+padding), 角距离 > radius+pad 的采样点直接跳过该 zone(粗筛)
+  //   - planeH: zone 整平基准(挖完后所有顶点高度 = planeH, 即球面切片)
+  //   - maxInfluence: 单顶点影响半径(角弧度); 通常 = zone.resolution × 1.5
+  //   - vertices: [{ dir, offset, targetOffset }]
+  //       offset = 已挖深度; targetOffset = 应挖深度(baseH - planeH)。
+  //       progress_i = offset/targetOffset(0=未挖, 1=完成); targetOffset=0 的"天然基准点" progress=1。
+  //   heightAt 在 zone 影响内把 h 朝 planeH 拉, 拉力 = IDW 加权的 progress →
+  //     完全挖完的 zone: h = planeH(完美球面切片, 无 bumps);
+  //     部分挖: h 在 baseH 与 planeH 之间平滑过渡;
+  //     边界外: h = baseH(dir)(原地形)。
+  //   比"减 IDW(offset)"准: 那样 baseNoise 在顶点间的高频起伏会泄漏成 bumps。
+  const digZones = Array.isArray(p.digZoneVertices) ? p.digZoneVertices.map((z) => ({
+    center: z.center,
+    cosRadiusPad: Math.cos((z.radius || 0) + 0.005),
+    planeH: z.planeH || 0,
+    maxInfluence: z.maxInfluence || 0.0075,
+    vertices: Array.isArray(z.vertices) ? z.vertices.map((v) => ({
+      dir: v.dir, offset: v.offset || 0, targetOffset: v.targetOffset || 0,
+    })) : [],
+  })) : [];
   // 每条挖掘编辑自带 dry 标记(挖的那刻的开关状态): 默认(dry!==false)是"干坑"→坑底露泥土;
   // dry===false 的是"湖"(关闭开关时挖的)→坑内保留海洋色。逐编辑独立, 改开关不影响已挖好的。
   const lakeEdits = edits.filter((e) => e.dry === false).map((e) => ({ pos: e.pos, cosR: Math.cos(e.radius) }));
@@ -163,6 +186,39 @@ export function makeTerrain(p) {
           h += (leveled - h) * w * (e.progress || 0);
         } else {
           h -= e.depth * fall;                               // 减量式(挖/抬)
+        }
+      }
+    }
+    // 叠加顶点网格(B升级·逐顶点挖掘): progress 加权整平到 planeH。
+    //   progress = IDW 加权的 (offset/targetOffset) → 0..1 表示"此处挖完了多少"。
+    //   h 朝 planeH 拉 progress 比例 → 完成处 h=planeH(球面切片), 未挖处 h=原值。
+    //   天然基准点(targetOffset=0 即 baseH==planeH)算 progress=1(本来就在基准上)。
+    if (digZones.length > 0) {
+      const len = Math.hypot(x, y, z) || 1;
+      const ux = x / len, uy = y / len, uz = z / len;
+      for (let gi = 0; gi < digZones.length; gi++) {
+        const zg = digZones[gi];
+        const cosC = ux * zg.center[0] + uy * zg.center[1] + uz * zg.center[2];
+        if (cosC < zg.cosRadiusPad) continue;                // 粗筛: 角距离 > radius+pad
+        let weight = 0, sumDone = 0;
+        for (let vi = 0; vi < zg.vertices.length; vi++) {
+          const v = zg.vertices[vi];
+          const cos = ux * v.dir[0] + uy * v.dir[1] + uz * v.dir[2];
+          if (cos <= 0) continue;
+          const ang = cos >= 1 ? 0 : Math.acos(cos);
+          if (ang > zg.maxInfluence) continue;
+          const w = 1 / Math.max(ang, 1e-4);                 // 反距离权重
+          weight += w;
+          // 该顶点的"完成度": targetOffset=0 → 1(天然在基准上); 否则 offset/targetOffset clamp 到 [0,1]
+          const done = v.targetOffset <= 1e-6 ? 1
+            : v.offset >= v.targetOffset - 1e-6 ? 1
+            : v.offset <= 0 ? 0
+            : v.offset / v.targetOffset;
+          sumDone += w * done;
+        }
+        if (weight > 0) {
+          const progress = sumDone / weight;                 // 0..1
+          if (progress > 0) h = h + (zg.planeH - h) * progress;
         }
       }
     }

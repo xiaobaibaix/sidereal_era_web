@@ -368,6 +368,20 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
     }
   }
 
+  // ---- 矿场覆盖范围圆环(青色虚线感, 半径 = depot.coverageRadius × R) ----
+  const coverMat = new THREE.LineBasicMaterial({ color: 0x5ad1c0, transparent: true, opacity: 0.45, depthTest: false, depthWrite: false });
+  const coverGroup = new THREE.Group();
+  coverGroup.renderOrder = 998;
+  scene.add(coverGroup);
+  const coverPool = [];
+  function ensureCoverRings(n) {
+    while (coverPool.length < n) {
+      const l = new THREE.LineLoop(ringGeo, coverMat);
+      l.frustumCulled = false; l.matrixAutoUpdate = false; l.renderOrder = 998;
+      coverGroup.add(l); coverPool.push(l);
+    }
+  }
+
   // ---- 电力连线(塔↔塔 / 塔↔建筑, 悬于地表上方) ----
   const POWER_MAX = 2048;   // 最多端点数
   const powerPos = new Float32Array(POWER_MAX * 3);
@@ -393,6 +407,15 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
   jetMesh.frustumCulled = false; jetMesh.count = 0; jetMesh.renderOrder = 996;
   jetMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
   scene.add(jetMesh);
+
+  // ---- 顶点指示器(B升级·逐顶点挖掘): 挖机锁定的顶点画一个小光点, 显示"正在挖这里" ----
+  const VTX_MAX = 1024;
+  const vtxGeo = new THREE.SphereGeometry(0.7, 8, 6);
+  const vtxMat = new THREE.MeshBasicMaterial({ color: 0xff5aff, transparent: true, opacity: 0.9, depthTest: false, depthWrite: false });
+  const vtxMesh = new THREE.InstancedMesh(vtxGeo, vtxMat, VTX_MAX);
+  vtxMesh.frustumCulled = false; vtxMesh.count = 0; vtxMesh.renderOrder = 995;
+  vtxMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  scene.add(vtxMesh);
 
   // ---- 传送带渲染: 带段(沿弧摆放的平板)+ 带上物品(小立方, 按物品染色) ----
   const BELT_SEG_MAX = 8192, BELT_ITEM_MAX = 8192;
@@ -480,6 +503,7 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
       // 建筑(静止): 落地 + 采矿机按状态染色
       for (const e of world.query('Building', 'Anchor')) {
         if (world.has(e, 'Belt')) continue;   // 带单独按弧线渲染(下方), 不走单点建筑渲染
+        if (world.has(e, 'DigZone')) continue;   // 挖掘区(R5独立实体)无外形, 只画红环
         const b = world.get(e, 'Building');
         const a = world.get(e, 'Anchor');
         const g = groups[b.mesh] || fallbackBuilding;
@@ -576,15 +600,15 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
         for (; i < ringPool.length; i++) ringPool[i].visible = false;
       }
 
-      // 矿场挖掘区圆环(常显): 已圈定挖掘区的矿场画一个红环, 半径 = 挖掘区角半径 × 星球半径
+      // 矿场挖掘区圆环(常显): R5 起 zone 是顶层独立实体 → 直接遍历 DigZone
       {
         let i = 0;
         const R = planet.params.radius;
-        for (const e of world.query('Depot', 'DigZone')) {
-          const z = world.get(e, 'DigZone');
-          if (!z.center) continue;
+        for (const e of world.query('DigZone')) {
+          const dz = world.get(e, 'DigZone');
+          if (!dz || !dz.center) continue;
           ensureZoneRings(i + 1);
-          worldMatrix(z.center, 0, planet, _m, z.radius * R);   // 角半径→世界半径
+          worldMatrix(dz.center, 0, planet, _m, (dz.radius || 0.05) * R);
           zonePool[i].matrix.copy(_m);
           zonePool[i].visible = true;
           i++;
@@ -594,6 +618,42 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
 
       // 建造网格(仅放置模式/B 键): 重建平台网格线(格集合贴合平地形状)
       if (_showGrids) rebuildGrids(world); else gridLines.visible = false;
+
+      // 矿场覆盖范围圆环(常显, 浅青): 每个 depot 一个, 半径 = coverageRadius × R
+      {
+        let i = 0;
+        const R = planet.params.radius;
+        for (const e of world.query('Depot', 'Anchor')) {
+          const dep = world.get(e, 'Depot');
+          const a = world.get(e, 'Anchor');
+          const r = (dep && dep.coverageRadius) || 0.16;
+          ensureCoverRings(i + 1);
+          worldMatrix(a.dir, 0, planet, _m, r * R);
+          coverPool[i].matrix.copy(_m);
+          coverPool[i].visible = true;
+          i++;
+        }
+        for (; i < coverPool.length; i++) coverPool[i].visible = false;
+      }
+
+      // 顶点指示器(B升级): 被挖机锁定的顶点画紫色光点(显示挖机正在挖哪里)
+      {
+        let i = 0;
+        for (const e of world.query('DigZone')) {
+          const dz = world.get(e, 'DigZone');
+          if (!dz || !dz.vertices) continue;
+          for (const v of dz.vertices) {
+            if (v.ownerId == null) continue;
+            if (i >= VTX_MAX) break;
+            worldMatrix(v.dir, 0, planet, _m, 1);
+            vtxMesh.setMatrixAt(i, _m);
+            i++;
+          }
+          if (i >= VTX_MAX) break;
+        }
+        vtxMesh.count = i;
+        vtxMesh.instanceMatrix.needsUpdate = true;
+      }
     },
     showPickRanges(on) { ringGroup.visible = !!on; },
     // 建造网格显隐(进入放置模式时开)
@@ -653,9 +713,10 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
         const g = groups[name];
         scene.remove(g.mesh); g.geo.dispose(); g.mat.dispose();
       }
-      scene.remove(ringGroup); scene.remove(zoneGroup); scene.remove(powerLines); scene.remove(jetMesh);
+      scene.remove(ringGroup); scene.remove(zoneGroup); scene.remove(coverGroup); scene.remove(powerLines); scene.remove(jetMesh); scene.remove(vtxMesh);
       scene.remove(beltSegMesh); scene.remove(beltItemMesh); scene.remove(gridLines); scene.remove(cursorMesh);
-      ringGeo.dispose(); ringMat.dispose(); zoneMat.dispose(); powerGeo.dispose(); powerMat.dispose(); jetGeo.dispose(); jetMat.dispose();
+      ringGeo.dispose(); ringMat.dispose(); zoneMat.dispose(); coverMat.dispose(); powerGeo.dispose(); powerMat.dispose(); jetGeo.dispose(); jetMat.dispose();
+      vtxGeo.dispose(); vtxMat.dispose();
       beltSegGeo.dispose(); beltSegMat.dispose(); beltItemGeo.dispose(); beltItemMat.dispose();
       gridGeo.dispose(); gridMat.dispose(); cursorGeo.dispose(); cursorOkMat.dispose(); cursorBadMat.dispose();
     },

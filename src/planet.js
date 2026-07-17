@@ -19,6 +19,9 @@ const TERRAIN_KEYS = [
   'colColdDry', 'colColdWet', 'colRock', 'colSnow',
   // 编辑列表(挖掘/抬升等运行时修改, terrain.heightAt 会叠加在噪声之上; 每条自带 dry 标记)
   'edits',
+  // 顶点网格(B升级·逐顶点挖掘): [{ center, radius, maxInfluence, vertices:[{dir, offset}] }]
+  // mining_crew.js 同步挖机/zone 状态到此参数 → terrain.js / worker 读到 → heightAt 逐顶点下沉
+  'digZoneVertices',
 ];
 
 // ---- 小型数组向量工具(供邻居层级查询用, 避免大量 Vector3 分配) ----

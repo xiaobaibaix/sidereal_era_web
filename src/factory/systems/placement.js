@@ -114,11 +114,12 @@ export function placeBuilding(world, ctx, buildingId, dir, yaw = 0) {
     world.add(e, 'Storage', {});
     world.add(e, 'Inventory', { items: {}, cap: b.cap != null ? b.cap : Infinity });
   } else if (b.kind === 'depot') {
-    // 矿场: 被动容器(自身不挖)。圈定挖掘区(DigZone.center)+挖机+采矿卡车后才有货进来。
-    world.add(e, 'Depot', {});
+    // 矿场: 被动容器(自身不挖)。覆盖范围内(R5)的独立挖掘区实体被自动绑定到该矿场;
+    // 矿场生成挖机/采矿卡车后, 挖机去覆盖范围内的挖掘区开采 → 卡车运回该矿场。
+    // coverageRadius=覆盖角半径(来自 building 表); coverageZones=每 tick 由 mining_crew 刷新的 zone eid 列表。
+    world.add(e, 'Depot', { coverageRadius: b.coverageRadius || 0.16, coverageZones: [] });
     world.add(e, 'Inventory', { items: {}, cap: b.cap != null ? b.cap : Infinity });
     world.add(e, 'Provider', { items: '*' });   // 对外供应存储的一切
-    world.add(e, 'DigZone', { center: null, radius: b.zoneRadius || 0.05, depth: 0 });
   } else if (b.kind === 'producer') {
     const recipeId = b.recipe || (b.recipes && b.recipes[0]);
     const recipe = registry.recipes[recipeId] || { in: [], out: [] };
@@ -397,21 +398,53 @@ export function placeSplitter(world, ctx, dir = null, opts = {}) {
   return e;
 }
 
-// 拆除: 移除组件/实体, 回收其地形坑/挖掘区 edit 并失效该区域(地形恢复)
+// 拆除: 移除组件/实体, 回收其地形坑 edit 并失效该区域。
+// 注意: 挖掘区(DigZone)的顶点级变形是"永久"的 —— 不再清空 planet.params.digZoneVertices,
+// 已挖出的坑留在地形上, 只有"显式 terrain restore UI"才能抹平(目前没有)。这样拆除矿场/换区
+// 不会让已经啃出来的坑恢复。
 export function demolish(world, ctx, eid) {
   const { planet, spatial, bus } = ctx;
-  const restore = (edit, map) => {
+  const restoreOne = (edit, map, key) => {
     if (!edit || !planet) return;
     const i = planet.params.edits.indexOf(edit);
     if (i >= 0) planet.params.edits.splice(i, 1);
-    if (map) map.delete(eid);
+    if (map) map.delete(key);
     planet._buildNoise();
     for (const r of planet.roots) planet._invalidateAffected(r, { x: edit.pos[0], y: edit.pos[1], z: edit.pos[2] }, edit.radius);
     planet._editPending = true;
   };
-  restore(ctx.minerEdits && ctx.minerEdits.get(eid), ctx.minerEdits);   // 旧直挖矿机的坑
-  restore(ctx.zoneEdits && ctx.zoneEdits.get(eid), ctx.zoneEdits);       // 矿场挖掘区的坑
-  restore(ctx.padEdits && ctx.padEdits.get(eid), ctx.padEdits);          // 建造平台的整平区
+  // 旧直挖矿机的坑(单 edit, key = eid)
+  restoreOne(ctx.minerEdits && ctx.minerEdits.get(eid), ctx.minerEdits, eid);
+  // 独立挖掘区(R5): ctx.zoneEdits key = zone 实体 eid。拆除 zone → 清其 dry edit。
+  // 旧版兼容: 还可能有 "eid:zoneId" 形式(depot 嵌套时代), 一并清。
+  if (ctx.zoneEdits) {
+    const prefix = eid + ':';
+    for (const key of [...ctx.zoneEdits.keys()]) {
+      if (key === eid || (typeof key === 'string' && key.startsWith(prefix))) {
+        restoreOne(ctx.zoneEdits.get(key), ctx.zoneEdits, key);
+      }
+    }
+  }
+  // 建造平台的整平区(网格建造)
+  restoreOne(ctx.padEdits && ctx.padEdits.get(eid), ctx.padEdits, eid);
+  // 释放锁定到该实体的挖机(若是 zone 实体)
+  if (world.has(eid, 'DigZone')) {
+    for (const exE of world.query('Excavator')) {
+      const ex = world.get(exE, 'Excavator');
+      if (ex.targetZone === eid) { ex.targetZone = null; ex.targetVertex = null; ex.state = 'idle'; }
+    }
+  }
+  // 释放归属该 depot 的挖机/采矿卡车(depot 拆了, 它们失业)
+  if (world.has(eid, 'Depot')) {
+    for (const exE of world.query('Excavator')) {
+      const ex = world.get(exE, 'Excavator');
+      if (ex.depot === eid) world.destroy(exE);
+    }
+    for (const trE of world.query('MineTruck')) {
+      const tr = world.get(trE, 'MineTruck');
+      if (tr.depot === eid) world.destroy(trE);
+    }
+  }
   // 释放网格占位
   const slot = world.get(eid, 'GridSlot');
   if (slot && world.alive(slot.pad)) { const pad = world.get(slot.pad, 'BuildPad'); if (pad) freePlaced(pad, slot.i, slot.j, slot.w, slot.h); }
