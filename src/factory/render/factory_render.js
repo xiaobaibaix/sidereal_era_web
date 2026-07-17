@@ -526,18 +526,21 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
         for (; i < ringPool.length; i++) ringPool[i].visible = false;
       }
 
-      // 矿场挖掘区圆环(常显): 已圈定挖掘区的矿场画一个红环, 半径 = 挖掘区角半径 × 星球半径
+      // 矿场挖掘区圆环(常显): 已圈定挖掘区的矿场每个 zone 画一个红环, 半径 = zone.radius × 星球半径
       {
         let i = 0;
         const R = planet.params.radius;
         for (const e of world.query('Depot', 'DigZone')) {
-          const z = world.get(e, 'DigZone');
-          if (!z.center) continue;
-          ensureZoneRings(i + 1);
-          worldMatrix(z.center, 0, planet, _m, z.radius * R);   // 角半径→世界半径
-          zonePool[i].matrix.copy(_m);
-          zonePool[i].visible = true;
-          i++;
+          const dz = world.get(e, 'DigZone');
+          if (!dz || !dz.zones) continue;
+          for (const z of dz.zones) {
+            if (!z.center) continue;
+            ensureZoneRings(i + 1);
+            worldMatrix(z.center, 0, planet, _m, z.radius * R);   // 角半径→世界半径
+            zonePool[i].matrix.copy(_m);
+            zonePool[i].visible = true;
+            i++;
+          }
         }
         for (; i < zonePool.length; i++) zonePool[i].visible = false;
       }
@@ -546,16 +549,19 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
       {
         let i = 0;
         for (const e of world.query('DigZone')) {
-          const z = world.get(e, 'DigZone');
-          if (!z || !z.vertices) continue;
-          for (const v of z.vertices) {
-            if (v.ownerId == null) continue;
+          const dz = world.get(e, 'DigZone');
+          if (!dz || !dz.zones) continue;
+          for (const z of dz.zones) {
+            if (!z.vertices) continue;
+            for (const v of z.vertices) {
+              if (v.ownerId == null) continue;
+              if (i >= VTX_MAX) break;
+              worldMatrix(v.dir, 0, planet, _m, 1);
+              vtxMesh.setMatrixAt(i, _m);
+              i++;
+            }
             if (i >= VTX_MAX) break;
-            worldMatrix(v.dir, 0, planet, _m, 1);
-            vtxMesh.setMatrixAt(i, _m);
-            i++;
           }
-          if (i >= VTX_MAX) break;
         }
         vtxMesh.count = i;
         vtxMesh.instanceMatrix.needsUpdate = true;

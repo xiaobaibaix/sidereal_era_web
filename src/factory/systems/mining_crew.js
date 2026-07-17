@@ -1,6 +1,7 @@
 // 矿场采矿小队(挖机 + 采矿卡车) —— 替代"直挖矿机"的新采矿方式。
-//   矿场(Depot): 被动容器, 自身不挖。需先"圈定挖掘区"(DigZone.center), 再生成挖机 + 采矿卡车。
-//   挖机(Excavator): 在矿场挖掘区里"逐顶点"啃地形(B升级):
+//   矿场(Depot): 被动容器, 自身不挖。需先"圈定挖掘区"(DigZone.zones[]), 再生成挖机 + 采矿卡车。
+//   一个矿场可圈定**多个**挖掘区(每点一次"圈定挖掘区"加一个, 互不影响, 删除矿场前都保留)。
+//   挖机(Excavator): 在矿场的任一挖掘区里"逐顶点"啃地形(B升级):
 //       - 每台挖机有自己的 digReach(挖掘臂角半径), 只能挖到范围内的顶点;
 //       - 一次只挖一个顶点(降低 zone.vertices[i].offset), 视觉上"一点点"下降;
 //       - 策略: 以最低点为平面基准(planeH=min baseH), 把"高于基准"的顶点全部挖到基准 → 平整出平面;
@@ -8,6 +9,8 @@
 //       - 顶点 ownerId 互斥(挖机间不重叠); 顶点挖到 targetOffset(=baseH-planeH)即释放, 找下一个待平整点。
 //   采矿卡车(MineTruck): 把挖机缓冲运进矿场库存。
 //   下游: 矿场是 Provider, 物流卡车(logistics)从矿场取货送冶炼/仓库 —— 与旧矿机对下游一致。
+//   永久变形: 顶点级变形(offset)同步到 planet.params.digZoneVertices 后, 即便 depot 被拆除,
+//   对应条目仍按 zone id 永久保留(地形保持已挖出的坑, 不恢复)。
 // 只有"圈定挖掘区 + 有挖机 + 有采矿卡车"三者齐备, 矿场才会进货。
 
 import { oreColumn, layerAt } from '../ore.js';
@@ -15,6 +18,9 @@ import { invTotal, invAdd, invTake, invSpace } from '../core/inventory.js';
 import { moveToward, tangentToward, dot, cross, norm, angle, randInCap } from '../core/sphere.js';
 
 const anchorDir = (world, eid) => [...world.get(eid, 'Anchor').dir];
+
+// 全局 zone id 分配(进程内单调递增; 不同 world 共享, 但 zone id 冲突概率极低且只用于 terrain 渲染层)
+let _nextZoneId = 1;
 
 export function createMiningCrewSystem(opts = {}) {
   const COMMIT_EVERY = opts.commitEvery != null ? opts.commitEvery : 0.15;
@@ -37,29 +43,29 @@ export function createMiningCrewSystem(opts = {}) {
   };
 }
 
-// 在 zone 顶点中找挖机的下一个目标。返回顶点索引 or null。
+// 在挖机 depot 的所有 zone 中找下一个目标。返回 { zoneIdx, vertexIdx } or null。
 // 策略(B5+ 平整版): 把"高于基准平面 planeH"的顶点全部挖到 planeH, 形成平整平面(不再挖成坑/碗)。
 //   - 顶点的 targetOffset = baseH - planeH(clamp 到 hardLimit); offset < targetOffset 即"还有工作"
 //   - 选目标: 范围内 + 未被他人锁 + 还有工作量(offset < targetOffset) + 紧邻"已动工/已到位"顶点(frontier)
 //   - 在 frontier 中选 baseH 最低的(从基准向外、由低到高平整)
 //   - R3 仅 ang <= reach; R6 互斥 ownerId; 已到位(offset>=targetOffset)跳过
 //   - 兜底: 范围内无 frontier(挖机离动工区太远)时, 退化到任意有工作量的顶点(最低 baseH 优先)
-function findNextVertex(zone, fromDir, reach, selfEid) {
-  const vs = zone.vertices;
-
-  // 是否已有"动工或到位"的顶点?(基准点天然到位 → 通常一开始就 true)
-  let hasAnchor = false;
-  for (const v of vs) {
-    if (v.offset >= v.targetOffset - 1e-6 || v.offset > 0 || v.ownerId != null) { hasAnchor = true; break; }
-  }
-
-  if (hasAnchor) {
-    // Frontier: 还有工作量的顶点 + 紧邻"动工或到位"的邻居 + baseH 最低
-    let bestIdx = -1, bestH = Infinity;
+// 跨 zone 选择: 在所有 zone 的候选中选 baseH 最低的(挖机顺势去最近的低处开工)。
+function findNextVertex(zones, fromDir, reach, selfEid) {
+  // 第一轮: frontier 候选(每个 zone 自己有 anchor → 该 zone 内的 frontier 顶点)
+  let bestZone = -1, bestIdx = -1, bestH = Infinity;
+  for (let zi = 0; zi < zones.length; zi++) {
+    const vs = zones[zi].vertices;
+    if (!vs || vs.length === 0) continue;
+    let hasAnchor = false;
+    for (const v of vs) {
+      if (v.offset >= v.targetOffset - 1e-6 || v.offset > 0 || v.ownerId != null) { hasAnchor = true; break; }
+    }
+    if (!hasAnchor) continue;
     for (let i = 0; i < vs.length; i++) {
       const v = vs[i];
-      if (v.ownerId != null && v.ownerId !== selfEid) continue;          // R6 互斥
-      if (v.offset >= v.targetOffset - 1e-6) continue;                   // 已到位
+      if (v.ownerId != null && v.ownerId !== selfEid) continue;
+      if (v.offset >= v.targetOffset - 1e-6) continue;
       let frontier = false;
       for (const ni of (v.neighbors || [])) {
         const nv = vs[ni];
@@ -68,36 +74,40 @@ function findNextVertex(zone, fromDir, reach, selfEid) {
       }
       if (!frontier) continue;
       const ang = angle(fromDir, v.dir);
-      if (ang > reach) continue;                                          // R3 超范围
-      if (v.baseH < bestH) { bestH = v.baseH; bestIdx = i; }
+      if (ang > reach) continue;
+      if (v.baseH < bestH) { bestH = v.baseH; bestZone = zi; bestIdx = i; }
     }
-    if (bestIdx >= 0) return bestIdx;
-    // 兜底未命中(挖机离动工区太远), 落到全局选择
   }
+  if (bestIdx >= 0) return { zoneIdx: bestZone, vertexIdx: bestIdx };
 
-  // 全局兜底: 任意有工作量的顶点, baseH 最低优先(从低处开始平整)
-  let bestIdx = -1, bestH = Infinity;
-  for (let i = 0; i < vs.length; i++) {
-    const v = vs[i];
-    if (v.ownerId != null && v.ownerId !== selfEid) continue;
-    if (v.offset >= v.targetOffset - 1e-6) continue;
-    const ang = angle(fromDir, v.dir);
-    if (ang > reach) continue;
-    if (v.baseH < bestH) { bestH = v.baseH; bestIdx = i; }
+  // 第二轮(兜底): 任意有工作量的顶点, baseH 最低优先
+  bestZone = -1; bestIdx = -1; bestH = Infinity;
+  for (let zi = 0; zi < zones.length; zi++) {
+    const vs = zones[zi].vertices;
+    if (!vs || vs.length === 0) continue;
+    for (let i = 0; i < vs.length; i++) {
+      const v = vs[i];
+      if (v.ownerId != null && v.ownerId !== selfEid) continue;
+      if (v.offset >= v.targetOffset - 1e-6) continue;
+      const ang = angle(fromDir, v.dir);
+      if (ang > reach) continue;
+      if (v.baseH < bestH) { bestH = v.baseH; bestZone = zi; bestIdx = i; }
+    }
   }
-  return bestIdx >= 0 ? bestIdx : null;
+  return bestIdx >= 0 ? { zoneIdx: bestZone, vertexIdx: bestIdx } : null;
 }
 
-// 释放挖机对当前顶点的锁定(ownerId=null, targetVertex=null)
+// 释放挖机对当前顶点的锁定(ownerId=null, targetZone/Vertex=null)
 function releaseVertex(zone, ex, eid) {
   if (ex.targetVertex == null) return;
   const v = zone.vertices[ex.targetVertex];
   if (v && v.ownerId === eid) v.ownerId = null;
   ex.targetVertex = null;
+  ex.targetZone = null;
   ex.digProgress = 0;
 }
 
-// 挖机(逐顶点版): 在挖掘区里"找下一个待平整顶点 → 移过去 → 啃到 planeH → 释放 → 找下一个"。
+// 挖机(逐顶点版): 在矿场任一挖掘区里"找下一个待平整顶点 → 移过去 → 啃到 planeH → 释放 → 找下一个"。
 // 状态机: idle(寻点冷却) → moving → digging → idle(平整完一个找下一个)/ full(满仓)
 // 返回是否改动了地形(顶点 offset 变了 → 需提交)。
 function stepExcavator(world, dt, ctx, e, reg, R) {
@@ -105,16 +115,15 @@ function stepExcavator(world, dt, ctx, e, reg, R) {
   const inv = world.get(e, 'Inventory');
   const mv = world.get(e, 'Mover');
   if (ex.depot == null || !world.alive(ex.depot)) { ex.state = 'idle'; return false; }
-  const zone = world.get(ex.depot, 'DigZone');
-  if (!zone || !zone.center || !zone.vertices || zone.vertices.length === 0) {
-    ex.state = 'idle'; return false;
-  }
+  const dz = world.get(ex.depot, 'DigZone');
+  const zones = dz && dz.zones;
+  if (!zones || zones.length === 0) { ex.state = 'idle'; return false; }
   const mt = reg.machineTypes[ex.typeId] || {};
   const cap = inv.cap == null ? Infinity : inv.cap;
 
   // 满仓 → 释放锁定 + 等卡车
   if (invTotal(inv) >= cap) {
-    if (ex.targetVertex != null) releaseVertex(zone, ex, e);
+    if (ex.targetVertex != null && zones[ex.targetZone]) releaseVertex(zones[ex.targetZone], ex, e);
     ex.state = 'full';
     return false;
   }
@@ -127,17 +136,22 @@ function stepExcavator(world, dt, ctx, e, reg, R) {
       return false;
     }
     ex.searchCooldown = 0.3;   // 找不到时半秒后再试
-    const idx = findNextVertex(zone, mv.dir, ex.digReach, e);
-    if (idx == null) { ex.state = 'idle'; return false; }
-    const v = zone.vertices[idx];
+    const pick = findNextVertex(zones, mv.dir, ex.digReach, e);
+    if (pick == null) { ex.state = 'idle'; return false; }
+    const zone = zones[pick.zoneIdx];
+    const v = zone.vertices[pick.vertexIdx];
     v.ownerId = e;             // 锁定(R6 互斥)
-    ex.targetVertex = idx;
+    ex.targetZone = pick.zoneIdx;
+    ex.targetVertex = pick.vertexIdx;
     ex.digProgress = 0;
     mv.target = [...v.dir];
     ex.state = 'moving';
     // 不 return: 本帧继续尝试移动
   }
 
+  const zone = zones[ex.targetZone];
+  // 防御: zone 在跨 tick 期间被外部删除
+  if (!zone) { ex.targetZone = null; ex.targetVertex = null; ex.state = 'idle'; return false; }
   const v = zone.vertices[ex.targetVertex];
 
   // 防御: 顶点已挖到平整目标(可能跨 tick 期间被外部改动)
@@ -264,46 +278,92 @@ function commitTerrain(planet, ctx) {
   planet._editPending = true;
 }
 
-// 存档迁移: world.load 后, 旧存档的 DigZone 可能没有 vertices 字段(本特性之前)。
-// 扫描所有"已圈定(center != null)但无 vertices"的 DigZone, 用当前 planet/ore 重新生成顶点网格。
-// 同时刷新 planet.params.digZoneVertices(因为 planet 不入 world 存档, load 后是空的)。
-// 幂等: vertices 已存在的跳过; center 未圈的跳过。
+// 存档迁移: world.load 后:
+//   (a) 旧版 DigZone 是单 zone 形状{center, vertices, ...} → 转成新版 { zones: [...] };
+//   (b) 旧版 zone 的 vertices 没生成(本特性之前) 或 pre-plane 格式(无 targetOffset) → 重生顶点;
+//   (c) planet 不入 world 存档 → load 后 digZoneVertices 是空的, 同步刷新。
+// 幂等: 已是新格式且 vertices 完整的跳过。
 export function migrateDigZones(world, ctx) {
   const planet = ctx.planet;
   const reg = ctx.registry;
   const hardnessMax = (reg.machineTypes.excavator_mk1 || {}).hardnessMax || 2;
   let touched = 0;
   for (const e of world.query('DigZone')) {
-    const z = world.get(e, 'DigZone');
-    if (!z.center) continue;
-    const needs = !z.vertices || z.vertices.length === 0
-      || z.vertices[0].targetOffset == null;   // pre-plane 旧格式 → 重生
-    if (!needs) continue;
-    z.vertices = generateVertices(z, planet, reg.ore, hardnessMax);
-    touched++;
+    const dz = world.get(e, 'DigZone');
+    // (a) 旧格式(单 zone): center/vertices 在 dz 顶层 → 包成 zones 数组
+    if (dz.center != null || (dz.vertices && !dz.zones)) {
+      const legacy = {
+        center: dz.center,
+        radius: dz.radius != null ? dz.radius : (dz._defRadius || 0.05),
+        resolution: dz.resolution != null ? dz.resolution : (dz._defResolution || 0.005),
+        planeH: dz.planeH || 0,
+        depth: dz.depth || 0,
+        vertices: dz.vertices,
+      };
+      dz.zones = [legacy];
+      delete dz.center; delete dz.vertices; delete dz.planeH; delete dz.depth;
+      touched++;
+    }
+    if (!dz.zones) continue;
+    for (const z of dz.zones) {
+      if (!z.center) continue;
+      const needs = !z.vertices || z.vertices.length === 0
+        || z.vertices[0].targetOffset == null
+        || z.id == null;   // 缺 id 也要补(永久变形靠 id 索引)
+      if (!needs) continue;
+      if (z.id == null) z.id = _nextZoneId++;
+      z.vertices = generateVertices(z, planet, reg.ore, hardnessMax);
+      touched++;
+    }
   }
   if (touched > 0 || (planet && !planet.params.digZoneVertices)) syncDigZoneVertices(world, ctx);
   return touched;
 }
 
 // 把 world 里所有 DigZone 的顶点(挖机已改的 offset)同步到 planet.params.digZoneVertices。
-// 单向数据流: world(DigZone 组件) → planet.params → terrain.js / worker 的 heightAt。
-// 在 setDigZone 后 + commitTerrain 前(挖机改顶点后)调用, 让渲染看到顶点级下沉。
+// 单向数据流: world(DigZone.zones) → planet.params → terrain.js / worker 的 heightAt。
+// 永久变形语义: planet.params.digZoneVertices 是**按 zone id 索引、只增不删**的列表。
+//   - 活跃 zone(在 world 里)→ 按 id 找/建条目, 原地更新 offsets;
+//   - 孤儿 zone(depot 已拆除, 不在 world 里)→ 条目保留, 不再更新, 永久留在地形上。
+// 这样拆除矿场/换区不会让已挖出的坑恢复。
 export function syncDigZoneVertices(world, ctx) {
   const planet = ctx.planet;
   if (!planet) return;
-  const out = [];
+  if (!planet.params.digZoneVertices) planet.params.digZoneVertices = [];
+  const list = planet.params.digZoneVertices;
+  const byId = new Map();
+  for (const en of list) if (en.id != null) byId.set(en.id, en);
   for (const e of world.query('DigZone')) {
-    const z = world.get(e, 'DigZone');
-    if (!z.center || !z.vertices || z.vertices.length === 0) continue;
-    out.push({
-      center: z.center,
-      radius: z.radius,
-      maxInfluence: (z.resolution || 0.005) * 1.5,
-      vertices: z.vertices.map((v) => ({ dir: v.dir, offset: v.offset })),
-    });
+    const dz = world.get(e, 'DigZone');
+    if (!dz || !dz.zones) continue;
+    for (const z of dz.zones) {
+      if (!z.center || !z.vertices || z.vertices.length === 0) continue;
+      if (z.id == null) z.id = _nextZoneId++;
+      let entry = byId.get(z.id);
+      if (!entry) {
+        entry = {
+          id: z.id,
+          center: z.center,
+          radius: z.radius,
+          maxInfluence: (z.resolution || 0.005) * 1.5,
+          vertices: z.vertices.map((v) => ({ dir: v.dir, offset: v.offset })),
+        };
+        list.push(entry);
+        byId.set(z.id, entry);
+      } else {
+        // 原地更新 offsets(顶点表长度在 generateVertices 后稳定, 直接索引覆盖)
+        const ev = entry.vertices;
+        if (ev.length !== z.vertices.length) {
+          // 长度不一致(可能 resolution 变了)→ 重建整张表
+          entry.center = z.center; entry.radius = z.radius;
+          entry.maxInfluence = (z.resolution || 0.005) * 1.5;
+          entry.vertices = z.vertices.map((v) => ({ dir: v.dir, offset: v.offset }));
+        } else {
+          for (let i = 0; i < ev.length; i++) ev[i].offset = z.vertices[i].offset;
+        }
+      }
+    }
   }
-  planet.params.digZoneVertices = out;
 }
 
 // ---- 顶点网格(B升级): 在挖掘区球冠内均匀采样的离散顶点 ----
@@ -403,41 +463,77 @@ export function recomputePlane(zone) {
   recomputePlaneImpl(zone, zone.vertices);
 }
 
-// 圈定矿场挖掘区: 设中心方向 + 生成顶点网格 + 建/换该矿场的挖掘区地形坑 edit(向后兼容)
+// 圈定矿场挖掘区: 加一个**新**zone 到该矿场的 zones 列表(已圈的 zone 保留)。
+//   - 每点一次"圈定挖掘区"加一个独立 zone, 互不影响;
+//   - 删除矿场(或显式 removeDigZone)前, 已圈的 zone 永久保留;
+//   - 即便删除, 该 zone 在 planet.params.digZoneVertices 里的顶点变形仍按 id 永久保留(永久变形)。
+// 参数 centerDir: 球面方向(不需要归一, 函数内归一)。
 export function setDigZone(world, ctx, depotEid, centerDir) {
-  const zone = world.get(depotEid, 'DigZone');
-  if (!zone) return false;
-  const c = [centerDir[0], centerDir[1], centerDir[2]];
-  zone.center = c; zone.depth = 0;
+  let dz = world.get(depotEid, 'DigZone');
+  if (!dz) {
+    dz = { zones: null };
+    world.add(depotEid, 'DigZone', dz);
+  }
+  if (!dz.zones) dz.zones = [];
+  const c = norm([centerDir[0], centerDir[1], centerDir[2]]);
   const planet = ctx.planet;
   const reg = ctx.registry;
+  // 半径/分辨率: 用 depot 默认(placement.js 写在 _defRadius/_defResolution), 否则 building 表里取
+  const depotB = reg.buildings.depot || {};
+  const radius = dz._defRadius != null ? dz._defRadius : (depotB.zoneRadius || 0.05);
+  const resolution = dz._defResolution != null ? dz._defResolution : (depotB.digResolution || 0.005);
   // 生成顶点网格(逐顶点挖掘的基础); hardnessMax 取 excavator_mk1 的(挖机能力上限)
   const hardnessMax = (reg.machineTypes.excavator_mk1 || {}).hardnessMax || 2;
-  zone.vertices = generateVertices(zone, planet, reg.ore, hardnessMax);
+  const z = {
+    id: _nextZoneId++,
+    center: [c[0], c[1], c[2]],
+    radius, resolution,
+    planeH: 0, depth: 0, vertices: null,
+  };
+  z.vertices = generateVertices(z, planet, reg.ore, hardnessMax);
+  dz.zones.push(z);
+
   if (planet) {
+    // 注: 旧版"圆形 edit"(depth=0, 无视觉影响)仍保留, 用于地形失效/invalidate 触发重生成。
+    // 每个圈定都触发一次失效, 让 chunks 重生成 → 读到顶点级变形。
     if (!ctx.zoneEdits) ctx.zoneEdits = new Map();
-    const old = ctx.zoneEdits.get(depotEid);
-    if (old) { const i = planet.params.edits.indexOf(old); if (i >= 0) planet.params.edits.splice(i, 1); }
-    const sea = planet.params.seaLevel || 0;
-    const h0 = planet.baseHeightAt ? planet.baseHeightAt(c[0], c[1], c[2]) : planet.heightAt(c[0], c[1], c[2]);
-    const edit = { pos: c, radius: zone.radius, depth: 0, falloff: 'smooth', dry: h0 > sea };
+    const edit = { pos: [c[0], c[1], c[2]], radius, depth: 0, falloff: 'smooth', dry: true };
     planet.params.edits.push(edit);
-    ctx.zoneEdits.set(depotEid, edit);
+    ctx.zoneEdits.set(depotEid + ':' + z.id, edit);
     if (planet._buildNoise) planet._buildNoise();
-    if (planet.roots) for (const r of planet.roots) planet._invalidateAffected(r, { x: c[0], y: c[1], z: c[2] }, zone.radius);
+    if (planet.roots) for (const r of planet.roots) planet._invalidateAffected(r, { x: c[0], y: c[1], z: c[2] }, radius);
     planet._editPending = true;
-    // 顶点表立即同步到 terrain 参数(让 heightAt 即时读到顶点网格)
     syncDigZoneVertices(world, ctx);
   }
+  return true;
+}
+
+// 删除矿场指定 zone(按 zone id)。不传 zoneId 则删第一个。地形变形永久保留(仅停止 AI 在该 zone 工作)。
+export function removeDigZone(world, ctx, depotEid, zoneId) {
+  const dz = world.get(depotEid, 'DigZone');
+  if (!dz || !dz.zones || dz.zones.length === 0) return false;
+  const idx = zoneId != null ? dz.zones.findIndex((z) => z.id === zoneId) : 0;
+  if (idx < 0) return false;
+  // 释放可能锁定该 zone 顶点的挖机
+  for (const e of world.query('Excavator')) {
+    const ex = world.get(e, 'Excavator');
+    if (ex.depot !== depotEid) continue;
+    if (ex.targetZone === idx) { ex.targetZone = null; ex.targetVertex = null; ex.state = 'idle'; }
+    else if (ex.targetZone != null && ex.targetZone > idx) ex.targetZone--;   // 索引回填
+  }
+  dz.zones.splice(idx, 1);
+  // 不清 planet.params.digZoneVertices 中对应 id 的条目(永久变形)
+  syncDigZoneVertices(world, ctx);
   return true;
 }
 
 // 生成挖机(绑定到某矿场, 在其挖掘区/矿场附近散布)
 export function spawnExcavators(world, ctx, n, depotEid, typeId = 'excavator_mk1') {
   const mt = ctx.registry.machineTypes[typeId] || {};
-  const zone = world.get(depotEid, 'DigZone');
-  const near = (zone && zone.center) ? zone.center : anchorDir(world, depotEid);
-  const spread = (zone ? zone.radius : 0.05) * 1.2;
+  const dz = world.get(depotEid, 'DigZone');
+  const firstZone = dz && dz.zones && dz.zones[0];
+  const near = firstZone ? firstZone.center : anchorDir(world, depotEid);
+  const spread = (firstZone ? firstZone.radius : 0.05) * 1.2;
   const out = [];
   for (let i = 0; i < n; i++) {
     const dir = randInCap(near, spread);
@@ -446,13 +542,13 @@ export function spawnExcavators(world, ctx, n, depotEid, typeId = 'excavator_mk1
     world.add(e, 'Mover', { dir, fwd: tangentToward(dir, near), target: [...dir] });
     // 逐顶点挖机(B升级):
     //   digReach=挖掘臂角半径; digStep=单次目标降低量;
-    //   targetVertex=当前锁定的 zone.vertices 索引; digProgress=该顶点累计挖量;
+    //   targetZone/targetVertex=当前锁定的 zone.vertices 索引; digProgress=该顶点累计挖量;
     //   searchCooldown=寻点冷却(避免每帧扫描所有顶点)
     world.add(e, 'Excavator', {
       typeId, depot: depotEid, state: 'idle',
       digPoint: null, reloc: 0, lastItem: null,        // 旧字段(legacy, 重写后逐步淘汰)
       digReach: mt.digReach || 0.025, digStep: mt.digStep || 0.02,
-      targetVertex: null, digProgress: 0, searchCooldown: 0,
+      targetZone: null, targetVertex: null, digProgress: 0, searchCooldown: 0,
     });
     world.add(e, 'Inventory', { items: {}, cap: mt.cap || 60 });
     if (ctx.spatial) ctx.spatial.insert(e, dir);

@@ -148,14 +148,16 @@ export function createFactoryApp(opts) {
     let any = null;
     for (const e of factory.world.query('Depot', 'DigZone')) {
       if (any == null) any = e;
-      if (factory.world.get(e, 'DigZone').center) return e;
+      const dz = factory.world.get(e, 'DigZone');
+      if (dz && dz.zones && dz.zones.length > 0) return e;
     }
     return any;
   }
   function doSpawnExcavators() {
     const depot = firstDepotWithZone();
     if (depot == null) { showToast('请先放置矿场', true); return; }
-    if (!factory.world.get(depot, 'DigZone').center) { showToast('请先圈定挖掘区(模式选「圈定挖掘区」点矿场旁)', true); return; }
+    const dz = factory.world.get(depot, 'DigZone');
+    if (!dz || !dz.zones || dz.zones.length === 0) { showToast('请先圈定挖掘区(模式选「圈定挖掘区」点矿场旁)', true); return; }
     spawnExcavators(factory.world, factory.ctx, fpTool.excavatorCount, depot);
     showToast(`已生成 ${fpTool.excavatorCount} 台挖机`, false);
   }

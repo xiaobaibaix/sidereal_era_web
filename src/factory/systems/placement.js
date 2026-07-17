@@ -32,13 +32,14 @@ export function placeBuilding(world, ctx, buildingId, dir, yaw = 0) {
     world.add(e, 'Storage', {});
     world.add(e, 'Inventory', { items: {}, cap: b.cap != null ? b.cap : Infinity });
   } else if (b.kind === 'depot') {
-    // 矿场: 被动容器(自身不挖)。圈定挖掘区(DigZone.center)+挖机+采矿卡车后才有货进来。
+    // 矿场: 被动容器(自身不挖)。圈定挖掘区(DigZone.zones[])+挖机+采矿卡车后才有货进来。
     world.add(e, 'Depot', {});
     world.add(e, 'Inventory', { items: {}, cap: b.cap != null ? b.cap : Infinity });
     world.add(e, 'Provider', { items: '*' });   // 对外供应存储的一切
-    // DigZone: vertices=null 表示未圈定; setDigZone 时填充顶点网格(逐顶点挖掘的基础)。
-    // planeH = 顶点网格中最低 baseH(平整目标平面高度); setDigZone 时计算。
-    world.add(e, 'DigZone', { center: null, radius: b.zoneRadius || 0.05, depth: 0, resolution: b.digResolution || 0.005, vertices: null, planeH: 0 });
+    // DigZone.zones: 该矿场可圈定多个独立挖掘区(每点一次"圈定挖掘区"加一个); null/空数组=未圈定。
+    // 每个 zone = { id, center, radius, resolution, planeH, depth, vertices:[...] }。
+    // radius/resolution 默认值存到 building 上, setDigZone 时拷到具体 zone。
+    world.add(e, 'DigZone', { zones: null, _defRadius: b.zoneRadius || 0.05, _defResolution: b.digResolution || 0.005 });
   } else if (b.kind === 'producer') {
     const recipeId = b.recipe || (b.recipes && b.recipes[0]);
     const recipe = registry.recipes[recipeId] || { in: [], out: [] };
@@ -173,24 +174,38 @@ export function placeSplitter(world, ctx, dir = null, opts = {}) {
   return e;
 }
 
-// 拆除: 移除组件/实体, 回收其地形坑/挖掘区 edit 并失效该区域(地形恢复)
+// 拆除: 移除组件/实体, 回收其地形坑 edit 并失效该区域。
+// 注意: 挖掘区(DigZone)的顶点级变形是"永久"的 —— 不再清空 planet.params.digZoneVertices,
+// 已挖出的坑留在地形上, 只有"显式 terrain restore UI"才能抹平(目前没有)。这样拆除矿场/换区
+// 不会让已经啃出来的坑恢复。
 export function demolish(world, ctx, eid) {
   const { planet, spatial, bus } = ctx;
-  const restore = (edit, map) => {
+  const restoreOne = (edit, map, key) => {
     if (!edit || !planet) return;
     const i = planet.params.edits.indexOf(edit);
     if (i >= 0) planet.params.edits.splice(i, 1);
-    if (map) map.delete(eid);
+    if (map) map.delete(key);
     planet._buildNoise();
     for (const r of planet.roots) planet._invalidateAffected(r, { x: edit.pos[0], y: edit.pos[1], z: edit.pos[2] }, edit.radius);
     planet._editPending = true;
   };
-  restore(ctx.minerEdits && ctx.minerEdits.get(eid), ctx.minerEdits);   // 旧直挖矿机的坑
-  restore(ctx.zoneEdits && ctx.zoneEdits.get(eid), ctx.zoneEdits);       // 矿场挖掘区的坑
+  // 旧直挖矿机的坑(单 edit, key = eid)
+  restoreOne(ctx.minerEdits && ctx.minerEdits.get(eid), ctx.minerEdits, eid);
+  // 矿场挖掘区圆形 edit(depth=0, 无视觉影响): 多 zone 场景下 ctx.zoneEdits 用 "eid:zoneId" 做 key,
+  // 同一矿场所有 zone 的 edit 都要清掉(避免泄漏)。
+  if (ctx.zoneEdits) {
+    const prefix = eid + ':';
+    for (const key of [...ctx.zoneEdits.keys()]) {
+      if (key === eid || (typeof key === 'string' && key.startsWith(prefix))) {
+        restoreOne(ctx.zoneEdits.get(key), ctx.zoneEdits, key);
+      }
+    }
+  }
   const hadDigZone = world.has(eid, 'DigZone');
   if (spatial) spatial.remove(eid);
   world.destroy(eid);
-  // 顶点网格同步: 已销毁的 depot 不应在 digZoneVertices 里 → 重同步(必须在 destroy 之后)
+  // 顶点网格同步: 已销毁的 depot 的 zone 会从"活跃集合"消失, 但其顶点级变形(已挖的坑)
+  // 通过 syncDigZoneVertices 的"按 id 永久保留"语义继续留在 planet.params.digZoneVertices 里。
   if (hadDigZone) syncDigZoneVertices(world, ctx);
   if (bus) bus.emit('demolish', { eid });
 }

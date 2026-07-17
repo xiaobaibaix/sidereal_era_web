@@ -61,7 +61,8 @@ function makeCtx(planet) {
 
   const zoneDir = S.norm([0.1, 1, 0.05]);
   assert.ok(setDigZone(world, ctx, depot, zoneDir), '圈定挖掘区成功');
-  assert.deepEqual(world.get(depot, 'DigZone').center, [...zoneDir], '挖掘区中心已设');
+  const dz = world.get(depot, 'DigZone');
+  assert.deepEqual(dz.zones[0].center, [...zoneDir], '挖掘区中心已设');
   assert.equal(planet.params.edits.length, 1, '建了挖掘区地形坑 edit');
 
   const exs = spawnExcavators(world, ctx, 2, depot);
@@ -75,7 +76,7 @@ function makeCtx(planet) {
   for (let i = 0; i < 2000; i++) {
     world.tick(0.05, ctx);
     for (const e of exs) if (invTotal(world.get(e, 'Inventory')) > 0) sawExcaOre = true;
-    if (world.get(depot, 'DigZone').depth > 0.05) sawDig = true;
+    if (dz.zones[0].depth > 0.05) sawDig = true;
     if (invTotal(depotInv) > 50) break;
   }
   assert.ok(sawDig, '挖掘区被挖深');
