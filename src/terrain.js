@@ -90,7 +90,7 @@ export function makeTerrain(p) {
   // 顶点网格(B升级·逐顶点挖掘): 每个矿场挖掘区一组离散顶点; heightAt 用"progress 加权整平"把
   // 它们叠加到高度场上 → 挖机改某顶点 offset 即"该方向逐渐下沉到 planeH", 视觉上一点一点下降。
   //   - center: zone 中心方向(单位向量)
-  //   - cosRadiusPad: cos(radius+padding), 角距离 > radius+pad 的采样点直接跳过该 zone(粗筛)
+  //   - cosRadius: cos(radius), 硬边界; 角距离 > radius 的采样点跳过 → 整平严格限制在圈内(不外溢)
   //   - planeH: zone 整平基准(挖完后所有顶点高度 = planeH, 即球面切片)
   //   - maxInfluence: 单顶点影响半径(角弧度); 通常 = zone.resolution × 1.5
   //   - vertices: [{ dir, offset, targetOffset }]
@@ -103,7 +103,8 @@ export function makeTerrain(p) {
   //   比"减 IDW(offset)"准: 那样 baseNoise 在顶点间的高频起伏会泄漏成 bumps。
   const digZones = Array.isArray(p.digZoneVertices) ? p.digZoneVertices.map((z) => ({
     center: z.center,
-    cosRadiusPad: Math.cos((z.radius || 0) + 0.005),
+    // 硬边界: 角距离 > radius 的采样点完全不受整平影响 → 挖掘严格限制在圈内(不外溢到圈外)
+    cosRadius: Math.cos(z.radius || 0),
     planeH: z.planeH || 0,
     maxInfluence: z.maxInfluence || 0.0075,
     vertices: Array.isArray(z.vertices) ? z.vertices.map((v) => ({
@@ -199,7 +200,7 @@ export function makeTerrain(p) {
       for (let gi = 0; gi < digZones.length; gi++) {
         const zg = digZones[gi];
         const cosC = ux * zg.center[0] + uy * zg.center[1] + uz * zg.center[2];
-        if (cosC < zg.cosRadiusPad) continue;                // 粗筛: 角距离 > radius+pad
+        if (cosC < zg.cosRadius) continue;                   // 硬边界: 圈外(角距离 > radius)不整平 → 不挖到圈外
         let weight = 0, sumDone = 0;
         for (let vi = 0; vi < zg.vertices.length; vi++) {
           const v = zg.vertices[vi];
