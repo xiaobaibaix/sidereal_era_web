@@ -27,8 +27,8 @@ import { createLogisticsSystem, spawnHaulers } from './systems/logistics.js';
 import { createBeltSystem } from './systems/belt.js';
 import { createInserterSystem } from './systems/inserter.js';
 import { createSplitterSystem } from './systems/splitter.js';
-import { placeBuilding, demolish, placeBelt, placeInserter, placeSplitter, linkBelts, placeBuildPad, placeBuildingSnapped, padAt, rebuildPadEdits } from './systems/placement.js';
-import { angle as sphAngle, cross, norm, rotateAxis, dot } from './core/sphere.js';
+import { placeBuilding, demolish, placeBelt, placeInserter, placeInserterMounted, placeSplitter, linkBelts, placeBuildPad, placeBuildingSnapped, padAt, rebuildPadEdits } from './systems/placement.js';
+import { angle as sphAngle } from './core/sphere.js';
 import { dirToCell, footprintCenterDir, snapYaw, canPlace, snapDir } from './core/grid.js';
 import { createFactoryRenderer } from './render/factory_render.js';
 import { createInspector } from './render/inspector.js';
@@ -86,6 +86,7 @@ export function createFactoryApp(opts) {
     excavatorCount: 3, spawnExcavators() { doSpawnExcavators(); },
     mineTruckCount: 3, spawnMineTrucks() { doSpawnMineTrucks(); },
     haulerCount: 3, spawnHaulers() { doSpawnHaulers(); },
+    inserterDir: '进料', inserterReach: 1,   // 分拣器: 方向(进料/出料) + 抓取距离(1/2/3 格)
     showRanges: false, status: '待命',
   };
   let _fpDown = null;
@@ -105,6 +106,8 @@ export function createFactoryApp(opts) {
   fpGui.add(fpTool, 'spawnMineTrucks').name('生成采矿车');
   fpGui.add(fpTool, 'haulerCount', 1, 20, 1).name('物流车数量');
   fpGui.add(fpTool, 'spawnHaulers').name('生成物流车');
+  fpGui.add(fpTool, 'inserterDir', ['进料', '出料']).name('分拣器方向');
+  fpGui.add(fpTool, 'inserterReach', 1, 3, 1).name('分拣器抓取距离');
   fpGui.add(fpTool, 'showRanges').name('显示可点击范围').onChange((v) => factoryRenderer.showPickRanges(v));
   fpGui.add(fpTool, 'status').name('状态').listen().disable();
 
@@ -245,27 +248,12 @@ export function createFactoryApp(opts) {
     }
     return true;
   }
-  // 建筑前向(与 anchor.worldMatrix 一致): t1 = norm(cross(up, n)) 绕 n 转 yaw
-  function buildingForward(n, yaw) {
-    const up = Math.abs(n[1]) < 0.99 ? [0, 1, 0] : [1, 0, 0];
-    return rotateAxis(norm(cross(up, n)), n, yaw || 0);
-  }
   // 若 dir 落在某建造平台内, 吸附到最近格点; 否则原样返回(供传送带端点吸附网格)
   function snapToGrid(dir) {
     const hit = padAt(factory.world, dir);
     if (!hit) return dir;
     const s = snapDir(hit.pad, dir, getPlanet().params.radius);
     return s.inside ? s.dir : dir;
-  }
-  // 端点最近的带(供分拣器连接): 返回 eid | null
-  function nearestBeltTo(dir) {
-    let best = null, bestA = Infinity;
-    for (const e of factory.world.query('Belt')) {
-      const b = factory.world.get(e, 'Belt');
-      const a = Math.min(sphAngle(dir, b.from), sphAngle(dir, b.to));
-      if (a < bestA) { bestA = a; best = e; }
-    }
-    return best;
   }
 
   // 放置带(折线的一段): 从 _beltStart→dir 成带, 并与上一段带↔带直连; 终点成为下一段起点(可继续延伸)
@@ -280,34 +268,26 @@ export function createFactoryApp(opts) {
   }
   const endBeltPath = () => { const had = _beltPrev != null || _beltStart != null; _beltStart = null; _beltPrev = null; return had; };
 
-  // 分拣器装在建筑上(单点): 点建筑"偏后"=进料(带→建筑入口), "偏前"=出料(建筑出口→带); 连到该侧最近的带。
-  // 前/后由点击点相对建筑中心在"建筑前向"上的投影正负决定。filtered=过滤分拣器(sorter)。
+  // 分拣器装在"平台网格上的建筑"边缘(单点): 点击建筑的某条边 → 分拣器嵌在那条边中点, 爪子朝外。
+  // 抓取格 = 该边外 reach 格(面板设 1/2/3); 方向 = 面板"进料/出料"; 运行时抓取格里有什么(带/建筑)就交互。
   function placeInserterOnBuilding(dir, filtered) {
     const buildingId = filtered ? 'sorter' : 'inserter';
     if (!checkUnlocked(buildingId)) return;
     const bld = factoryRenderer.pickBuilding(factory.world, dir);
-    if (bld == null || factory.world.has(bld, 'Belt') || !factory.world.has(bld, 'Inventory')) {
-      showToast('请点在一个建筑上(偏后=进料 / 偏前=出料)', true); return;
+    if (bld == null || factory.world.has(bld, 'Belt') || !factory.world.has(bld, 'GridSlot')) {
+      showToast('请点在平台网格里的建筑上(先把建筑放到建造平台内)', true); return;
     }
-    const a = factory.world.get(bld, 'Anchor');
-    const n = a.dir;
-    const fwd = buildingForward(n, a.yaw);
-    const cd = dot(n, dir);
-    const ox = dir[0] - n[0] * cd, oy = dir[1] - n[1] * cd, oz = dir[2] - n[2] * cd;   // 点击相对建筑中心的切向偏移
-    const front = (ox * fwd[0] + oy * fwd[1] + oz * fwd[2]) >= 0;                       // 投影到前向: >=0 前(出料), <0 后(进料)
-    const belt = nearestBeltTo(dir);
-    if (belt == null) { showToast(`该${front ? '前' : '后'}侧附近没有传送带, 请先在这侧放一条带`, true); return; }
-    let fromPort, toPort;
-    if (front) {   // 出料: 建筑 → 带
-      fromPort = { kind: 'inv', eid: bld, role: 'provide' };
-      toPort = { kind: 'belt', eid: belt, role: 'in' };
-    } else {       // 进料: 带 → 建筑
-      fromPort = { kind: 'belt', eid: belt, role: 'out' };
-      toPort = { kind: 'inv', eid: bld, role: factory.world.has(bld, 'Requester') ? 'request' : 'any' };
-    }
+    const slot = factory.world.get(bld, 'GridSlot');
+    const pad = factory.world.get(slot.pad, 'BuildPad');
+    const c = dirToCell(pad, dir, getPlanet().params.radius);
+    const cx = slot.i + (slot.w - 1) / 2, cy = slot.j + (slot.h - 1) / 2;    // 建筑中心格
+    const dx = c.i - cx, dy = c.j - cy;                                       // 点击相对建筑中心的格偏移
+    const axis = Math.abs(dx) >= Math.abs(dy) ? { di: dx >= 0 ? 1 : -1, dj: 0 } : { di: 0, dj: dy >= 0 ? 1 : -1 };
+    const mode = fpTool.inserterDir === '出料' ? 'out' : 'in';
+    const e = placeInserterMounted(factory.world, factory.ctx, bld, axis, fpTool.inserterReach, mode, filtered);
+    if (e == null) { showToast('装分拣器失败(建筑需在平台内 / 科技未解锁)', true); return; }
     const name = (factory.registry.buildings[factory.world.get(bld, 'Building').typeId] || {}).name || '建筑';
-    const e = placeInserter(factory.world, factory.ctx, fromPort, toPort, { buildingId });
-    if (e != null) showToast(`已在${name}${front ? '前侧装出料(建筑→带)' : '后侧装进料(带→建筑)'}${filtered ? '·过滤' : ''}分拣器`, false);
+    showToast(`已在${name}边装${filtered ? '过滤' : ''}分拣器 · ${mode === 'in' ? '进料(抓取格→建筑)' : '出料(建筑→抓取格)'} · 抓取距离${fpTool.inserterReach}`, false);
   }
 
   // 放置分流器: 单点; 自动把"头端靠近该点的带"接为入, "尾端靠近该点的带"接为出

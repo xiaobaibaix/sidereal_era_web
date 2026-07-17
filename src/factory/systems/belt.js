@@ -59,6 +59,36 @@ export function beltTakeHead(belt) {
   return null;
 }
 
+// ---- 中途抽取/投放(方案1): 让分拣器在带的任意 s 位置抓取/放置, 不限于头/尾 ----
+const tapWindow = (belt, w) => (w != null ? w : Math.max(spacingNorm(belt), 0.06));
+
+// 看 sPos 附近窗口内最近的物品(不移除); 无则 null。
+export function beltTapPeek(belt, sPos, window) {
+  const w = tapWindow(belt, window);
+  let bi = -1, bd = Infinity;
+  for (let i = 0; i < belt.items.length; i++) { const d = Math.abs(belt.items[i].s - sPos); if (d < w && d < bd) { bd = d; bi = i; } }
+  return bi >= 0 ? belt.items[bi].item : null;
+}
+// 取走 sPos 附近最近的物品; 无则 null。
+export function beltTapTake(belt, sPos, window) {
+  const w = tapWindow(belt, window);
+  let bi = -1, bd = Infinity;
+  for (let i = 0; i < belt.items.length; i++) { const d = Math.abs(belt.items[i].s - sPos); if (d < w && d < bd) { bd = d; bi = i; } }
+  if (bi < 0) return null;
+  const it = belt.items[bi].item; belt.items.splice(bi, 1); return it;
+}
+// 在 sPos 处放一个物品(该处 spacing 内无物品且未满); 保持 items 按 s 降序。成功返回 true。
+export function beltTapPut(belt, item, sPos) {
+  const sp = spacingNorm(belt);
+  const s = sPos < 0 ? 0 : sPos > 1 ? 1 : sPos;
+  for (const it of belt.items) if (Math.abs(it.s - s) < sp) return false;
+  if (belt.items.length >= belt.cap) return false;
+  let idx = belt.items.length;
+  for (let i = 0; i < belt.items.length; i++) { if (belt.items[i].s < s) { idx = i; break; } }
+  belt.items.splice(idx, 0, { item, s });
+  return true;
+}
+
 // 把头部物品投递到 outPort。返回是否投递成功。
 //   outPort.kind==='inv':  写入实体 Inventory(role==='request' 时须该实体确有此需求)
 //   outPort.kind==='belt': 压入目标带尾(带↔带直连)

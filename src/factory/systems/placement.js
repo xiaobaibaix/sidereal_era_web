@@ -5,7 +5,7 @@ import { createBelt } from './belt.js';
 import { midPortDir } from './inserter.js';
 import { norm } from '../core/sphere.js';
 import { angle } from '../core/sphere.js';
-import { makePad, offsetToDir, dirToCell, footprintCenterDir, canPlace, markPlaced, freePlaced, snapYaw } from '../core/grid.js';
+import { makePad, offsetToDir, dirToCell, cellToDir, footprintCenterDir, canPlace, markPlaced, freePlaced, snapYaw } from '../core/grid.js';
 
 // 采样平台圆区内基础地形的最低点, 作为整平目标 level(只挖不填 → 全平)。无 planet 返回 0。
 function sampleMinLevel(planet, pad, R) {
@@ -198,7 +198,31 @@ export function placeBelt(world, ctx, from, to, opts = {}) {
   const buildingId = opts.buildingId || 'belt';
   const b = registry.buildings[buildingId];
   if (b && b.locked && !(registry.isUnlocked && registry.isUnlocked(buildingId))) return null;
-  return createBelt(world, ctx, from, to, { ...opts, buildingId });
+  const e = createBelt(world, ctx, from, to, { ...opts, buildingId });
+  registerBeltPadCells(world, ctx, e);
+  return e;
+}
+
+// 若带的两端都在同一建造平台内, 记录它经过的网格格(供分拣器按抓取格找到该带 + 该格的 s 位置)。
+// belt.pad = 平台 eid; belt.cells = { "i,j": s }(s: 0=尾→1=头)。
+export function registerBeltPadCells(world, ctx, beltEid) {
+  const bl = beltEid != null && world.get(beltEid, 'Belt');
+  if (!bl) return;
+  const R = ctx.planet ? ctx.planet.params.radius : 100;
+  const hitA = padAt(world, bl.from), hitB = padAt(world, bl.to);
+  if (!hitA || !hitB || hitA.eid !== hitB.eid) { bl.pad = null; bl.cells = null; return; }
+  const pad = hitA.pad;
+  const ca = dirToCell(pad, bl.from, R), cb = dirToCell(pad, bl.to, R);
+  const steps = Math.max(Math.abs(cb.i - ca.i), Math.abs(cb.j - ca.j));
+  const cells = {};
+  for (let k = 0; k <= steps; k++) {
+    const t = steps ? k / steps : 0;
+    const i = Math.round(ca.i + (cb.i - ca.i) * t);
+    const j = Math.round(ca.j + (cb.j - ca.j) * t);
+    cells[i + ',' + j] = t;   // t = s 位置(尾→头)
+  }
+  bl.pad = hitA.eid; bl.cells = cells;
+  bl.cellGap = steps > 0 ? 1 / steps : 1;   // 每格的 s 跨度(供分拣器抽取窗口, 防高速带跳过)
 }
 
 // 放置一条折线带(多段): points=[dir0,dir1,...] → 生成 N-1 段带, 每段头部(outPort)直连下一段带尾(不经分拣器)。
@@ -243,6 +267,44 @@ export function placeInserter(world, ctx, from, to, opts = {}) {
   world.add(e, 'Building', { typeId: buildingId, mesh: (b && b.mesh) || mt.mesh || 'inserter' });
   world.add(e, 'Inserter', { from, to, rate, filter, carry: null, charge: 0 });
   if (spatial) spatial.insert(e, dir);
+  if (bus) bus.emit('build', { eid: e, buildingId });
+  return e;
+}
+
+// 分拣器装在建筑边缘(网格版): mountEid=所在建筑(须在平台上, 有 GridSlot); axis={di,dj}=向外的网格轴;
+// reach=抓取格距边缘的格数(1/2/3); mode='in'(抓取格→建筑) | 'out'(建筑→抓取格); filtered=sorter。
+// 分拣器嵌在该边中点, 爪子朝外; 抓取格(gi,gj)由 footprint 边缘 + reach 决定。运行时动态解析抓取格里的实体。
+export function placeInserterMounted(world, ctx, mountEid, axis, reach, mode, filtered) {
+  const { registry, spatial, bus } = ctx;
+  const buildingId = filtered ? 'sorter' : 'inserter';
+  const b = registry.buildings[buildingId];
+  if (b && b.locked && !(registry.isUnlocked && registry.isUnlocked(buildingId))) return null;
+  const slot = world.get(mountEid, 'GridSlot');
+  if (!slot || !world.alive(slot.pad)) return null;                 // 必须放在平台上的建筑
+  const pad = world.get(slot.pad, 'BuildPad');
+  const R = ctx.planet ? ctx.planet.params.radius : 100;
+  const mt = registry.machineTypes[(b && b.machine) || 'inserter_mk1'] || {};
+  const rate = mt.rate != null ? mt.rate : 4;
+  const rr = Math.max(1, Math.min(3, reach || 1));
+  const { i, j, w, h } = slot;
+  const midI = i + Math.floor(w / 2), midJ = j + Math.floor(h / 2);
+  const di = axis.di | 0, dj = axis.dj | 0;
+
+  // 抓取格 + 锚点(边中点) + 朝向 quarter(向外)
+  let gi, gj, ai, aj, quarter;
+  if (di > 0) { gi = i + w - 1 + rr; gj = midJ; ai = i + w - 0.5; aj = midJ; quarter = 0; }
+  else if (di < 0) { gi = i - rr; gj = midJ; ai = i - 0.5; aj = midJ; quarter = 2; }
+  else if (dj > 0) { gj = j + h - 1 + rr; gi = midI; aj = j + h - 0.5; ai = midI; quarter = 1; }
+  else { gj = j - rr; gi = midI; aj = j - 0.5; ai = midI; quarter = 3; }
+
+  const anchorDir = cellToDir(pad, ai, aj, R);
+  const yaw = snapYaw(pad, anchorDir, quarter);
+
+  const e = world.create();
+  world.add(e, 'Anchor', { dir: [anchorDir[0], anchorDir[1], anchorDir[2]], yaw });
+  world.add(e, 'Building', { typeId: buildingId, mesh: (b && b.mesh) || mt.mesh || 'inserter' });
+  world.add(e, 'Inserter', { mount: mountEid, pad: slot.pad, gi, gj, reach: rr, mode: mode === 'out' ? 'out' : 'in', rate, filter: filtered ? [] : null, carry: null, charge: 0 });
+  if (spatial) spatial.insert(e, anchorDir);
   if (bus) bus.emit('build', { eid: e, buildingId });
   return e;
 }
