@@ -4,6 +4,60 @@
 import { createBelt } from './belt.js';
 import { midPortDir } from './inserter.js';
 import { norm } from '../core/sphere.js';
+import { makePad, offsetToDir } from '../core/grid.js';
+
+// 采样平台圆区内基础地形的最低点, 作为整平目标 level(只挖不填 → 全平)。无 planet 返回 0。
+function sampleMinLevel(planet, pad, R) {
+  if (!planet || !planet.baseHeightAt) return 0;
+  let lo = planet.baseHeightAt(pad.center[0], pad.center[1], pad.center[2]);
+  const rings = [0.4, 0.75, 0.98], K = 8;
+  for (const rr of rings) {
+    const rad = rr * pad.radius * R;   // 弧长(米)
+    for (let k = 0; k < K; k++) {
+      const a = (k / K) * Math.PI * 2;
+      const d = offsetToDir(pad, Math.cos(a) * rad, Math.sin(a) * rad, R);
+      const h = planet.baseHeightAt(d[0], d[1], d[2]);
+      if (h < lo) lo = h;
+    }
+  }
+  return lo;
+}
+
+// 放置一个建造平台(BuildPad): 平整圆区(level 编辑) + 建 pad 实体(供网格吸附)。返回实体 id(失败返回 null)。
+// opts: { buildingId, cell, radius, level }
+export function placeBuildPad(world, ctx, center, opts = {}) {
+  const { planet, registry, spatial, bus } = ctx;
+  const buildingId = opts.buildingId || 'build_pad';
+  const def = (registry.buildings && registry.buildings[buildingId]) || {};
+  if (def.locked && !(registry.isUnlocked && registry.isUnlocked(buildingId))) return null;
+  const cell = opts.cell != null ? opts.cell : (def.cell != null ? def.cell : 3.0);
+  const radius = opts.radius != null ? opts.radius : (def.radius != null ? def.radius : 0.06);
+  const R = planet ? planet.params.radius : 100;
+  const pad = makePad(center, { cell, radius });
+  pad.level = opts.level != null ? opts.level : sampleMinLevel(planet, pad, R);
+
+  const e = world.create();
+  world.add(e, 'Anchor', { dir: [pad.center[0], pad.center[1], pad.center[2]], yaw: 0 });
+  world.add(e, 'BuildPad', {
+    center: [pad.center[0], pad.center[1], pad.center[2]],
+    e: [pad.e[0], pad.e[1], pad.e[2]], n: [pad.n[0], pad.n[1], pad.n[2]],
+    cell, radius, level: pad.level, occupied: {},
+  });
+
+  // 整平地形: level 编辑(削平圆区内高于 level 的地形到平面)
+  if (planet) {
+    if (!ctx.padEdits) ctx.padEdits = new Map();
+    const edit = { type: 'level', pos: [pad.center[0], pad.center[1], pad.center[2]], radius, level: pad.level, progress: 1, falloff: 'smooth' };
+    planet.params.edits.push(edit);
+    if (planet._buildNoise) planet._buildNoise();
+    if (planet.roots) for (const r of planet.roots) planet._invalidateAffected(r, { x: pad.center[0], y: pad.center[1], z: pad.center[2] }, radius);
+    planet._editPending = true;
+    ctx.padEdits.set(e, edit);
+  }
+  if (spatial) spatial.insert(e, pad.center);
+  if (bus) bus.emit('build', { eid: e, buildingId });
+  return e;
+}
 
 // 放置一个建筑; 返回实体 id(失败返回 null)
 export function placeBuilding(world, ctx, buildingId, dir, yaw = 0) {
@@ -184,6 +238,7 @@ export function demolish(world, ctx, eid) {
   };
   restore(ctx.minerEdits && ctx.minerEdits.get(eid), ctx.minerEdits);   // 旧直挖矿机的坑
   restore(ctx.zoneEdits && ctx.zoneEdits.get(eid), ctx.zoneEdits);       // 矿场挖掘区的坑
+  restore(ctx.padEdits && ctx.padEdits.get(eid), ctx.padEdits);          // 建造平台的整平区
   if (spatial) spatial.remove(eid);
   world.destroy(eid);
   if (bus) bus.emit('demolish', { eid });

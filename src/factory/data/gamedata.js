@@ -60,6 +60,8 @@ export const buildings = {
   depot: { name: '矿场', kind: 'depot', mesh: 'depot', cap: 2000, zoneRadius: 0.05 },
   miner: { name: '采矿机 Mk1', kind: 'miner', machine: 'miner_mk1', mesh: 'miner', digRadius: 0.03, cap: 500 },   // 旧直挖矿机(遗留, UI 已改用矿场)
   warehouse: { name: '仓库', kind: 'storage', mesh: 'warehouse', cap: 5000 },
+  // 建造平台(网格建造): 平整一块圆区(terrain level 编辑)并生成网格球, 在其中吸附放置建筑。cell=格边长(世界单位), radius=角半径。
+  build_pad: { name: '建造平台', kind: 'buildpad', mesh: 'build_pad', cell: 3.0, radius: 0.06 },
   // 生产建筑: recipe=默认配方; recipes=可选配方列表; cap=库存(输入缓冲+输出); bufferMult=输入缓冲维持的配方份数
   smelter: { name: '冶炼炉', kind: 'producer', machine: 'smelter_mk1', mesh: 'smelter', recipe: 'smelt_iron', recipes: ['smelt_iron', 'smelt_copper'], cap: 300, bufferMult: 6, power: 90 },
   // 制造台: 科技锁(需"装配技术")。
