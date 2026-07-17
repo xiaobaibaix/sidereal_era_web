@@ -287,15 +287,16 @@ export function placeInserterMounted(world, ctx, mountEid, axis, reach, mode, fi
   const rate = mt.rate != null ? mt.rate : 4;
   const rr = Math.max(1, Math.min(3, reach || 1));
   const { i, j, w, h } = slot;
-  const midI = i + Math.floor(w / 2), midJ = j + Math.floor(h / 2);
   const di = axis.di | 0, dj = axis.dj | 0;
+  const alongI = i + (w - 1) / 2, alongJ = j + (h - 1) / 2;   // 边的真中点(沿边方向)
+  const NUDGE = 0.2;                                          // 贴住建筑外沿(靠外沿格, 不悬空)
 
-  // 抓取格 + 锚点(边中点) + 朝向 quarter(向外)
+  // 抓取格(整数格, reach 外移) + 锚点(边中点, 贴外沿) + 朝向 quarter(向外)
   let gi, gj, ai, aj, quarter;
-  if (di > 0) { gi = i + w - 1 + rr; gj = midJ; ai = i + w - 0.5; aj = midJ; quarter = 0; }
-  else if (di < 0) { gi = i - rr; gj = midJ; ai = i - 0.5; aj = midJ; quarter = 2; }
-  else if (dj > 0) { gj = j + h - 1 + rr; gi = midI; aj = j + h - 0.5; ai = midI; quarter = 1; }
-  else { gj = j - rr; gi = midI; aj = j - 0.5; ai = midI; quarter = 3; }
+  if (di > 0) { gi = i + w - 1 + rr; gj = Math.round(alongJ); ai = i + w - 1 + NUDGE; aj = alongJ; quarter = 0; }
+  else if (di < 0) { gi = i - rr; gj = Math.round(alongJ); ai = i - NUDGE; aj = alongJ; quarter = 2; }
+  else if (dj > 0) { gj = j + h - 1 + rr; gi = Math.round(alongI); aj = j + h - 1 + NUDGE; ai = alongI; quarter = 1; }
+  else { gj = j - rr; gi = Math.round(alongI); aj = j - NUDGE; ai = alongI; quarter = 3; }
 
   const anchorDir = cellToDir(pad, ai, aj, R);
   const yaw = snapYaw(pad, anchorDir, quarter);
