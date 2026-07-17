@@ -5,7 +5,17 @@ import { createBelt } from './belt.js';
 import { midPortDir } from './inserter.js';
 import { norm } from '../core/sphere.js';
 import { angle } from '../core/sphere.js';
-import { makePad, offsetToDir, dirToCell, cellToDir, footprintCenterDir, canPlace, markPlaced, freePlaced, snapYaw } from '../core/grid.js';
+import { makePad, offsetToDir, dirToCell, cellToDir, footprintCenterDir, footprintInPad, canPlace, markPlaced, freePlaced, snapYaw, discCells, floodFlatCells, expandFlatCells } from '../core/grid.js';
+
+// 全局网格参考向量(整场统一 → 所有平台网格方向一致)。首次按"与该点最垂直的世界轴"选定并缓存到 ctx。
+function gridRef(ctx, center) {
+  if (ctx.gridRef) return ctx.gridRef;
+  const ax = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+  let best = ax[0], bd = Infinity;
+  for (const a of ax) { const d = Math.abs(a[0] * center[0] + a[1] * center[1] + a[2] * center[2]); if (d < bd) { bd = d; best = a; } }
+  ctx.gridRef = best;
+  return best;
+}
 
 // 采样平台圆区内基础地形的最低点, 作为整平目标 level(只挖不填 → 全平)。无 planet 返回 0。
 function sampleMinLevel(planet, pad, R) {
@@ -34,15 +44,16 @@ export function placeBuildPad(world, ctx, center, opts = {}) {
   const cell = opts.cell != null ? opts.cell : (def.cell != null ? def.cell : 3.0);
   const radius = opts.radius != null ? opts.radius : (def.radius != null ? def.radius : 0.06);
   const R = planet ? planet.params.radius : 100;
-  const pad = makePad(center, { cell, radius });
+  const pad = makePad(center, { cell, radius, ref: gridRef(ctx, norm(center)) });
   pad.level = opts.level != null ? opts.level : sampleMinLevel(planet, pad, R);
+  const cells = discCells(pad, R);   // 调试平整: 规整圆盘格集合
 
   const e = world.create();
   world.add(e, 'Anchor', { dir: [pad.center[0], pad.center[1], pad.center[2]], yaw: 0 });
   world.add(e, 'BuildPad', {
     center: [pad.center[0], pad.center[1], pad.center[2]],
     e: [pad.e[0], pad.e[1], pad.e[2]], n: [pad.n[0], pad.n[1], pad.n[2]],
-    cell, radius, level: pad.level, occupied: {},
+    cell, radius, level: pad.level, R, cells, occupied: {},
   });
 
   // 整平地形: level 编辑(削平圆区内高于 level 的地形到平面)
@@ -154,13 +165,56 @@ export function placeBuilding(world, ctx, buildingId, dir, yaw = 0) {
   return e;
 }
 
-// 找包含某方向的建造平台, 返回 { eid, pad } 或 null
+// 找包含某方向的建造平台(按格集合判定); 多个重叠时返回"最深(level 最低)"的(洞里点击吸附到低平台)。返回 { eid, pad } 或 null
 export function padAt(world, dir) {
+  let best = null, bestLevel = Infinity;
   for (const pe of world.query('BuildPad')) {
     const p = world.get(pe, 'BuildPad');
-    if (angle(p.center, dir) <= p.radius) return { eid: pe, pad: p };
+    if (!dirToCell(p, dir, p.R || 100).inside) continue;
+    const lv = p.level != null ? p.level : 0;
+    if (best == null || lv < bestLevel - 1e-9) { best = { eid: pe, pad: p }; bestLevel = lv; }
   }
-  return null;
+  return best;
+}
+
+// 探测建造区(不改地形): 在 clickDir 处洪泛检测平整连通区; 格数达标则建 BuildPad(网格贴合平地形状)。
+// opts: { cell, radius(探测半径上限,角), tol(高度容差), minCells(最小格数) }。返回 { eid, count } | { rejected, count } | null
+export function probePad(world, ctx, clickDir, opts = {}) {
+  const { planet, spatial, bus } = ctx;
+  if (!planet || !planet.heightAt) return null;
+  const R = planet.params.radius;
+  const cell = opts.cell != null ? opts.cell : 3.0;
+  const radius = opts.radius != null ? opts.radius : 0.15;
+  const tol = opts.tol != null ? opts.tol : 0.02;
+  const minCells = opts.minCells != null ? opts.minCells : 9;
+  const pad = makePad(clickDir, { cell, radius, ref: gridRef(ctx, norm(clickDir)) });
+  const sample = (d) => planet.heightAt(d[0], d[1], d[2]);
+  const maxRadiusCells = Math.max(2, Math.ceil((radius * R) / cell));
+  const res = floodFlatCells(pad, sample, R, { tol, maxRadiusCells });
+  if (res.count < minCells) return { rejected: true, count: res.count };
+
+  const e = world.create();
+  world.add(e, 'Anchor', { dir: [pad.center[0], pad.center[1], pad.center[2]], yaw: 0 });
+  world.add(e, 'BuildPad', {
+    center: [pad.center[0], pad.center[1], pad.center[2]],
+    e: [pad.e[0], pad.e[1], pad.e[2]], n: [pad.n[0], pad.n[1], pad.n[2]],
+    cell, radius, level: res.level, tol, R, cells: res.cells, occupied: {}, probe: true,
+  });
+  if (spatial) spatial.insert(e, pad.center);
+  if (bus) bus.emit('build', { eid: e, buildingId: 'build_pad' });
+  return { eid: e, count: res.count };
+}
+
+// 让探测平台的网格跟随地形变化(继续开挖后扩张/收缩)。返回新格数。
+export function expandPad(world, ctx, padEid) {
+  const p = world.get(padEid, 'BuildPad');
+  if (!p || !ctx.planet || !ctx.planet.heightAt) return 0;
+  const R = ctx.planet.params.radius;
+  const sample = (d) => ctx.planet.heightAt(d[0], d[1], d[2]);
+  const maxRadiusCells = Math.max(2, Math.ceil(((p.radius || 0.15) * R) / p.cell));
+  const res = expandFlatCells(p, sample, R, { tol: p.tol != null ? p.tol : 0.02, maxRadiusCells });
+  if (res.count > 0) p.cells = res.cells;
+  return res.count;
 }
 
 // 网格吸附放置: dir 落在某平台内 → 吸附格点 + 对齐朝向 + footprint 占位检查(占用则拒);
@@ -180,6 +234,7 @@ export function placeBuildingSnapped(world, ctx, buildingId, dir, quarter = 0) {
   const w = fp[0], h = fp[1];
   const c = dirToCell(pad, dir, R);                  // 最近格点
   const i0 = c.i - Math.floor(w / 2), j0 = c.j - Math.floor(h / 2);   // footprint 最小角(居中于该格)
+  if (!footprintInPad(pad, i0, j0, w, h)) return { eid: null, snapped: true, blocked: true, offpad: true };   // 部分格不在平地
   if (!canPlace(pad, i0, j0, w, h)) return { eid: null, snapped: true, blocked: true };
   const cdir = footprintCenterDir(pad, i0, j0, w, h, R);
   const yaw = snapYaw(pad, cdir, quarter);

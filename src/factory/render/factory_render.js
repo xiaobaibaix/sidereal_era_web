@@ -8,7 +8,7 @@ import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { worldMatrix, worldMatrixHeading, groundRadius } from '../core/anchor.js';
 import { slerp, tangentToward } from '../core/sphere.js';
-import { cellToDir } from '../core/grid.js';
+import { cellToDir, dirToCell } from '../core/grid.js';
 import { angle as sphAngle } from '../core/sphere.js';
 
 const MAX = 512;
@@ -453,17 +453,27 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
   function rebuildGrids(world) {
     let k = 0;
     const R = planet.params.radius;
-    for (const pe of world.query('BuildPad')) {
-      const pad = world.get(pe, 'BuildPad');
-      const N = Math.max(1, Math.ceil((pad.radius * R) / pad.cell));
-      const inside = (i, j) => sphAngle(cellToDir(pad, i, j, R), pad.center) <= pad.radius;
-      for (let i = -N; i <= N; i++) {
-        for (let j = -N; j <= N; j++) {
-          if (!inside(i, j)) continue;
-          if (k + 12 > gridPos.length) { i = N + 1; break; }   // 顶点封顶
-          if (inside(i + 1, j)) { gridVertexTo(cellToDir(pad, i, j, R), gridPos, k); k += 3; gridVertexTo(cellToDir(pad, i + 1, j, R), gridPos, k); k += 3; }
-          if (inside(i, j + 1)) { gridVertexTo(cellToDir(pad, i, j, R), gridPos, k); k += 3; gridVertexTo(cellToDir(pad, i, j + 1, R), gridPos, k); k += 3; }
-        }
+    const pads = [];
+    for (const pe of world.query('BuildPad')) { const p = world.get(pe, 'BuildPad'); if (p.cells) pads.push(p); }
+    // 某方向是否被"更深(level 更低)"的平台覆盖 → 该处上层网格开洞(消失)。跨平台用方向判定(各自格坐标系不同)。
+    const coveredByDeeper = (dir, pad) => {
+      const lv = pad.level != null ? pad.level : 0;
+      for (const q of pads) {
+        if (q === pad) continue;
+        const qlv = q.level != null ? q.level : 0;
+        if (qlv < lv - 1e-6 && dirToCell(q, dir, R).inside) return true;
+      }
+      return false;
+    };
+    for (const pad of pads) {
+      const valid = (i, j) => pad.cells[i + ',' + j] === true && !coveredByDeeper(cellToDir(pad, i, j, R), pad);
+      for (const key in pad.cells) {
+        const p = key.split(','); const i = +p[0], j = +p[1];
+        if (k + 12 > gridPos.length) break;
+        if (!valid(i, j)) continue;
+        // 画到 +i / +j 邻格的边(两端都有效才画 → 洞边自动断开)
+        if (valid(i + 1, j)) { gridVertexTo(cellToDir(pad, i, j, R), gridPos, k); k += 3; gridVertexTo(cellToDir(pad, i + 1, j, R), gridPos, k); k += 3; }
+        if (valid(i, j + 1)) { gridVertexTo(cellToDir(pad, i, j, R), gridPos, k); k += 3; gridVertexTo(cellToDir(pad, i, j + 1, R), gridPos, k); k += 3; }
       }
     }
     gridGeo.setDrawRange(0, k / 3);

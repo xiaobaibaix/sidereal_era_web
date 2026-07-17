@@ -10,18 +10,34 @@
 
 import { norm, dot, cross, angle } from './sphere.js';
 
-// 平台切平面基: 返回 { c, e, n } (右手系 {e, n, c})
-export function makePadBasis(center) {
+export const keyOf = (i, j) => i + ',' + j;      // 格键
+const NB4 = [[1, 0], [-1, 0], [0, 1], [0, -1]];  // 4 邻
+
+// 平台切平面基: 返回 { c, e, n } (右手系 {e, n, c})。
+//   ref(可选)= 全局参考世界向量: e = ref 在 c 切平面上的投影(归一) → 不同平台方向全局一致。
+//   不传 ref 时退回"经纬(北极)"基(可能随位置摆动, 仅内部/测试用)。
+export function makePadBasis(center, ref) {
   const c = norm(center);
-  const a = Math.abs(c[1]) < 0.99 ? [0, 1, 0] : [1, 0, 0];
-  const e = norm(cross(a, c));   // 东向切向
-  const n = cross(c, e);         // 北向切向(c,e 正交 → 已是单位)
+  let e;
+  if (ref) {
+    const d = dot(c, ref);
+    e = [ref[0] - c[0] * d, ref[1] - c[1] * d, ref[2] - c[2] * d];   // ref 投影到切平面
+    if (Math.hypot(e[0], e[1], e[2]) < 1e-6) {                       // c 与 ref 几乎共线 → 退回
+      const a = Math.abs(c[1]) < 0.99 ? [0, 1, 0] : [1, 0, 0];
+      e = cross(a, c);
+    }
+    e = norm(e);
+  } else {
+    const a = Math.abs(c[1]) < 0.99 ? [0, 1, 0] : [1, 0, 0];
+    e = norm(cross(a, c));
+  }
+  const n = cross(c, e);
   return { c, e, n };
 }
 
-// 建一个平台(纯数据; 将作为 BuildPad 组件)。opts: { cell, radius, level }
+// 建一个平台(纯数据; 将作为 BuildPad 组件)。opts: { cell, radius, level, ref }
 export function makePad(center, opts = {}) {
-  const { c, e, n } = makePadBasis(center);
+  const { c, e, n } = makePadBasis(center, opts.ref);
   return {
     center: c, e, n,
     cell: opts.cell != null ? opts.cell : 3.0,       // 世界单位/格
@@ -72,17 +88,26 @@ export function cellToDir(pad, i, j, R) {
   return offsetToDir(pad, i * pad.cell, j * pad.cell, R);
 }
 
-// 方向 → 最近格点 { i, j, inside }
+// 某格是否属于该平台: 有 cells 集合则按集合判定; 否则退回角半径(圆盘)
+export function cellInPad(pad, i, j) {
+  if (pad.cells) return pad.cells[keyOf(i, j)] === true;
+  return false;
+}
+
+// 方向 → 最近格点 { i, j, inside }。inside: 有 cells 则看集合, 否则看角半径。
 export function dirToCell(pad, dir, R) {
   const { u, v, ang } = dirToOffset(pad, dir, R);
-  return { i: Math.round(u / pad.cell), j: Math.round(v / pad.cell), inside: ang <= pad.radius };
+  const i = Math.round(u / pad.cell), j = Math.round(v / pad.cell);
+  const inside = pad.cells ? pad.cells[keyOf(i, j)] === true : ang <= pad.radius;
+  return { i, j, inside };
 }
 
 // 吸附: pad 内 → 最近格点方向 { dir, i, j, inside:true }; pad 外 → 原方向 { dir, i:null, j:null, inside:false }
 export function snapDir(pad, dir, R) {
   const { u, v, ang } = dirToOffset(pad, dir, R);
-  if (ang > pad.radius) return { dir: norm(dir), i: null, j: null, inside: false };
   const i = Math.round(u / pad.cell), j = Math.round(v / pad.cell);
+  const inside = pad.cells ? pad.cells[keyOf(i, j)] === true : ang <= pad.radius;
+  if (!inside) return { dir: norm(dir), i: null, j: null, inside: false };
   return { dir: cellToDir(pad, i, j, R), i, j, inside: true };
 }
 
@@ -102,8 +127,6 @@ export function snapYaw(pad, dir, quarter = 0) {
 }
 
 // ---- 占位(多格建筑) ----
-const cellKey = (i, j) => i + ',' + j;
-
 // footprint [w,h] 锚在最小角 (i,j) 时覆盖的格
 export function footprintCells(i, j, w = 1, h = 1) {
   const out = [];
@@ -116,20 +139,70 @@ export function footprintCenterDir(pad, i, j, w, h, R) {
   return cellToDir(pad, i + (w - 1) / 2, j + (h - 1) / 2, R);
 }
 
+// footprint 全部格是否都在平台可建集合内(有 cells 时才校验)
+export function footprintInPad(pad, i, j, w = 1, h = 1) {
+  if (!pad.cells) return true;
+  for (const [ci, cj] of footprintCells(i, j, w, h)) if (pad.cells[keyOf(ci, cj)] !== true) return false;
+  return true;
+}
+
 export function canPlace(pad, i, j, w = 1, h = 1) {
-  for (const [ci, cj] of footprintCells(i, j, w, h)) if (pad.occupied[cellKey(ci, cj)] != null) return false;
+  for (const [ci, cj] of footprintCells(i, j, w, h)) if (pad.occupied[keyOf(ci, cj)] != null) return false;
   return true;
 }
 export function markPlaced(pad, i, j, w = 1, h = 1, eid = true) {
-  for (const [ci, cj] of footprintCells(i, j, w, h)) pad.occupied[cellKey(ci, cj)] = eid;
+  for (const [ci, cj] of footprintCells(i, j, w, h)) pad.occupied[keyOf(ci, cj)] = eid;
 }
 export function freePlaced(pad, i, j, w = 1, h = 1) {
-  for (const [ci, cj] of footprintCells(i, j, w, h)) delete pad.occupied[cellKey(ci, cj)];
+  for (const [ci, cj] of footprintCells(i, j, w, h)) delete pad.occupied[keyOf(ci, cj)];
 }
 
-// 从一组 pad 里找包含该方向的(角距离 ≤ radius); 无则 null
-export function padContaining(pads, dir) {
+// 从一组 pad 里找包含该方向的; 无则 null
+export function padContaining(pads, dir, R) {
   const d = norm(dir);
-  for (const pad of pads) if (angle(pad.center, d) <= pad.radius) return pad;
+  for (const pad of pads) if (dirToCell(pad, d, R).inside) return pad;
   return null;
+}
+
+// ---- 平地探测(格集合) ----
+// 圆盘格集合(供"调试平整"生成规整圆形网格)
+export function discCells(pad, R) {
+  const cells = {};
+  const N = Math.max(1, Math.ceil((pad.radius * R) / pad.cell));
+  for (let i = -N; i <= N; i++) for (let j = -N; j <= N; j++) {
+    if (angle(cellToDir(pad, i, j, R), pad.center) <= pad.radius) cells[keyOf(i, j)] = true;
+  }
+  return cells;
+}
+
+// 从种子格 BFS 洪泛出"平整连通区"。sampleHeight(dir)=地形高度回调。
+//   opts: { tol 高度容差, level 参考面(缺省=中心高度), maxCells 上限, maxRadiusCells 半径上限, seed 种子格数组 }
+// 返回 { cells:{"i,j":true}, count, level }。
+export function floodFlatCells(pad, sampleHeight, R, opts = {}) {
+  const tol = opts.tol != null ? opts.tol : 0.02;
+  const level = opts.level != null ? opts.level : sampleHeight(pad.center);
+  const maxCells = opts.maxCells || 4000;
+  const maxR = opts.maxRadiusCells || 60;
+  const buildable = (i, j) => Math.abs(sampleHeight(cellToDir(pad, i, j, R)) - level) <= tol;
+  const cells = {}; let count = 0;
+  const q = []; const seen = new Set();
+  for (const [si, sj] of (opts.seed || [[0, 0]])) { const k = keyOf(si, sj); if (!seen.has(k)) { seen.add(k); q.push([si, sj]); } }
+  while (q.length) {
+    const [i, j] = q.shift();
+    if (Math.abs(i) > maxR || Math.abs(j) > maxR) continue;
+    if (cells[keyOf(i, j)]) continue;
+    if (!buildable(i, j)) continue;
+    cells[keyOf(i, j)] = true; count++;
+    if (count >= maxCells) break;
+    for (const [di, dj] of NB4) { const nk = keyOf(i + di, j + dj); if (!seen.has(nk)) { seen.add(nk); q.push([i + di, j + dj]); } }
+  }
+  return { cells, count, level };
+}
+
+// 以现有 cells 为种子重新洪泛(平地被继续挖掘/扩张时, 网格跟着长/缩)。level 固定为 pad.level。
+export function expandFlatCells(pad, sampleHeight, R, opts = {}) {
+  const seed = [];
+  for (const k in (pad.cells || {})) { const p = k.split(','); seed.push([+p[0], +p[1]]); }
+  if (seed.length === 0) seed.push([0, 0]);
+  return floodFlatCells(pad, sampleHeight, R, { ...opts, seed, level: pad.level });
 }
