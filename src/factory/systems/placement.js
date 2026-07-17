@@ -60,6 +60,23 @@ export function placeBuildPad(world, ctx, center, opts = {}) {
   return e;
 }
 
+// 读档后重建"平台实体 → 整平编辑"映射(ctx.padEdits): 按 center 匹配 planet.params.edits 里的 level 编辑。
+// 供读档后拆除平台时能恢复地形(整平编辑在 planet 存档里, 但 eid→edit 的运行时映射不随 world 存档保存)。
+export function rebuildPadEdits(world, ctx) {
+  const planet = ctx.planet;
+  if (!planet || !planet.params || !Array.isArray(planet.params.edits)) return;
+  ctx.padEdits = ctx.padEdits || new Map();
+  for (const pe of world.query('BuildPad')) {
+    if (ctx.padEdits.has(pe)) continue;
+    const pad = world.get(pe, 'BuildPad');
+    const edit = planet.params.edits.find((ed) => ed && ed.type === 'level' && ed.pos
+      && Math.abs(ed.pos[0] - pad.center[0]) < 1e-6
+      && Math.abs(ed.pos[1] - pad.center[1]) < 1e-6
+      && Math.abs(ed.pos[2] - pad.center[2]) < 1e-6);
+    if (edit) ctx.padEdits.set(pe, edit);
+  }
+}
+
 // 放置一个建筑; 返回实体 id(失败返回 null)
 export function placeBuilding(world, ctx, buildingId, dir, yaw = 0) {
   const { planet, registry, spatial, bus } = ctx;

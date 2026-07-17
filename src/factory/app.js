@@ -27,7 +27,7 @@ import { createLogisticsSystem, spawnHaulers } from './systems/logistics.js';
 import { createBeltSystem } from './systems/belt.js';
 import { createInserterSystem } from './systems/inserter.js';
 import { createSplitterSystem } from './systems/splitter.js';
-import { placeBuilding, demolish, placeBelt, placeInserter, placeSplitter, linkBelts, placeBuildPad, placeBuildingSnapped, padAt } from './systems/placement.js';
+import { placeBuilding, demolish, placeBelt, placeInserter, placeSplitter, linkBelts, placeBuildPad, placeBuildingSnapped, padAt, rebuildPadEdits } from './systems/placement.js';
 import { angle as sphAngle } from './core/sphere.js';
 import { dirToCell, footprintCenterDir, snapYaw, canPlace } from './core/grid.js';
 import { createFactoryRenderer } from './render/factory_render.js';
@@ -398,7 +398,7 @@ export function createFactoryApp(opts) {
     factory, renderer: factoryRenderer, inspector, fpTool, showToast,
     // 该屏幕点是否命中工厂建筑/agent(宿主用来在放置/查看时让出点击, 不误触发相机聚焦切换)
     hitTest: (clientX, clientY) => pickEntity(clientX, clientY),
-    setPlanet(planet) { factory.setPlanet(planet); factoryRenderer.setPlanet(planet); },
+    setPlanet(planet) { factory.setPlanet(planet); factoryRenderer.setPlanet(planet); rebuildPadEdits(factory.world, factory.ctx); },
     // 固定步长模拟 + 渲染 + 面板刷新。宿主在 animate 里、行星 LOD 更新前调用。
     tick(dt) {
       _acc += dt; let n = 0;

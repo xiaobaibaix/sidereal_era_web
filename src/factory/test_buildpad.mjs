@@ -6,7 +6,7 @@ import { createWorld } from './core/world.js';
 import { createRegistry } from './core/registry.js';
 import { createSpatial } from './core/spatial.js';
 import { createEventBus } from './core/events.js';
-import { placeBuildPad, placeBuildingSnapped, padAt, demolish } from './systems/placement.js';
+import { placeBuildPad, placeBuildingSnapped, padAt, demolish, rebuildPadEdits } from './systems/placement.js';
 import { dot, angle } from './core/sphere.js';
 import { dirToCell, canPlace } from './core/grid.js';
 import gameData from './data/gamedata.js';
@@ -127,4 +127,38 @@ function makeCtx() {
   ok('平台外: 自由放置(不规整也能放)');
 }
 
-console.log(`\nG1/G3 建造平台+吸附 全部通过 (${pass} 组断言)`);
+// ---- G4 存档: BuildPad 占位/GridSlot 往返 + rebuildPadEdits 使读档后拆除能恢复整平 ----
+{
+  const ctx = makeCtx(); const world = createWorld();
+  const padEid = placeBuildPad(world, ctx, [0, 1, 0], { cell: 3, radius: 0.1 });
+  const pad = world.get(padEid, 'BuildPad');
+  const r = placeBuildingSnapped(world, ctx, 'smelter', [0, 1, 0]);   // 占 4 格 + GridSlot
+  const slot = world.get(r.eid, 'GridSlot');
+  const occKeys = Object.keys(pad.occupied).length;
+  assert.equal(occKeys, 4, '存档前: 2x2 占 4 格');
+
+  // world 序列化往返(ECS)
+  const snap = JSON.parse(JSON.stringify(world.serialize()));
+  const w2 = createWorld(); w2.load(snap);
+  const pad2 = w2.get(padEid, 'BuildPad');
+  assert.equal(Object.keys(pad2.occupied).length, 4, '读档后: 占位保留');
+  assert.ok(w2.has(r.eid, 'GridSlot'), '读档后: GridSlot 保留');
+  const slot2 = w2.get(r.eid, 'GridSlot');
+  assert.equal(slot2.w * slot2.h, 4, '读档后: footprint 保留');
+
+  // 读档后同格仍被占 → 拒绝重放
+  const ctx2 = makeCtx();
+  const rr = placeBuildingSnapped(w2, ctx2, 'smelter', [0, 1, 0]);
+  assert.ok(rr.blocked, '读档后: 已占格仍拒绝重放');
+
+  // planet 存档单独恢复(模拟): 把整平编辑放回 ctx2.planet.edits, rebuildPadEdits 重建映射
+  ctx2.planet.params.edits.push({ type: 'level', pos: [pad2.center[0], pad2.center[1], pad2.center[2]], radius: pad2.radius, level: pad2.level, progress: 1, falloff: 'smooth' });
+  rebuildPadEdits(w2, ctx2);
+  assert.ok(ctx2.padEdits.has(padEid), 'rebuildPadEdits: 平台→整平编辑映射重建');
+  assert.equal(ctx2.planet.params.edits.length, 1, '重建后有 1 条整平编辑');
+  demolish(w2, ctx2, padEid);
+  assert.equal(ctx2.planet.params.edits.length, 0, '拆除读档平台 → 整平编辑移除(地形恢复)');
+  ok('存档: 占位/GridSlot 往返 + rebuildPadEdits 恢复整平');
+}
+
+console.log(`\nG1/G3/G4 建造平台+吸附+存档 全部通过 (${pass} 组断言)`);
