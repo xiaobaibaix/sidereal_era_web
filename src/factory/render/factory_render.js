@@ -7,6 +7,7 @@
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 import { worldMatrix, worldMatrixHeading } from '../core/anchor.js';
+import { slerp, tangentToward } from '../core/sphere.js';
 
 const MAX = 512;
 
@@ -158,6 +159,75 @@ function buildEngineGeometry() {
   return geo;
 }
 
+// ---- 物流升级(B系列)外形 ----
+const BELT_SEG_LEN = 2.0;   // 单段带的世界长度(沿弧采样步长, 几何随之构建)
+
+// 分拣器: 底座 + 转柱 + 朝 +z 的摆臂 + 爪(象征在带↔机器间搬运)
+function buildInserterGeometry() {
+  const parts = [];
+  const push = (g, x, y, z, rx) => { if (rx) g.rotateX(rx); g.translate(x, y, z); parts.push(g); };
+  push(new THREE.BoxGeometry(1.3, 0.4, 1.3), 0, 0.2, 0);            // 底座
+  push(new THREE.CylinderGeometry(0.3, 0.32, 1.0, 8), 0, 0.7, 0);   // 转柱
+  push(new THREE.BoxGeometry(0.24, 0.24, 2.1), 0, 1.35, 0.75, -0.5);// 摆臂(前伸 +z, 略上扬)
+  push(new THREE.BoxGeometry(0.55, 0.32, 0.42), 0, 1.02, 1.7);      // 爪
+  const geo = mergeGeometries(parts, false); geo.computeVertexNormals(); return geo;
+}
+
+// 过滤分拣器(sorter): 分拣器造型 + 顶部滤盒标记
+function buildSorterGeometry() {
+  const parts = [];
+  const push = (g, x, y, z, rx) => { if (rx) g.rotateX(rx); g.translate(x, y, z); parts.push(g); };
+  push(new THREE.BoxGeometry(1.3, 0.4, 1.3), 0, 0.2, 0);
+  push(new THREE.CylinderGeometry(0.3, 0.32, 1.0, 8), 0, 0.7, 0);
+  push(new THREE.BoxGeometry(0.24, 0.24, 2.1), 0, 1.35, 0.75, -0.5);
+  push(new THREE.BoxGeometry(0.55, 0.32, 0.42), 0, 1.02, 1.7);
+  push(new THREE.BoxGeometry(0.7, 0.5, 0.7), 0, 1.5, 0);            // 滤盒(区别普通分拣器)
+  const geo = mergeGeometries(parts, false); geo.computeVertexNormals(); return geo;
+}
+
+// 分流器: 十字低台 + 中央枢纽(带的合流/分流节点)
+function buildSplitterGeometry() {
+  const parts = [];
+  const push = (g, x, y, z) => { g.translate(x, y, z); parts.push(g); };
+  push(new THREE.BoxGeometry(3.4, 0.4, 1.5), 0, 0.2, 0);           // 横臂
+  push(new THREE.BoxGeometry(1.5, 0.4, 3.4), 0, 0.2, 0);           // 纵臂
+  push(new THREE.BoxGeometry(1.1, 0.8, 1.1), 0, 0.6, 0);           // 中央枢纽
+  const geo = mergeGeometries(parts, false); geo.computeVertexNormals(); return geo;
+}
+
+// 运输站: 大平台 + 四角立柱 + 中央箭头锥(up=装货朝上 / down=卸货朝下)。比机器大(cap 1000)。
+function buildStationGeometry(up) {
+  const parts = [];
+  const push = (g, x, y, z) => { g.translate(x, y, z); parts.push(g); };
+  push(new THREE.BoxGeometry(6.6, 1.0, 6.6), 0, 0.5, 0);          // 平台
+  push(new THREE.BoxGeometry(5.0, 1.6, 5.0), 0, 1.5, 0);          // 站体
+  for (const sx of [-1, 1]) for (const sz of [-1, 1]) push(new THREE.BoxGeometry(0.5, 2.8, 0.5), sx * 2.9, 1.6, sz * 2.9); // 四角立柱
+  const cone = new THREE.ConeGeometry(1.3, 2.4, 12);
+  if (!up) cone.rotateX(Math.PI);                                  // 卸货: 箭头朝下
+  cone.translate(0, 3.9, 0);
+  parts.push(cone);
+  const geo = mergeGeometries(parts, false); geo.computeVertexNormals(); return geo;
+}
+function buildStationLoadGeometry() { return buildStationGeometry(true); }
+function buildStationUnloadGeometry() { return buildStationGeometry(false); }
+
+// 带段: 贴地平板 + 两侧护栏(z=前进方向, 长度=BELT_SEG_LEN)
+function buildBeltSegGeometry() {
+  const parts = [];
+  const push = (g, x, y, z) => { g.translate(x, y, z); parts.push(g); };
+  push(new THREE.BoxGeometry(1.7, 0.18, BELT_SEG_LEN), 0, 0.12, 0);   // 带面
+  push(new THREE.BoxGeometry(0.2, 0.3, BELT_SEG_LEN), 0.85, 0.22, 0); // 左护栏
+  push(new THREE.BoxGeometry(0.2, 0.3, BELT_SEG_LEN), -0.85, 0.22, 0);// 右护栏
+  const geo = mergeGeometries(parts, false); geo.computeVertexNormals(); return geo;
+}
+
+// 带上物品: 小立方(顶在带面上, +y 偏移使其坐落于带上)
+function buildBeltItemGeometry() {
+  const g = new THREE.BoxGeometry(0.7, 0.7, 0.7);
+  g.translate(0, 0.52, 0);
+  return g;
+}
+
 const GEO_BUILDERS = {
   miner: buildMinerGeometry,
   warehouse: buildWarehouseGeometry,
@@ -170,6 +240,11 @@ const GEO_BUILDERS = {
   generator: buildGeneratorGeometry,
   lab: buildLabGeometry,
   engine: buildEngineGeometry,
+  inserter: buildInserterGeometry,
+  sorter: buildSorterGeometry,
+  splitter: buildSplitterGeometry,
+  station_load: buildStationLoadGeometry,
+  station_unload: buildStationUnloadGeometry,
 };
 // 各外形的基础色(未按状态染色时)
 const BASE_COLOR = {
@@ -177,10 +252,19 @@ const BASE_COLOR = {
   smelter: 0xb56a4a, assembler: 0x7f8aa0,
   depot: 0x8a7a5a, excavator: 0xe0a52e,
   tower: 0x9fb0c0, generator: 0xdfe6ec, lab: 0x6fae9f, engine: 0x8892a0,
+  inserter: 0xc98a3a, sorter: 0x4fae9f, splitter: 0x7aa0c0,
+  station_load: 0x6fae7a, station_unload: 0xd08a5a,
 };
+// 带上物品按物品类型染色(与 inspector 图标语义呼应)
+const ITEM_COLOR = {
+  overburden: 0x8a7a5a, stone: 0xb0a48c, iron_ore: 0xc98f6a, copper_ore: 0xd98a4a,
+  iron_ingot: 0xd9dde3, copper_ingot: 0xe0a06a, iron_plate: 0xb9c2cc,
+};
+const DEFAULT_ITEM_COLOR = 0xcccccc;
 // 各建筑的可点击半径(世界单位, 略大于模型底座, 便于点选)。点击拾取 + 范围可视化共用同一数据。
 const MESH_PICK_R = {
   miner: 2.6, smelter: 3.2, assembler: 3.4, warehouse: 5.2, depot: 5.6, tower: 2.2, generator: 2.6, lab: 3.4, engine: 8.5,
+  inserter: 1.6, sorter: 1.6, splitter: 2.2, station_load: 4.6, station_unload: 4.6,
 };
 const DEFAULT_PICK_R = 3.0;
 
@@ -308,6 +392,25 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
   jetMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
   scene.add(jetMesh);
 
+  // ---- 传送带渲染: 带段(沿弧摆放的平板)+ 带上物品(小立方, 按物品染色) ----
+  const BELT_SEG_MAX = 8192, BELT_ITEM_MAX = 8192;
+  const beltSegGeo = buildBeltSegGeometry();
+  const beltSegMat = new THREE.MeshStandardMaterial({ color: 0x44484f, roughness: 0.85, metalness: 0.15 });
+  const beltSegMesh = new THREE.InstancedMesh(beltSegGeo, beltSegMat, BELT_SEG_MAX);
+  beltSegMesh.frustumCulled = false; beltSegMesh.count = 0;
+  beltSegMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  scene.add(beltSegMesh);
+
+  const beltItemGeo = buildBeltItemGeometry();
+  const beltItemMat = new THREE.MeshStandardMaterial({ roughness: 0.6, metalness: 0.2 });
+  const beltItemMesh = new THREE.InstancedMesh(beltItemGeo, beltItemMat, BELT_ITEM_MAX);
+  beltItemMesh.frustumCulled = false; beltItemMesh.count = 0;
+  beltItemMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  for (let i = 0; i < BELT_ITEM_MAX; i++) beltItemMesh.setColorAt(i, white);
+  scene.add(beltItemMesh);
+  const _itemColorCache = {};
+  const itemColor = (id) => (_itemColorCache[id] || (_itemColorCache[id] = new THREE.Color(ITEM_COLOR[id] != null ? ITEM_COLOR[id] : DEFAULT_ITEM_COLOR)));
+
   return {
     groups,
     setPlanet(p) { planet = p; },
@@ -317,6 +420,7 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
 
       // 建筑(静止): 落地 + 采矿机按状态染色
       for (const e of world.query('Building', 'Anchor')) {
+        if (world.has(e, 'Belt')) continue;   // 带单独按弧线渲染(下方), 不走单点建筑渲染
         const b = world.get(e, 'Building');
         const a = world.get(e, 'Anchor');
         const g = groups[b.mesh] || fallbackBuilding;
@@ -369,6 +473,33 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
         }
         jetMesh.count = j;
         jetMesh.instanceMatrix.needsUpdate = true;
+      }
+
+      // 传送带: 沿测地线弧摆带段 + 带上物品按 s 定位并按物品染色
+      {
+        let seg = 0, it = 0;
+        const R = planet.params.radius;
+        for (const e of world.query('Belt')) {
+          const belt = world.get(e, 'Belt');
+          const from = belt.from, to = belt.to;
+          const n = Math.max(1, Math.round((belt.length * R) / BELT_SEG_LEN));
+          for (let i = 0; i < n && seg < BELT_SEG_MAX; i++) {
+            const t = (i + 0.5) / n;
+            const d = slerp(from, to, t);
+            worldMatrixHeading(d, tangentToward(d, to), planet, _m, size);
+            beltSegMesh.setMatrixAt(seg, _m); seg++;
+          }
+          const items = belt.items;
+          for (let k = 0; k < items.length && it < BELT_ITEM_MAX; k++) {
+            worldMatrix(slerp(from, to, items[k].s), 0, planet, _m, size);
+            beltItemMesh.setMatrixAt(it, _m);
+            beltItemMesh.setColorAt(it, itemColor(items[k].item));
+            it++;
+          }
+        }
+        beltSegMesh.count = seg; beltSegMesh.instanceMatrix.needsUpdate = true;
+        beltItemMesh.count = it; beltItemMesh.instanceMatrix.needsUpdate = true;
+        if (beltItemMesh.instanceColor) beltItemMesh.instanceColor.needsUpdate = true;
       }
 
       // 可点击范围圆环(仅在开启时): 每个建筑一个环, 半径 = 其 pick 半径
@@ -450,7 +581,9 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
         scene.remove(g.mesh); g.geo.dispose(); g.mat.dispose();
       }
       scene.remove(ringGroup); scene.remove(zoneGroup); scene.remove(powerLines); scene.remove(jetMesh);
+      scene.remove(beltSegMesh); scene.remove(beltItemMesh);
       ringGeo.dispose(); ringMat.dispose(); zoneMat.dispose(); powerGeo.dispose(); powerMat.dispose(); jetGeo.dispose(); jetMat.dispose();
+      beltSegGeo.dispose(); beltSegMat.dispose(); beltItemGeo.dispose(); beltItemMat.dispose();
     },
   };
 }

@@ -1,6 +1,10 @@
 // 建造 / 拆除 —— 把建筑数据组装成实体(组件),并处理挖机的地形坑 edit。
 // 与渲染/UI 解耦: App 只需 pick 到方向 dir 后调 placeBuilding。
 
+import { createBelt } from './belt.js';
+import { midPortDir } from './inserter.js';
+import { norm } from '../core/sphere.js';
+
 // 放置一个建筑; 返回实体 id(失败返回 null)
 export function placeBuilding(world, ctx, buildingId, dir, yaw = 0) {
   const { planet, registry, spatial, bus } = ctx;
@@ -61,8 +65,107 @@ export function placeBuilding(world, ctx, buildingId, dir, yaw = 0) {
     world.add(e, 'Construction', { stage: 0, prog: 0, contributed: {}, done: false, built: false });
     world.add(e, 'Inventory', { items: {}, cap: b.cap != null ? b.cap : 1000 });
     world.add(e, 'Requester', { needs: {} });   // 由 construction 按阶段设置
+  } else if (b.kind === 'loadstation') {
+    // 装货站(B2): 缓冲仓 + 对卡车表现为 Provider。带/分拣器填它, 卡车从它取货(远距离起点)。
+    world.add(e, 'Inventory', { items: {}, cap: b.cap != null ? b.cap : 1000 });
+    world.add(e, 'Provider', { items: b.filter || '*' });        // 卡车取货依此过滤; 默认供应一切
+    world.add(e, 'LoadStation', { filter: b.filter || null });
+  } else if (b.kind === 'unloadstation') {
+    // 卸货站(B2): 缓冲仓 + 对卡车表现为 Requester。卡车卸进它, 带/分拣器取走送下游(远距离终点)。
+    world.add(e, 'Inventory', { items: {}, cap: b.cap != null ? b.cap : 1000 });
+    world.add(e, 'Requester', { needs: b.needs || {} });         // 空需求 → 通用卸货(接收任何物品)
+    world.add(e, 'Provider', { items: '*' });                    // 供下游分拣器取走
+    world.add(e, 'UnloadStation', {});
   }
 
+  if (bus) bus.emit('build', { eid: e, buildingId });
+  return e;
+}
+
+// 放置一条传送带(两点放置)。from/to 为球面单位方向; opts 透传给 createBelt(buildingId/outPort/inPort 等)。
+// 返回带实体 id(失败返回 null, 例如科技未解锁)。
+export function placeBelt(world, ctx, from, to, opts = {}) {
+  const { registry } = ctx;
+  const buildingId = opts.buildingId || 'belt';
+  const b = registry.buildings[buildingId];
+  if (b && b.locked && !(registry.isUnlocked && registry.isUnlocked(buildingId))) return null;
+  return createBelt(world, ctx, from, to, { ...opts, buildingId });
+}
+
+// 放置一条折线带(多段): points=[dir0,dir1,...] → 生成 N-1 段带, 每段头部(outPort)直连下一段带尾(不经分拣器)。
+// 返回带实体 id 数组(失败返回 [])。
+export function placeBeltPath(world, ctx, points, opts = {}) {
+  const { registry } = ctx;
+  const buildingId = opts.buildingId || 'belt';
+  const b = registry.buildings[buildingId];
+  if (b && b.locked && !(registry.isUnlocked && registry.isUnlocked(buildingId))) return [];
+  if (!points || points.length < 2) return [];
+  const belts = [];
+  for (let i = 0; i < points.length - 1; i++) {
+    belts.push(createBelt(world, ctx, points[i], points[i + 1], { ...opts, buildingId }));
+  }
+  for (let i = 0; i < belts.length - 1; i++) {
+    world.get(belts[i], 'Belt').outPort = { kind: 'belt', eid: belts[i + 1], role: 'in' };   // 带↔带直连
+  }
+  return belts;
+}
+
+// 把已存在的带 a 的头部直连到带 b 的尾部(带↔带直连, 不经分拣器)。
+export function linkBelts(world, aBelt, bBelt) {
+  const a = world.get(aBelt, 'Belt');
+  if (a && world.has(bBelt, 'Belt')) { a.outPort = { kind: 'belt', eid: bBelt, role: 'in' }; return true; }
+  return false;
+}
+
+// 放置一个分拣器。from/to 为 Port {kind:'inv'|'belt', eid, role}(取货端/放货端)。
+// opts: { buildingId, rate, filter }。返回实体 id(失败返回 null)。
+export function placeInserter(world, ctx, from, to, opts = {}) {
+  const { registry, spatial, bus } = ctx;
+  const buildingId = opts.buildingId || 'inserter';
+  const b = registry.buildings[buildingId];
+  if (b && b.locked && !(registry.isUnlocked && registry.isUnlocked(buildingId))) return null;
+  const mt = registry.machineTypes[(b && b.machine) || 'inserter_mk1'] || {};
+  const rate = opts.rate != null ? opts.rate : (mt.rate != null ? mt.rate : 4);
+  const filter = opts.filter != null ? opts.filter : null;
+  const dir = midPortDir(world, from, to);
+
+  const e = world.create();
+  world.add(e, 'Anchor', { dir: [dir[0], dir[1], dir[2]], yaw: opts.yaw || 0 });
+  world.add(e, 'Building', { typeId: buildingId, mesh: (b && b.mesh) || mt.mesh || 'inserter' });
+  world.add(e, 'Inserter', { from, to, rate, filter, carry: null, charge: 0 });
+  if (spatial) spatial.insert(e, dir);
+  if (bus) bus.emit('build', { eid: e, buildingId });
+  return e;
+}
+
+// 放置一个分流器(单点放置)。dir 为球面方向; opts: { buildingId, ins:[beltId], outs:[beltId], mode, filters, rate }。
+// dir 缺省时用入/出带端点中点。返回实体 id(失败返回 null)。
+export function placeSplitter(world, ctx, dir = null, opts = {}) {
+  const { registry, spatial, bus } = ctx;
+  const buildingId = opts.buildingId || 'splitter';
+  const b = registry.buildings[buildingId];
+  if (b && b.locked && !(registry.isUnlocked && registry.isUnlocked(buildingId))) return null;
+  const mt = registry.machineTypes[(b && b.machine) || 'splitter_mk1'] || {};
+  const ins = opts.ins ? [...opts.ins] : [];
+  const outs = opts.outs ? [...opts.outs] : [];
+  const mode = opts.mode || 'balance';
+  const rate = opts.rate != null ? opts.rate : (mt.rate != null ? mt.rate : 8);
+
+  // 锚点: 优先给定 dir; 否则取相连带端点中点
+  let anchor = dir;
+  if (!anchor) {
+    const acc = [0, 0, 0]; let cnt = 0;
+    const addEnd = (beltId, end) => { const bl = world.get(beltId, 'Belt'); if (bl) { const p = bl[end]; acc[0] += p[0]; acc[1] += p[1]; acc[2] += p[2]; cnt++; } };
+    for (const id of ins) addEnd(id, 'to');       // 入带的头端接分流器
+    for (const id of outs) addEnd(id, 'from');     // 出带的尾端接分流器
+    anchor = cnt > 0 ? norm(acc) : [0, 1, 0];
+  }
+
+  const e = world.create();
+  world.add(e, 'Anchor', { dir: [anchor[0], anchor[1], anchor[2]], yaw: opts.yaw || 0 });
+  world.add(e, 'Building', { typeId: buildingId, mesh: (b && b.mesh) || mt.mesh || 'splitter' });
+  world.add(e, 'Splitter', { ins, outs, mode, filters: opts.filters || {}, rate, rr: 0, rrIn: 0, charge: 0 });
+  if (spatial) spatial.insert(e, anchor);
   if (bus) bus.emit('build', { eid: e, buildingId });
   return e;
 }

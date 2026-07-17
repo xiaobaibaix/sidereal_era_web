@@ -45,6 +45,14 @@ export const machineTypes = {
   excavator_mk1: { kind: 'excavator', mesh: 'excavator', tier: 1, digRate: 0.05, hardnessMax: 2, yield: 100, speed: 16, cap: 60, power: 30 },
   // kind=minetruck: 采矿卡车, 把挖机缓冲运进矿场
   mine_truck_mk1: { kind: 'minetruck', mesh: 'truck', tier: 1, speed: 22, cap: 80, power: 10 },
+  // ---- 物流升级(B系列): 传送带 / 分拣器 / 分流器 ----
+  // kind=belt: 一段测地线弧上的单向 FIFO 物品流。speed=物品前进速度(角/秒); spacing=物品最小间距(角)。
+  belt_mk1: { kind: 'belt', mesh: 'belt', tier: 1, speed: 0.15, spacing: 0.006 },
+  // kind=inserter: 分拣臂, 在相邻两端点间按 rate 搬运单个物品。filterable=可过滤(sorter 版)。
+  inserter_mk1: { kind: 'inserter', mesh: 'inserter', tier: 1, rate: 4 },
+  sorter_mk1: { kind: 'inserter', mesh: 'sorter', tier: 1, rate: 4, filterable: true },
+  // kind=splitter: 分流器, 带的合流/分流/按物品路由节点。
+  splitter_mk1: { kind: 'splitter', mesh: 'splitter', tier: 1, rate: 8 },
 };
 
 export const buildings = {
@@ -75,12 +83,28 @@ export const buildings = {
     // 燃烧任意原始物质(废料优先, 但废料稀少 → 也烧常见矿石)。不烧铁锭/铁板(留给科研/建造)。
     burnRate: 40, exhaust: 60, fuelBuffer: 300, fuelItems: ['overburden', 'stone', 'iron_ore', 'copper_ore'],
   },
+  // ---- 物流升级(B系列): 传送带 / 分拣器 / 分流器 / 运输站 ----
+  // 传送带: 两点放置(from/to), 弧长 length 决定 cap; 近距离贴地流动。科技锁(logistics_belts)。
+  belt: { name: '传送带', kind: 'belt', machine: 'belt_mk1', mesh: 'belt', locked: true },
+  // 分拣器: 吸附到"最近带段 + 最近建筑口", 在带↔机器/仓库/站之间搬运。科技锁(logistics_belts)。
+  inserter: { name: '分拣器', kind: 'inserter', machine: 'inserter_mk1', mesh: 'inserter', locked: true },
+  // 分拣器(过滤版): 只搬指定物品(filter)。科技锁(freight_stations)。
+  sorter: { name: '过滤分拣器', kind: 'inserter', machine: 'sorter_mk1', mesh: 'sorter', filterable: true, locked: true },
+  // 分流器: 带的合流/分流/按物品路由节点。科技锁(logistics_belts)。
+  splitter: { name: '分流器', kind: 'splitter', machine: 'splitter_mk1', mesh: 'splitter', locked: true },
+  // 装货站: 缓冲仓 + 对卡车表现为 Provider(远距离运输起点)。带/分拣器填它, 卡车从它取货。科技锁(freight_stations)。
+  load_station: { name: '装货站', kind: 'loadstation', mesh: 'station_load', cap: 1000, locked: true },
+  // 卸货站: 缓冲仓 + 对卡车表现为 Requester(远距离运输终点)。卡车卸进它, 带/分拣器取走送下游。科技锁(freight_stations)。
+  unload_station: { name: '卸货站', kind: 'unloadstation', mesh: 'station_unload', cap: 1000, locked: true },
 };
 
 // 科技(M5): 发展度(dev)到阈值(+可选 builtAny)自动解锁; unlock 列出解锁的建筑/配方 id。
 export const tech = {
   assembly: { name: '装配技术', require: { dev: 40 }, unlock: { buildings: ['assembler'], recipes: ['make_plate'] } },
   planet_engine: { name: '行星发动机', require: { dev: 150, builtAny: ['assembler'] }, unlock: { buildings: ['engine_site'] } },   // engine_site 于 M6 加入
+  // 物流升级(B系列): 近距离传送带 → 远距离运输站。
+  logistics_belts: { name: '传送带物流', require: { dev: 20 }, unlock: { buildings: ['belt', 'inserter', 'splitter'] } },
+  freight_stations: { name: '货运站', require: { dev: 60 }, unlock: { buildings: ['load_station', 'unload_station', 'sorter'] } },
 };
 
 export const gameData = { items, ore, recipes, machineTypes, buildings, tech };
