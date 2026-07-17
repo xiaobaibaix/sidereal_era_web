@@ -196,9 +196,11 @@ pass = 0;
   assert.ok(Array.isArray(z0.vertices) && z0.vertices.length > 0, '同步项含 vertices');
   for (const v of z0.vertices) {
     assert.ok(Array.isArray(v.dir) && typeof v.offset === 'number', '顶点 {dir, offset}');
-    assert.ok(!('ownerId' in v) && !('hardLimit' in v) && !('baseH' in v), '同步项只含 dir+offset(精简)');
+    assert.equal(typeof v.targetOffset, 'number', '顶点含 targetOffset(progress 整平用)');
+    assert.ok(!('ownerId' in v) && !('hardLimit' in v) && !('baseH' in v), '同步项不含 ownerId/hardLimit/baseH');
   }
-  ok('syncDigZoneVertices: 字段格式 + 精简(只传 dir/offset)');
+  assert.equal(typeof z0.planeH, 'number', 'zone 级 planeH 已同步');
+  ok('syncDigZoneVertices: 字段格式 + 含 planeH/targetOffset(progress 整平用)');
 }
 
 // ---- 7. 顶点 offset 改变后, 重同步会反映到 params ----
@@ -272,6 +274,124 @@ function idw(ux, uy, uz, vertices, maxInfluence) {
 }
 
 console.log(`\n阶段 2 全部通过 (${pass} 组断言)`);
+
+// ---- 9b. zone-level flatten: 挖完后 zone 内任意 dir 的 heightAt ≈ planeH(球面切片) ----
+// 旧实现"减 IDW(offset)"在 dir 处不能完全抵消 baseNoise 高频起伏 → bumps。
+// 新实现按 progress 整平: 挖完的 zone 内 h = planeH(精确, 无 bumps)。
+// 注: terrain.js 用 CDN import simplex-noise, node 跑不了 → 在测试里纯 JS 重写 heightAt 的 digZone 分支。
+{
+  const planet = stubPlanet();
+  const ctx = makeCtx(planet);
+  const world = createWorld();
+  placeBuilding(world, ctx, 'depot', norm([0, 1, 0]));
+  const ze = placeDigZoneEntity(world, ctx, norm([0, 1, 0]));
+  const zone = world.get(ze, 'DigZone');
+  // 模拟所有顶点挖到 targetOffset(完全挖完)
+  for (const v of zone.vertices) v.offset = v.targetOffset;
+  syncDigZoneVertices(world, ctx);
+  // 用 planet.params.digZoneVertices 重放 terrain.js 的 progress 整平逻辑
+  const zg = planet.params.digZoneVertices[0];
+  // baseH(dir) 用 planet 的 stub 实现
+  const baseH = (dir) => planet.baseHeightAt(dir[0], dir[1], dir[2]);
+  const maxInfluence = zg.maxInfluence;
+  const cosRadiusPad = Math.cos((zg.radius || 0) + 0.005);
+  function heightAt(dir) {
+    const len = Math.hypot(dir[0], dir[1], dir[2]) || 1;
+    const ux = dir[0] / len, uy = dir[1] / len, uz = dir[2] / len;
+    let h = baseH(dir);
+    const cosC = ux * zg.center[0] + uy * zg.center[1] + uz * zg.center[2];
+    if (cosC >= cosRadiusPad) {
+      let weight = 0, sumDone = 0;
+      for (const v of zg.vertices) {
+        const cos = ux * v.dir[0] + uy * v.dir[1] + uz * v.dir[2];
+        if (cos <= 0) continue;
+        const ang = cos >= 1 ? 0 : Math.acos(cos);
+        if (ang > maxInfluence) continue;
+        const w = 1 / Math.max(ang, 1e-4);
+        weight += w;
+        const done = v.targetOffset <= 1e-6 ? 1
+          : v.offset >= v.targetOffset - 1e-6 ? 1
+          : v.offset <= 0 ? 0
+          : v.offset / v.targetOffset;
+        sumDone += w * done;
+      }
+      if (weight > 0) {
+        const progress = sumDone / weight;
+        if (progress > 0) h = h + (zg.planeH - h) * progress;
+      }
+    }
+    return h;
+  }
+  // 在 zone 内撒多个方向(含顶点之间), 验证 heightAt ≈ planeH
+  // 注: 必须严格在 zone.radius 内 — 出 zone 后没有顶点影响, h 自然回原值(baseH)。
+  let maxDev = 0;
+  const angBetween = (a, b) => Math.acos(Math.max(-1, Math.min(1, a[0]*b[0]+a[1]*b[1]+a[2]*b[2])));
+  for (let i = 0; i < 200; i++) {
+    const t = (i / 200) * Math.PI * 2;
+    // 严格在 zone.radius 内: r 取 [0.1, 0.85] × radius
+    const r = (0.1 + (i % 7) * 0.1) * zone.radius * 0.85;
+    const dir = norm([
+      zone.center[0] + Math.cos(t) * r,
+      zone.center[1] + Math.sin(t) * r,
+      zone.center[2] + Math.sin(t * 1.7) * r,
+    ]);
+    // 确认在 zone.radius 内(else 跳过)
+    if (angBetween(dir, zone.center) > zone.radius * 0.95) continue;
+    const h = heightAt(dir);
+    const dev = Math.abs(h - zg.planeH);
+    if (dev > maxDev) maxDev = dev;
+  }
+  assert.ok(maxDev < 0.001, `zone 内任意位置 heightAt ≈ planeH(最大偏差 ${maxDev.toFixed(6)} < 0.001, 完美球面切片)`);
+  ok(`zone-level flatten: 挖完后 zone 内 heightAt ≈ planeH(最大偏差 ${maxDev.toFixed(6)}, 无 bumps)`);
+}
+
+// ---- 9c. 反向验证: 旧 IDW-offset 实现在同样条件下有 bumps ----
+// 同样挖完, 用旧的"减 IDW(offset)"公式算, 应该有显著偏差(证明新实现确实修复了 bumps)。
+{
+  const planet = stubPlanet();
+  const ctx = makeCtx(planet);
+  const world = createWorld();
+  placeBuilding(world, ctx, 'depot', norm([0, 1, 0]));
+  const ze = placeDigZoneEntity(world, ctx, norm([0, 1, 0]));
+  const zone = world.get(ze, 'DigZone');
+  for (const v of zone.vertices) v.offset = v.targetOffset;
+  syncDigZoneVertices(world, ctx);
+  const zg = planet.params.digZoneVertices[0];
+  const baseH = (dir) => planet.baseHeightAt(dir[0], dir[1], dir[2]);
+  // 旧公式: h = baseH(dir) - IDW(offsets, dir)
+  function heightAtOldIDW(dir) {
+    const len = Math.hypot(dir[0], dir[1], dir[2]) || 1;
+    const ux = dir[0] / len, uy = dir[1] / len, uz = dir[2] / len;
+    let h = baseH(dir);
+    let weight = 0, sumOff = 0;
+    for (const v of zg.vertices) {
+      if (v.offset <= 0) continue;
+      const cos = ux * v.dir[0] + uy * v.dir[1] + uz * v.dir[2];
+      if (cos <= 0) continue;
+      const ang = cos >= 1 ? 0 : Math.acos(cos);
+      if (ang > zg.maxInfluence) continue;
+      const w = 1 / Math.max(ang, 1e-4);
+      weight += w; sumOff += v.offset * w;
+    }
+    if (weight > 0) h -= sumOff / weight;
+    return h;
+  }
+  let maxDev = 0;
+  for (let i = 0; i < 200; i++) {
+    const t = (i / 200) * Math.PI * 2;
+    const r = (0.3 + (i % 7) * 0.1) * zone.radius * 0.9;
+    const dir = norm([
+      zone.center[0] + Math.cos(t) * r,
+      zone.center[1] + Math.sin(t) * r,
+      zone.center[2] + Math.sin(t * 1.7) * r,
+    ]);
+    const dev = Math.abs(heightAtOldIDW(dir) - zg.planeH);
+    if (dev > maxDev) maxDev = dev;
+  }
+  // 旧公式应该有明显偏差(>0.01), 证明新实现的修复有效
+  assert.ok(maxDev > 0.01, `旧 IDW-offset 实现有 bumps(最大偏差 ${maxDev.toFixed(4)} > 0.01)`);
+  ok(`反向验证: 旧 IDW-offset 实现确实有 bumps(偏差 ${maxDev.toFixed(4)}, 证明修复必要)`);
+}
 
 // ===========================================================================
 // 阶段 3: 挖机状态机(R3 范围 / R4 平面 / R6 互斥 / R5 找下一个)

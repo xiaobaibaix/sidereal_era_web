@@ -440,26 +440,37 @@ export function syncDigZoneVertices(world, ctx) {
     const dz = world.get(e, 'DigZone');
     if (!dz || !dz.center || !dz.vertices || dz.vertices.length === 0) continue;
     if (dz.id == null) dz.id = _nextZoneId++;
+    // 同步字段: 每顶点 {dir, offset, targetOffset}, zone 级 {planeH}
+    //   - targetOffset: 该顶点要被挖到的目标深度(baseH - planeH, clamp 到 hardLimit)
+    //   - planeH: 整平基准(最低 baseH), 用于 zone-level flatten
+    //   这两项让 terrain.js 能算 "progress = IDW(offset/targetOffset)" 并把 h 整平到 planeH,
+    //   而不是粗暴减 IDW(offset)(那样 baseNoise 的高频起伏会形成 bumps)。
+    const projV = (v) => ({ dir: v.dir, offset: v.offset, targetOffset: v.targetOffset });
     let entry = byId.get(dz.id);
     if (!entry) {
       entry = {
         id: dz.id,
         center: dz.center,
         radius: dz.radius,
+        planeH: dz.planeH || 0,
         maxInfluence: (dz.resolution || 0.005) * 1.5,
-        vertices: dz.vertices.map((v) => ({ dir: v.dir, offset: v.offset })),
+        vertices: dz.vertices.map(projV),
       };
       list.push(entry);
       byId.set(dz.id, entry);
     } else {
-      // 原地更新 offsets(顶点表长度在 generateVertices 后稳定, 直接索引覆盖)
       const ev = entry.vertices;
       if (ev.length !== dz.vertices.length) {
         entry.center = dz.center; entry.radius = dz.radius;
+        entry.planeH = dz.planeH || 0;
         entry.maxInfluence = (dz.resolution || 0.005) * 1.5;
-        entry.vertices = dz.vertices.map((v) => ({ dir: v.dir, offset: v.offset }));
+        entry.vertices = dz.vertices.map(projV);
       } else {
-        for (let i = 0; i < ev.length; i++) ev[i].offset = dz.vertices[i].offset;
+        entry.planeH = dz.planeH || 0;
+        for (let i = 0; i < ev.length; i++) {
+          ev[i].offset = dz.vertices[i].offset;
+          ev[i].targetOffset = dz.vertices[i].targetOffset;
+        }
       }
     }
   }
