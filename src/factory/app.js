@@ -27,8 +27,9 @@ import { createLogisticsSystem, spawnHaulers } from './systems/logistics.js';
 import { createBeltSystem } from './systems/belt.js';
 import { createInserterSystem } from './systems/inserter.js';
 import { createSplitterSystem } from './systems/splitter.js';
-import { placeBuilding, demolish, placeBelt, placeInserter, placeSplitter, linkBelts } from './systems/placement.js';
+import { placeBuilding, demolish, placeBelt, placeInserter, placeSplitter, linkBelts, placeBuildPad, placeBuildingSnapped, padAt } from './systems/placement.js';
 import { angle as sphAngle } from './core/sphere.js';
+import { dirToCell, footprintCenterDir, snapYaw, canPlace } from './core/grid.js';
 import { createFactoryRenderer } from './render/factory_render.js';
 import { createInspector } from './render/inspector.js';
 import { pick as anchorPick } from './core/anchor.js';
@@ -90,10 +91,13 @@ export function createFactoryApp(opts) {
   let _fpDown = null;
   let _beltStart = null;   // 传送带折线放置: 当前段起点(球面方向)
   let _beltPrev = null;    // 上一段带实体(用于带↔带直连成折线)
+  let _quarter = 0;        // 网格放置朝向(0..3, 每次 R 键 +90°)
+  let _cursor = null;      // 最近一次鼠标屏幕坐标(驱动网格虚影预览)
+  const showsGrid = (m) => m === '平整地面' || m.startsWith('放置');
   const fpGui = new GUI({ title: '🏭 工厂', container });
-  fpGui.add(fpTool, 'mode', ['关闭', '放置矿场', '圈定挖掘区', '放置冶炼炉', '放置制造台', '放置研究站', '放置仓库', '放置输电塔', '放置发电机', '放置发动机', '点火发动机',
+  fpGui.add(fpTool, 'mode', ['关闭', '平整地面', '放置矿场', '圈定挖掘区', '放置冶炼炉', '放置制造台', '放置研究站', '放置仓库', '放置输电塔', '放置发电机', '放置发动机', '点火发动机',
     '放置传送带', '放置分拣器·上料', '放置分拣器·下料', '放置过滤分拣器·上料', '放置过滤分拣器·下料', '放置分流器', '放置装货站', '放置卸货站', '拆除']).name('模式').listen()
-    .onChange((v) => { if (v !== '关闭') onModeActivate(); _beltStart = null; _beltPrev = null; });
+    .onChange((v) => { if (v !== '关闭') onModeActivate(); _beltStart = null; _beltPrev = null; factoryRenderer.showBuildGrids(showsGrid(v)); });
   fpGui.add(fpTool, 'excavatorCount', 1, 20, 1).name('挖机数量');
   fpGui.add(fpTool, 'spawnExcavators').name('生成挖机');
   fpGui.add(fpTool, 'mineTruckCount', 1, 20, 1).name('采矿车数量');
@@ -191,6 +195,45 @@ export function createFactoryApp(opts) {
     return e;
   }
 
+  // 放置模式 → 建筑 id / 成功提示(走网格吸附)
+  const MODE_BUILDING = {
+    '放置矿场': 'depot', '放置冶炼炉': 'smelter', '放置制造台': 'assembler', '放置研究站': 'lab',
+    '放置仓库': 'warehouse', '放置输电塔': 'power_tower', '放置发电机': 'generator',
+    '放置装货站': 'load_station', '放置卸货站': 'unload_station',
+  };
+  const MODE_MSG = {
+    '放置矿场': '已放置矿场 · 请圈定挖掘区并生成挖机/采矿车', '放置冶炼炉': '已放置冶炼炉',
+    '放置制造台': '已放置制造台', '放置研究站': '已放置研究站 · 送铁锭进来提升发展度',
+    '放置仓库': '已放置仓库', '放置输电塔': '已放置输电塔', '放置发电机': '已放置发电机',
+    '放置装货站': '已放置装货站 · 带/分拣器填它, 卡车从它取货', '放置卸货站': '已放置卸货站 · 卡车卸进它, 带/分拣器取走送下游',
+  };
+  // 网格吸附放置: 平台内吸附落格(占用则拒), 平台外/按住 Alt 自由放置
+  function trySnapPlace(buildingId, dir, okMsg, free) {
+    if (!checkUnlocked(buildingId)) return null;
+    if (free) { const e = placeBuilding(factory.world, factory.ctx, buildingId, dir); if (e != null && okMsg) showToast(okMsg, false); return e; }
+    const r = placeBuildingSnapped(factory.world, factory.ctx, buildingId, dir, _quarter);
+    if (r.blocked) { showToast('该网格已被占用', true); return null; }
+    if (r.eid != null && okMsg) showToast(r.snapped ? `${okMsg} · 已吸附网格` : okMsg, false);
+    return r.eid;
+  }
+
+  // 网格虚影预览: 在光标吸附格画绿(可放)/红(占用)方块; 非建筑放置模式或不在平台内则隐藏
+  function updateGridGhost() {
+    const bid = MODE_BUILDING[fpTool.mode];
+    if (!bid || !_cursor) { factoryRenderer.setGridCursor(null); return; }
+    const d = anchorPick(_cursor.x, _cursor.y, getCamera(), getPlanet());
+    if (!d) { factoryRenderer.setGridCursor(null); return; }
+    const hit = padAt(factory.world, [d.x, d.y, d.z]);
+    if (!hit) { factoryRenderer.setGridCursor(null); return; }
+    const pad = hit.pad, R = getPlanet().params.radius;
+    const def = factory.registry.buildings[bid] || {};
+    const fp = def.footprint || [1, 1], w = fp[0], h = fp[1];
+    const c = dirToCell(pad, [d.x, d.y, d.z], R);
+    const i0 = c.i - Math.floor(w / 2), j0 = c.j - Math.floor(h / 2);
+    const cdir = footprintCenterDir(pad, i0, j0, w, h, R);
+    factoryRenderer.setGridCursor(cdir, snapYaw(pad, cdir, _quarter), w * pad.cell, h * pad.cell, !canPlace(pad, i0, j0, w, h));
+  }
+
   // 科技锁提示(带/分拣器/分流器/站): 未解锁则 toast 并返回 false
   function checkUnlocked(buildingId) {
     const b = factory.registry.buildings[buildingId];
@@ -268,18 +311,17 @@ export function createFactoryApp(opts) {
     if (!d) return;
     const dir = [d.x, d.y, d.z];
     const m = fpTool.mode;
-    if (m === '放置矿场') tryPlace('depot', dir, '已放置矿场 · 请圈定挖掘区并生成挖机/采矿车');
+    if (m === '平整地面') {
+      const e = placeBuildPad(factory.world, factory.ctx, dir);
+      if (e != null) showToast('已平整建造平台 · 切放置模式即可在网格内吸附建造(R 旋转, Alt 自由放置)', false);
+    }
+    else if (MODE_BUILDING[m]) trySnapPlace(MODE_BUILDING[m], dir, MODE_MSG[m], e.altKey);
     else if (m === '圈定挖掘区') {
       const depot = factory.spatial.nearest(dir, (id) => factory.world.has(id, 'Depot'));
       if (depot == null) { showToast('附近没有矿场, 请先放置矿场', true); return; }
       setDigZone(factory.world, factory.ctx, depot, dir);
       showToast('已圈定挖掘区 · 生成挖机+采矿车即可开采', false);
-    } else if (m === '放置冶炼炉') tryPlace('smelter', dir, '已放置冶炼炉');
-    else if (m === '放置制造台') tryPlace('assembler', dir, '已放置制造台');
-    else if (m === '放置研究站') tryPlace('lab', dir, '已放置研究站 · 送铁锭进来提升发展度');
-    else if (m === '放置仓库') tryPlace('warehouse', dir, '已放置仓库');
-    else if (m === '放置输电塔') tryPlace('power_tower', dir, '已放置输电塔');
-    else if (m === '放置发电机') tryPlace('generator', dir, '已放置发电机');
+    }
     else if (m === '放置发动机') tryPlace('engine_site', dir, '已开建行星发动机 · 依阶段自动索取建材(铁板)');
     else if (m === '放置传送带') {
       if (!checkUnlocked('belt')) return;
@@ -326,11 +368,16 @@ export function createFactoryApp(opts) {
     const eid = pickEntity(e.clientX, e.clientY);
     if (eid != null) inspector.show(eid); else inspector.hide();
   };
-  const onKey = (e) => { if (e.key === 'Escape') { if (endBeltPath()) showToast('已结束传送带', false); inspector.hide(); } };
+  const onKey = (e) => {
+    if (e.key === 'Escape') { if (endBeltPath()) showToast('已结束传送带', false); inspector.hide(); }
+    else if (e.key === 'r' || e.key === 'R') { _quarter = (_quarter + 1) % 4; }   // 网格放置: 旋转 90°
+  };
+  const onPointerMove = (e) => { _cursor = { x: e.clientX, y: e.clientY }; };
   dom.addEventListener('pointerdown', onPlaceDown);
   dom.addEventListener('pointerup', onPlaceUp);
   dom.addEventListener('pointerdown', onInspectDown);
   dom.addEventListener('pointerup', onInspectUp);
+  dom.addEventListener('pointermove', onPointerMove);
   window.addEventListener('keydown', onKey);
 
   // ---- 状态 ----
@@ -359,6 +406,7 @@ export function createFactoryApp(opts) {
       factoryRenderer.setSelected(inspector.selected());
       factoryRenderer.update(factory.world);
       factoryRenderer.setPowerLines(factory.ctx.power && factory.ctx.power.links);
+      updateGridGhost();
       inspector.update();
       updateFactoryStatus();
       updateResearchStatus();
@@ -366,6 +414,7 @@ export function createFactoryApp(opts) {
     dispose() {
       dom.removeEventListener('pointerdown', onPlaceDown); dom.removeEventListener('pointerup', onPlaceUp);
       dom.removeEventListener('pointerdown', onInspectDown); dom.removeEventListener('pointerup', onInspectUp);
+      dom.removeEventListener('pointermove', onPointerMove);
       window.removeEventListener('keydown', onKey);
       fpGui.destroy(); techGui.destroy(); dbgGui.destroy(); inspector.dispose(); factoryRenderer.dispose(); toastEl.remove();
     },

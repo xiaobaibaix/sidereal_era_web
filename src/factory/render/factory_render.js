@@ -6,8 +6,10 @@
 
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
-import { worldMatrix, worldMatrixHeading } from '../core/anchor.js';
+import { worldMatrix, worldMatrixHeading, groundRadius } from '../core/anchor.js';
 import { slerp, tangentToward } from '../core/sphere.js';
+import { cellToDir } from '../core/grid.js';
+import { angle as sphAngle } from '../core/sphere.js';
 
 const MAX = 512;
 
@@ -411,6 +413,53 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
   const _itemColorCache = {};
   const itemColor = (id) => (_itemColorCache[id] || (_itemColorCache[id] = new THREE.Color(ITEM_COLOR[id] != null ? ITEM_COLOR[id] : DEFAULT_ITEM_COLOR)));
 
+  // ---- 建造网格(网格球): 平台上的方格线 + 光标 footprint 高亮(仅放置模式显示) ----
+  let _showGrids = false;
+  const GRID_MAXV = 60000;   // 顶点上限(GRID_MAXV/2 段)
+  const gridPos = new Float32Array(GRID_MAXV * 3);
+  const gridGeo = new THREE.BufferGeometry();
+  gridGeo.setAttribute('position', new THREE.BufferAttribute(gridPos, 3));
+  const gridMat = new THREE.LineBasicMaterial({ color: 0x6cc7ff, transparent: true, opacity: 0.5, depthWrite: false });
+  const gridLines = new THREE.LineSegments(gridGeo, gridMat);
+  gridLines.frustumCulled = false; gridLines.renderOrder = 998; gridLines.visible = false;
+  scene.add(gridLines);
+
+  const cursorGeo = new THREE.BoxGeometry(1, 0.25, 1); cursorGeo.translate(0, 0.14, 0);
+  const cursorOkMat = new THREE.MeshBasicMaterial({ color: 0x5ad17a, transparent: true, opacity: 0.45, depthWrite: false });
+  const cursorBadMat = new THREE.MeshBasicMaterial({ color: 0xe0604a, transparent: true, opacity: 0.5, depthWrite: false });
+  const cursorMesh = new THREE.Mesh(cursorGeo, cursorOkMat);
+  cursorMesh.matrixAutoUpdate = false; cursorMesh.frustumCulled = false; cursorMesh.renderOrder = 999; cursorMesh.visible = false;
+  scene.add(cursorMesh);
+  const _gv = new THREE.Vector3();
+
+  function gridVertexTo(dir, arr, k) {
+    const rr = groundRadius(dir, planet) + 0.35;
+    arr[k] = dir[0] * rr + planet.position.x;
+    arr[k + 1] = dir[1] * rr + planet.position.y;
+    arr[k + 2] = dir[2] * rr + planet.position.z;
+  }
+  function rebuildGrids(world) {
+    let k = 0;
+    const R = planet.params.radius;
+    for (const pe of world.query('BuildPad')) {
+      const pad = world.get(pe, 'BuildPad');
+      const N = Math.max(1, Math.ceil((pad.radius * R) / pad.cell));
+      const inside = (i, j) => sphAngle(cellToDir(pad, i, j, R), pad.center) <= pad.radius;
+      for (let i = -N; i <= N; i++) {
+        for (let j = -N; j <= N; j++) {
+          if (!inside(i, j)) continue;
+          if (k + 12 > gridPos.length) { i = N + 1; break; }   // 顶点封顶
+          if (inside(i + 1, j)) { gridVertexTo(cellToDir(pad, i, j, R), gridPos, k); k += 3; gridVertexTo(cellToDir(pad, i + 1, j, R), gridPos, k); k += 3; }
+          if (inside(i, j + 1)) { gridVertexTo(cellToDir(pad, i, j, R), gridPos, k); k += 3; gridVertexTo(cellToDir(pad, i, j + 1, R), gridPos, k); k += 3; }
+        }
+      }
+    }
+    gridGeo.setDrawRange(0, k / 3);
+    gridGeo.attributes.position.needsUpdate = true;
+    gridGeo.computeBoundingSphere();
+    gridLines.visible = k > 0;
+  }
+
   return {
     groups,
     setPlanet(p) { planet = p; },
@@ -532,8 +581,22 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
         }
         for (; i < zonePool.length; i++) zonePool[i].visible = false;
       }
+
+      // 建造网格(仅放置模式): 重建平台网格线
+      if (_showGrids) rebuildGrids(world); else gridLines.visible = false;
     },
     showPickRanges(on) { ringGroup.visible = !!on; },
+    // 建造网格显隐(进入放置模式时开)
+    showBuildGrids(on) { _showGrids = !!on; if (!on) { gridLines.visible = false; cursorMesh.visible = false; } },
+    // 光标 footprint 高亮预览。dir=null 隐藏; 否则在吸附位姿画一个 w×h 格的绿(可放)/红(占用)方块。
+    setGridCursor(dir, yaw, wWorld, hWorld, blocked) {
+      if (!dir) { cursorMesh.visible = false; return; }
+      worldMatrix(dir, yaw || 0, planet, _m, 1);
+      _m.scale(_gv.set(wWorld, 1, hWorld));
+      cursorMesh.matrix.copy(_m);
+      cursorMesh.material = blocked ? cursorBadMat : cursorOkMat;
+      cursorMesh.visible = true;
+    },
     // 更新电力连线; links = [[dirA, dirB], ...](单位方向数组), 由 power 系统写入 ctx.power.links
     setPowerLines(links) {
       let n = 0;
@@ -581,9 +644,10 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
         scene.remove(g.mesh); g.geo.dispose(); g.mat.dispose();
       }
       scene.remove(ringGroup); scene.remove(zoneGroup); scene.remove(powerLines); scene.remove(jetMesh);
-      scene.remove(beltSegMesh); scene.remove(beltItemMesh);
+      scene.remove(beltSegMesh); scene.remove(beltItemMesh); scene.remove(gridLines); scene.remove(cursorMesh);
       ringGeo.dispose(); ringMat.dispose(); zoneMat.dispose(); powerGeo.dispose(); powerMat.dispose(); jetGeo.dispose(); jetMat.dispose();
       beltSegGeo.dispose(); beltSegMat.dispose(); beltItemGeo.dispose(); beltItemMat.dispose();
+      gridGeo.dispose(); gridMat.dispose(); cursorGeo.dispose(); cursorOkMat.dispose(); cursorBadMat.dispose();
     },
   };
 }
