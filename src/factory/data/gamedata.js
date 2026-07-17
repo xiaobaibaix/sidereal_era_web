@@ -57,18 +57,21 @@ export const machineTypes = {
 
 export const buildings = {
   // 矿场: 被动容器。圈定挖掘区 + 生成挖机(挖) + 采矿卡车(运)后才会存入矿石; 下游物流卡车再从这里取货。
-  depot: { name: '矿场', kind: 'depot', mesh: 'depot', cap: 2000, zoneRadius: 0.05 },
+  depot: { name: '矿场', kind: 'depot', mesh: 'depot', cap: 2000, zoneRadius: 0.05, footprint: [3, 3] },
   miner: { name: '采矿机 Mk1', kind: 'miner', machine: 'miner_mk1', mesh: 'miner', digRadius: 0.03, cap: 500 },   // 旧直挖矿机(遗留, UI 已改用矿场)
-  warehouse: { name: '仓库', kind: 'storage', mesh: 'warehouse', cap: 5000 },
+  warehouse: { name: '仓库', kind: 'storage', mesh: 'warehouse', cap: 5000, footprint: [2, 2] },
+  // 建造平台(网格建造): 平整一块圆区(terrain level 编辑)并生成网格球, 在其中吸附放置建筑。cell=格边长(世界单位), radius=角半径。
+  build_pad: { name: '建造平台', kind: 'buildpad', mesh: 'build_pad', cell: 3.0, radius: 0.06 },
   // 生产建筑: recipe=默认配方; recipes=可选配方列表; cap=库存(输入缓冲+输出); bufferMult=输入缓冲维持的配方份数
-  smelter: { name: '冶炼炉', kind: 'producer', machine: 'smelter_mk1', mesh: 'smelter', recipe: 'smelt_iron', recipes: ['smelt_iron', 'smelt_copper'], cap: 300, bufferMult: 6, power: 90 },
+  // footprint=[w,h] 网格占位(格), 缺省 1x1
+  smelter: { name: '冶炼炉', kind: 'producer', machine: 'smelter_mk1', mesh: 'smelter', recipe: 'smelt_iron', recipes: ['smelt_iron', 'smelt_copper'], cap: 300, bufferMult: 6, power: 90, footprint: [2, 2] },
   // 制造台: 科技锁(需"装配技术")。
-  assembler: { name: '制造台', kind: 'producer', machine: 'assembler_mk1', mesh: 'assembler', recipe: 'make_plate', recipes: ['make_plate'], cap: 300, bufferMult: 6, power: 120, locked: true },
+  assembler: { name: '制造台', kind: 'producer', machine: 'assembler_mk1', mesh: 'assembler', recipe: 'make_plate', recipes: ['make_plate'], cap: 300, bufferMult: 6, power: 120, locked: true, footprint: [2, 2] },
   // 电力(M4): 输电塔覆盖一片区域(range=角半径), 覆盖内建筑自动接入; 塔与塔覆盖相交则并入同一电网。
   power_tower: { name: '输电塔', kind: 'tower', mesh: 'tower', range: 0.14 },
   generator: { name: '风力发电机', kind: 'generator', mesh: 'generator', output: 200 },
   // 研究站(M5): 消耗铁锭 → 提升殖民地发展度(简化"科技水平"占位)。发展度到阈值解锁科技。
-  lab: { name: '研究站', kind: 'lab', mesh: 'lab', input: 'iron_ingot', inRate: 2, devPerUnit: 1, cap: 100, bufferMult: 10 },
+  lab: { name: '研究站', kind: 'lab', mesh: 'lab', input: 'iron_ingot', inRate: 2, devPerUnit: 1, cap: 100, bufferMult: 10, footprint: [2, 2] },
   // 行星发动机(M6): 科技锁(planet_engine)。分阶段建造 —— 选址平整→骨架投料→核心投料→调试 → 建成(未点火, M7 点火)。
   //   type: 'level'/'commission' = 计时阶段; 'build'/'assemble' = 投料阶段(in 由物流送达并被吸收)。
   engine_site: {
@@ -93,9 +96,9 @@ export const buildings = {
   // 分流器: 带的合流/分流/按物品路由节点。科技锁(logistics_belts)。
   splitter: { name: '分流器', kind: 'splitter', machine: 'splitter_mk1', mesh: 'splitter', locked: true },
   // 装货站: 缓冲仓 + 对卡车表现为 Provider(远距离运输起点)。带/分拣器填它, 卡车从它取货。科技锁(freight_stations)。
-  load_station: { name: '装货站', kind: 'loadstation', mesh: 'station_load', cap: 1000, locked: true },
+  load_station: { name: '装货站', kind: 'loadstation', mesh: 'station_load', cap: 1000, locked: true, footprint: [3, 3] },
   // 卸货站: 缓冲仓 + 对卡车表现为 Requester(远距离运输终点)。卡车卸进它, 带/分拣器取走送下游。科技锁(freight_stations)。
-  unload_station: { name: '卸货站', kind: 'unloadstation', mesh: 'station_unload', cap: 1000, locked: true },
+  unload_station: { name: '卸货站', kind: 'unloadstation', mesh: 'station_unload', cap: 1000, locked: true, footprint: [3, 3] },
 };
 
 // 科技(M5): 发展度(dev)到阈值(+可选 builtAny)自动解锁; unlock 列出解锁的建筑/配方 id。
