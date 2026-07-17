@@ -14,6 +14,7 @@
 // 从带取头(须到出口)、往带放尾(遵守 spacing/cap)。目标放不下 → 握在手里, 天然背压到上游。
 
 import { portPeek, portTakeUnit, portPutUnit } from '../core/port.js';
+import { beltTapPeek, beltTapTake, beltTapPut } from './belt.js';
 import { norm } from '../core/sphere.js';
 
 // 依 filter 选一个此刻可取的物品(不移除); 取不到返回 null。
@@ -37,11 +38,62 @@ function doOneMove(world, ins) {
   return true;
 }
 
-// 单个分拣器一帧
+// ---- 网格版分拣器(装在建筑边缘, 抓取格动态解析) ----
+// 解析抓取格(gi,gj)里的实体: 平台占位里的建筑, 或经过该格的传送带(带 + 该格 s 位置)。无则 null。
+function resolveGrab(world, ins) {
+  if (ins.pad == null || !world.alive(ins.pad)) return null;
+  const pad = world.get(ins.pad, 'BuildPad'); if (!pad) return null;
+  const key = ins.gi + ',' + ins.gj;
+  const occ = pad.occupied && pad.occupied[key];
+  if (occ != null && occ !== ins.mount && world.alive(occ) && world.has(occ, 'Inventory')) return { kind: 'inv', eid: occ };
+  for (const be of world.query('Belt')) {
+    const b = world.get(be, 'Belt');
+    if (b.pad === ins.pad && b.cells && b.cells[key] != null) return { kind: 'belt', eid: be, s: b.cells[key], window: b.cellGap != null ? b.cellGap : 0.1 };
+  }
+  return null;
+}
+
+// 从库存端按 filter 取 1 个整单位(filter 为列表时只取列表内物品)
+function invPick(world, eid, role, filter) {
+  const port = { kind: 'inv', eid, role };
+  if (filter && filter.length) { for (const f of filter) if (portPeek(world, port, f)) return portTakeUnit(world, port, f); return null; }
+  const it = portPeek(world, port, null);
+  return it != null ? portTakeUnit(world, port, it) : null;
+}
+
+// 网格分拣器一次搬运。mode 'in': 抓取格→建筑; 'out': 建筑→抓取格。carry 手持背压同普通分拣器。
+function doOneMoveGrid(world, ins) {
+  const grab = resolveGrab(world, ins);
+  const bldPutRole = world.has(ins.mount, 'Requester') ? 'request' : 'any';
+  const takeSource = () => {
+    if (ins.mode === 'out') return invPick(world, ins.mount, 'provide', ins.filter);   // 源=建筑
+    if (!grab) return null;                                                             // 源=抓取格
+    if (grab.kind === 'belt') {
+      const b = world.get(grab.eid, 'Belt'); if (!b) return null;
+      const it = beltTapPeek(b, grab.s, grab.window);
+      if (it == null || (ins.filter && ins.filter.length && !ins.filter.includes(it))) return null;
+      return beltTapTake(b, grab.s, grab.window);
+    }
+    return invPick(world, grab.eid, 'provide', ins.filter);
+  };
+  const putSink = (item) => {
+    if (ins.mode === 'in') return portPutUnit(world, { kind: 'inv', eid: ins.mount, role: bldPutRole }, item);   // 汇=建筑
+    if (!grab) return false;                                                                                     // 汇=抓取格
+    if (grab.kind === 'belt') { const b = world.get(grab.eid, 'Belt'); if (!b) return false; return beltTapPut(b, item, grab.s); }
+    return portPutUnit(world, { kind: 'inv', eid: grab.eid, role: (world.has(grab.eid, 'Requester') ? 'request' : 'any') }, item);
+  };
+  if (ins.carry != null) { if (putSink(ins.carry)) { ins.carry = null; return true; } return false; }
+  const it = takeSource(); if (it == null) return false;
+  if (!putSink(it)) ins.carry = it;
+  return true;
+}
+
+// 单个分拣器一帧(自动区分 网格版/端口版)
 export function stepInserter(world, dt, ins) {
   ins.charge = (ins.charge || 0) + (ins.rate || 1) * dt;
+  const grid = ins.mount != null;
   while (ins.charge >= 1) {
-    if (!doOneMove(world, ins)) break;                      // 停手(无货/背压), 保留余量
+    if (!(grid ? doOneMoveGrid(world, ins) : doOneMove(world, ins))) break;   // 停手(无货/背压), 保留余量
     ins.charge -= 1;
   }
   if (ins.charge > 1) ins.charge = 1;                       // 封顶: 阻塞时不无限累积, 疏通后至多补 1 次
@@ -57,7 +109,9 @@ export function createInserterSystem(opts = {}) {
     for (const e of world.query('Inserter')) {
       const ins = world.get(e, 'Inserter');
       if (phase !== 'all') {
-        const toBelt = ins.to && ins.to.kind === 'belt';
+        // 往带上放的分拣器归 'load'(带之前跑); 其余归 'unload'(带之后)。
+        // 网格版: 出料(建筑→抓取格)视作 load; 进料视作 unload。端口版: to 是 belt 视作 load。
+        const toBelt = ins.mount != null ? (ins.mode === 'out') : (ins.to && ins.to.kind === 'belt');
         if (phase === 'load' && !toBelt) continue;
         if (phase === 'unload' && toBelt) continue;
       }
