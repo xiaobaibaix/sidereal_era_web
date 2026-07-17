@@ -161,4 +161,19 @@ function makeCtx() {
   ok('存档: 占位/GridSlot 往返 + rebuildPadEdits 恢复整平');
 }
 
+// ---- 多高度重叠: padAt 返回最深(level 最低)平台(挖洞里点击吸附到低平台) ----
+{
+  const ctx = makeCtx(); const world = createWorld();
+  const padA = placeBuildPad(world, ctx, [0, 1, 0], { radius: 0.1, level: 0.5 });   // 上层大平台
+  const padB = placeBuildPad(world, ctx, [0, 1, 0], { radius: 0.04, level: 0.1 });  // 里面挖的低平台(更深)
+  // 重叠中心: 返回更深的 B
+  const hitCenter = padAt(world, [0, 1, 0]);
+  assert.equal(hitCenter.eid, padB, '重叠处 padAt 返回最深(低 level)平台');
+  // A 内、B 外(角距离 0.07: <0.1 且 >0.04): 返回 A
+  const dOut = [Math.sin(0.07), Math.cos(0.07), 0];
+  const hitA = padAt(world, dOut);
+  assert.equal(hitA.eid, padA, 'B 外 A 内 → 返回 A');
+  ok('多高度重叠: padAt 取最深平台');
+}
+
 console.log(`\nG1/G3/G4 建造平台+吸附+存档 全部通过 (${pass} 组断言)`);

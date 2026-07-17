@@ -96,10 +96,12 @@ export function createFactoryApp(opts) {
   let _cursor = null;      // 最近一次鼠标屏幕坐标(驱动网格虚影预览)
 
   const showsGrid = (m) => m === '平整地面' || m.startsWith('放置');
+  let _gridManual = false;   // B 键手动网格显隐(与放置模式自动显示叠加)
+  const updateGridVis = () => factoryRenderer.showBuildGrids(_gridManual || showsGrid(fpTool.mode));
   const fpGui = new GUI({ title: '🏭 工厂', container });
   fpGui.add(fpTool, 'mode', ['关闭', '平整地面', '放置矿场', '圈定挖掘区', '放置冶炼炉', '放置制造台', '放置研究站', '放置仓库', '放置输电塔', '放置发电机', '放置发动机', '点火发动机',
     '放置传送带', '放置分拣器', '放置过滤分拣器', '放置分流器', '放置装货站', '放置卸货站', '拆除']).name('模式').listen()
-    .onChange((v) => { if (v !== '关闭') onModeActivate(); _beltStart = null; _beltPrev = null; factoryRenderer.showBuildGrids(showsGrid(v)); });
+    .onChange((v) => { if (v !== '关闭') onModeActivate(); _beltStart = null; _beltPrev = null; updateGridVis(); });
   fpGui.add(fpTool, 'excavatorCount', 1, 20, 1).name('挖机数量');
   fpGui.add(fpTool, 'spawnExcavators').name('生成挖机');
   fpGui.add(fpTool, 'mineTruckCount', 1, 20, 1).name('采矿车数量');
@@ -378,19 +380,42 @@ export function createFactoryApp(opts) {
     const eid = pickEntity(e.clientX, e.clientY);
     if (eid != null) inspector.show(eid); else inspector.hide();
   };
+  // 退出放置模式(切回"关闭"): 供右键调用
+  function exitMode() {
+    if (fpTool.mode === '关闭') return false;
+    fpTool.mode = '关闭';
+    endBeltPath();
+    updateGridVis();
+    showToast('已退出放置模式', false);
+    return true;
+  }
   const onKey = (e) => {
     if (e.key === 'Escape') {
       if (endBeltPath()) showToast('已结束传送带', false);
+      else exitMode();
       inspector.hide();
     }
     else if (e.key === 'r' || e.key === 'R') { _quarter = (_quarter + 1) % 4; }   // 网格放置: 旋转 90°
+    else if (e.key === 'b' || e.key === 'B') { _gridManual = !_gridManual; updateGridVis(); showToast(_gridManual ? '网格: 常显(再按 B 关闭)' : '网格: 仅放置模式显示', false); }
   };
   const onPointerMove = (e) => { _cursor = { x: e.clientX, y: e.clientY }; };
+  // 右键单击(非拖拽) → 退出放置模式; 拖拽保留给相机
+  let _rDown = null;
+  const onRightDown = (e) => { if (e.button === 2) _rDown = { x: e.clientX, y: e.clientY }; };
+  const onRightUp = (e) => {
+    if (e.button !== 2 || !_rDown) return;
+    const moved = Math.hypot(e.clientX - _rDown.x, e.clientY - _rDown.y); _rDown = null;
+    if (moved <= 5 && fpTool.mode !== '关闭') exitMode();
+  };
+  const onContext = (e) => { if (fpTool.mode !== '关闭') e.preventDefault(); };   // 放置模式下屏蔽浏览器右键菜单
   dom.addEventListener('pointerdown', onPlaceDown);
   dom.addEventListener('pointerup', onPlaceUp);
   dom.addEventListener('pointerdown', onInspectDown);
   dom.addEventListener('pointerup', onInspectUp);
   dom.addEventListener('pointermove', onPointerMove);
+  dom.addEventListener('pointerdown', onRightDown);
+  dom.addEventListener('pointerup', onRightUp);
+  dom.addEventListener('contextmenu', onContext);
   window.addEventListener('keydown', onKey);
 
   // ---- 状态 ----
@@ -428,6 +453,8 @@ export function createFactoryApp(opts) {
       dom.removeEventListener('pointerdown', onPlaceDown); dom.removeEventListener('pointerup', onPlaceUp);
       dom.removeEventListener('pointerdown', onInspectDown); dom.removeEventListener('pointerup', onInspectUp);
       dom.removeEventListener('pointermove', onPointerMove);
+      dom.removeEventListener('pointerdown', onRightDown); dom.removeEventListener('pointerup', onRightUp);
+      dom.removeEventListener('contextmenu', onContext);
       window.removeEventListener('keydown', onKey);
       fpGui.destroy(); techGui.destroy(); dbgGui.destroy(); inspector.dispose(); factoryRenderer.dispose(); toastEl.remove();
     },

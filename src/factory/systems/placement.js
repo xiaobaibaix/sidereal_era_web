@@ -154,13 +154,16 @@ export function placeBuilding(world, ctx, buildingId, dir, yaw = 0) {
   return e;
 }
 
-// 找包含某方向的建造平台, 返回 { eid, pad } 或 null
+// 找包含某方向的建造平台; 多个重叠时返回"最深(level 最低)"的那个(洞里点击吸附到低平台)。返回 { eid, pad } 或 null
 export function padAt(world, dir) {
+  let best = null, bestLevel = Infinity;
   for (const pe of world.query('BuildPad')) {
     const p = world.get(pe, 'BuildPad');
-    if (angle(p.center, dir) <= p.radius) return { eid: pe, pad: p };
+    if (angle(p.center, dir) > p.radius) continue;
+    const lv = p.level != null ? p.level : 0;
+    if (best == null || lv < bestLevel - 1e-9) { best = { eid: pe, pad: p }; bestLevel = lv; }
   }
-  return null;
+  return best;
 }
 
 // 网格吸附放置: dir 落在某平台内 → 吸附格点 + 对齐朝向 + footprint 占位检查(占用则拒);
