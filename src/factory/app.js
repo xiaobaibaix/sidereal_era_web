@@ -17,7 +17,7 @@ import * as THREE from 'three';
 import GUI from 'lil-gui';
 import { createFactory } from './factory.js';
 import gameData from './data/gamedata.js';
-import { createMiningCrewSystem, setDigZone, spawnExcavators, spawnMineTrucks } from './systems/mining_crew.js';
+import { createMiningCrewSystem, placeDigZoneEntity, getDepotCoverage, spawnExcavators, spawnMineTrucks } from './systems/mining_crew.js';
 import { createProductionSystem } from './systems/production.js';
 import { createPowerSystem } from './systems/power.js';
 import { createResearchSystem } from './systems/research.js';
@@ -59,7 +59,18 @@ export function createFactoryApp(opts) {
   factory.ctx.planetMass = planetMass;
 
   const factoryRenderer = createFactoryRenderer(scene, getPlanet(), { size });
-  const inspector = createInspector({ getWorld: () => factory.world, registry: factory.registry, getPower: () => factory.ctx.power });
+  const inspector = createInspector({
+    getWorld: () => factory.world, registry: factory.registry, getPower: () => factory.ctx.power,
+    onAction: (eid, action, n) => {
+      if (action === 'spawn_excavators') {
+        spawnExcavators(factory.world, factory.ctx, n || 3, eid);
+        showToast(`已生成 ${n || 3} 台挖机 · 归属此矿场`, false);
+      } else if (action === 'spawn_minetrucks') {
+        spawnMineTrucks(factory.world, factory.ctx, n || 3, eid);
+        showToast(`已生成 ${n || 3} 辆采矿车 · 归属此矿场`, false);
+      }
+    },
+  });
   const _ray = new THREE.Raycaster();
   const _ndc = new THREE.Vector2();
   let _acc = 0; const FIXED = 0.05;
@@ -82,8 +93,6 @@ export function createFactoryApp(opts) {
   // ---- 建造面板 ----
   const fpTool = {
     mode: '关闭',
-    excavatorCount: 3, spawnExcavators() { doSpawnExcavators(); },
-    mineTruckCount: 3, spawnMineTrucks() { doSpawnMineTrucks(); },
     haulerCount: 3, spawnHaulers() { doSpawnHaulers(); },
     showRanges: false, status: '待命',
   };
@@ -91,13 +100,9 @@ export function createFactoryApp(opts) {
   let _beltStart = null;   // 传送带折线放置: 当前段起点(球面方向)
   let _beltPrev = null;    // 上一段带实体(用于带↔带直连成折线)
   const fpGui = new GUI({ title: '🏭 工厂', container });
-  fpGui.add(fpTool, 'mode', ['关闭', '放置矿场', '圈定挖掘区', '放置冶炼炉', '放置制造台', '放置研究站', '放置仓库', '放置输电塔', '放置发电机', '放置发动机', '点火发动机',
+  fpGui.add(fpTool, 'mode', ['关闭', '放置矿场', '放置挖掘区', '放置冶炼炉', '放置制造台', '放置研究站', '放置仓库', '放置输电塔', '放置发电机', '放置发动机', '点火发动机',
     '放置传送带', '放置分拣器·上料', '放置分拣器·下料', '放置过滤分拣器·上料', '放置过滤分拣器·下料', '放置分流器', '放置装货站', '放置卸货站', '拆除']).name('模式').listen()
     .onChange((v) => { if (v !== '关闭') onModeActivate(); _beltStart = null; _beltPrev = null; });
-  fpGui.add(fpTool, 'excavatorCount', 1, 20, 1).name('挖机数量');
-  fpGui.add(fpTool, 'spawnExcavators').name('生成挖机');
-  fpGui.add(fpTool, 'mineTruckCount', 1, 20, 1).name('采矿车数量');
-  fpGui.add(fpTool, 'spawnMineTrucks').name('生成采矿车');
   fpGui.add(fpTool, 'haulerCount', 1, 20, 1).name('物流车数量');
   fpGui.add(fpTool, 'spawnHaulers').name('生成物流车');
   fpGui.add(fpTool, 'showRanges').name('显示可点击范围').onChange((v) => factoryRenderer.showPickRanges(v));
@@ -144,28 +149,9 @@ export function createFactoryApp(opts) {
     if (parts.length) techTool.status = parts.join(' · ');
   }
 
-  function firstDepotWithZone() {
-    let any = null;
-    for (const e of factory.world.query('Depot', 'DigZone')) {
-      if (any == null) any = e;
-      const dz = factory.world.get(e, 'DigZone');
-      if (dz && dz.zones && dz.zones.length > 0) return e;
-    }
-    return any;
-  }
-  function doSpawnExcavators() {
-    const depot = firstDepotWithZone();
-    if (depot == null) { showToast('请先放置矿场', true); return; }
-    const dz = factory.world.get(depot, 'DigZone');
-    if (!dz || !dz.zones || dz.zones.length === 0) { showToast('请先圈定挖掘区(模式选「圈定挖掘区」点矿场旁)', true); return; }
-    spawnExcavators(factory.world, factory.ctx, fpTool.excavatorCount, depot);
-    showToast(`已生成 ${fpTool.excavatorCount} 台挖机`, false);
-  }
-  function doSpawnMineTrucks() {
-    const depot = firstDepotWithZone();
-    if (depot == null) { showToast('请先放置矿场', true); return; }
-    spawnMineTrucks(factory.world, factory.ctx, fpTool.mineTruckCount, depot);
-    showToast(`已生成 ${fpTool.mineTruckCount} 辆采矿车`, false);
+  function firstDepot() {
+    for (const e of factory.world.query('Depot')) return e;
+    return null;
   }
   function doSpawnHaulers() {
     let nearDir = [0, 1, 0];
@@ -271,11 +257,17 @@ export function createFactoryApp(opts) {
     const dir = [d.x, d.y, d.z];
     const m = fpTool.mode;
     if (m === '放置矿场') tryPlace('depot', dir, '已放置矿场 · 请圈定挖掘区并生成挖机/采矿车');
-    else if (m === '圈定挖掘区') {
-      const depot = factory.spatial.nearest(dir, (id) => factory.world.has(id, 'Depot'));
-      if (depot == null) { showToast('附近没有矿场, 请先放置矿场', true); return; }
-      setDigZone(factory.world, factory.ctx, depot, dir);
-      showToast('已圈定挖掘区 · 生成挖机+采矿车即可开采', false);
+    else if (m === '放置挖掘区') {
+      const z = placeDigZoneEntity(factory.world, factory.ctx, dir);
+      if (z == null) { showToast('放置挖掘区失败', true); return; }
+      // 找到覆盖该 zone 的矿场数(给用户即时反馈)
+      let n = 0;
+      for (const de of factory.world.query('Depot', 'Anchor')) {
+        const dep = factory.world.get(de, 'Depot');
+        const a = factory.world.get(de, 'Anchor');
+        if (sphAngle(a.dir, dir) <= (dep.coverageRadius || 0.16)) n++;
+      }
+      showToast(n > 0 ? `已放置挖掘区 · 覆盖范围内 ${n} 个矿场` : '已放置挖掘区(暂无矿场覆盖, 请放置矿场)', n === 0);
     } else if (m === '放置冶炼炉') tryPlace('smelter', dir, '已放置冶炼炉');
     else if (m === '放置制造台') tryPlace('assembler', dir, '已放置制造台');
     else if (m === '放置研究站') tryPlace('lab', dir, '已放置研究站 · 送铁锭进来提升发展度');

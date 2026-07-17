@@ -57,9 +57,12 @@ export const machineTypes = {
 };
 
 export const buildings = {
-  // 矿场: 被动容器。圈定挖掘区 + 生成挖机(挖) + 采矿卡车(运)后才会存入矿石; 下游物流卡车再从这里取货。
+  // 矿场: 被动容器。生成挖机(挖) + 采矿卡车(运)后才会存入矿石; 下游物流卡车再从这里取货。
+  // coverageRadius=矿场对**独立放置的挖掘区**的覆盖角半径; 覆盖内的区都可被该矿场的挖机开采。
   // digResolution=挖掘区顶点网格间距(角弧度); 越小越细越贵。zoneRadius=挖掘区角半径。
-  depot: { name: '矿场', kind: 'depot', mesh: 'depot', cap: 2000, zoneRadius: 0.05, digResolution: 0.005 },
+  depot: { name: '矿场', kind: 'depot', mesh: 'depot', cap: 2000, coverageRadius: 0.16, zoneRadius: 0.05, digResolution: 0.005 },
+  // 挖掘区(独立放置): 在矿场 coverageRadius 内即可被该矿场覆盖。多对多 — 一个区可被多个矿场覆盖, 一个矿场可覆盖多个区。
+  dig_zone: { name: '挖掘区', kind: 'digzone', mesh: 'digZone', zoneRadius: 0.05, digResolution: 0.005 },
   miner: { name: '采矿机 Mk1', kind: 'miner', machine: 'miner_mk1', mesh: 'miner', digRadius: 0.03, cap: 500 },   // 旧直挖矿机(遗留, UI 已改用矿场)
   warehouse: { name: '仓库', kind: 'storage', mesh: 'warehouse', cap: 5000 },
   // 生产建筑: recipe=默认配方; recipes=可选配方列表; cap=库存(输入缓冲+输出); bufferMult=输入缓冲维持的配方份数

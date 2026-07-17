@@ -4,7 +4,6 @@
 import { createBelt } from './belt.js';
 import { midPortDir } from './inserter.js';
 import { norm } from '../core/sphere.js';
-import { syncDigZoneVertices } from './mining_crew.js';
 
 // 放置一个建筑; 返回实体 id(失败返回 null)
 export function placeBuilding(world, ctx, buildingId, dir, yaw = 0) {
@@ -32,14 +31,12 @@ export function placeBuilding(world, ctx, buildingId, dir, yaw = 0) {
     world.add(e, 'Storage', {});
     world.add(e, 'Inventory', { items: {}, cap: b.cap != null ? b.cap : Infinity });
   } else if (b.kind === 'depot') {
-    // 矿场: 被动容器(自身不挖)。圈定挖掘区(DigZone.zones[])+挖机+采矿卡车后才有货进来。
-    world.add(e, 'Depot', {});
+    // 矿场: 被动容器(自身不挖)。覆盖范围内(R5)的独立挖掘区实体被自动绑定到该矿场;
+    // 矿场生成挖机/采矿卡车后, 挖机去覆盖范围内的挖掘区开采 → 卡车运回该矿场。
+    // coverageRadius=覆盖角半径(来自 building 表); coverageZones=每 tick 由 mining_crew 刷新的 zone eid 列表。
+    world.add(e, 'Depot', { coverageRadius: b.coverageRadius || 0.16, coverageZones: [] });
     world.add(e, 'Inventory', { items: {}, cap: b.cap != null ? b.cap : Infinity });
     world.add(e, 'Provider', { items: '*' });   // 对外供应存储的一切
-    // DigZone.zones: 该矿场可圈定多个独立挖掘区(每点一次"圈定挖掘区"加一个); null/空数组=未圈定。
-    // 每个 zone = { id, center, radius, resolution, planeH, depth, vertices:[...] }。
-    // radius/resolution 默认值存到 building 上, setDigZone 时拷到具体 zone。
-    world.add(e, 'DigZone', { zones: null, _defRadius: b.zoneRadius || 0.05, _defResolution: b.digResolution || 0.005 });
   } else if (b.kind === 'producer') {
     const recipeId = b.recipe || (b.recipes && b.recipes[0]);
     const recipe = registry.recipes[recipeId] || { in: [], out: [] };
@@ -191,8 +188,8 @@ export function demolish(world, ctx, eid) {
   };
   // 旧直挖矿机的坑(单 edit, key = eid)
   restoreOne(ctx.minerEdits && ctx.minerEdits.get(eid), ctx.minerEdits, eid);
-  // 矿场挖掘区圆形 edit(depth=0, 无视觉影响): 多 zone 场景下 ctx.zoneEdits 用 "eid:zoneId" 做 key,
-  // 同一矿场所有 zone 的 edit 都要清掉(避免泄漏)。
+  // 独立挖掘区(R5): ctx.zoneEdits key = zone 实体 eid。拆除 zone → 清其 dry edit。
+  // 旧版兼容: 还可能有 "eid:zoneId" 形式(depot 嵌套时代), 一并清。
   if (ctx.zoneEdits) {
     const prefix = eid + ':';
     for (const key of [...ctx.zoneEdits.keys()]) {
@@ -201,11 +198,25 @@ export function demolish(world, ctx, eid) {
       }
     }
   }
-  const hadDigZone = world.has(eid, 'DigZone');
+  // 释放锁定到该实体的挖机(若是 zone 实体)
+  if (world.has(eid, 'DigZone')) {
+    for (const exE of world.query('Excavator')) {
+      const ex = world.get(exE, 'Excavator');
+      if (ex.targetZone === eid) { ex.targetZone = null; ex.targetVertex = null; ex.state = 'idle'; }
+    }
+  }
+  // 释放归属该 depot 的挖机/采矿卡车(depot 拆了, 它们失业)
+  if (world.has(eid, 'Depot')) {
+    for (const exE of world.query('Excavator')) {
+      const ex = world.get(exE, 'Excavator');
+      if (ex.depot === eid) world.destroy(exE);
+    }
+    for (const trE of world.query('MineTruck')) {
+      const tr = world.get(trE, 'MineTruck');
+      if (tr.depot === eid) world.destroy(trE);
+    }
+  }
   if (spatial) spatial.remove(eid);
   world.destroy(eid);
-  // 顶点网格同步: 已销毁的 depot 的 zone 会从"活跃集合"消失, 但其顶点级变形(已挖的坑)
-  // 通过 syncDigZoneVertices 的"按 id 永久保留"语义继续留在 planet.params.digZoneVertices 里。
-  if (hadDigZone) syncDigZoneVertices(world, ctx);
   if (bus) bus.emit('demolish', { eid });
 }

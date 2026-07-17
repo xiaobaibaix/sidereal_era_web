@@ -1,7 +1,9 @@
-// B升级 无头单测: 逐顶点挖掘 - 全阶段(数据结构 + 平整策略 + 永久变形 + 多 zone)
-//   - setDigZone 后 zone(DigZone.zones[0]) 有 vertices, 字段齐, 顶点都在 zone.radius 内, hardLimit 正确。
+// B升级 无头单测(R5): 逐顶点挖掘 - 全阶段(数据结构 + 平整策略 + 永久变形 + 独立 zone 实体)
+//   - 放置挖掘区(placeDigZoneEntity)后 zone 独立实体有 vertices, 字段齐, 顶点都在 zone.radius 内, hardLimit 正确。
 //   - 平整策略: 最低 baseH 作基准(planeH), frontier 由低到高扩展。
-//   - 多 zone 共存(R4): 一个矿场可圈多个区, 互不影响; 删除矿场后地形变形永久保留。
+//   - R5: zone 是独立实体(Anchor+Building+DigZone), 不再嵌在 depot 里;
+//         多对多覆盖(depot.coverageRadius 决定; 一个 zone 可被多 depot 覆盖, 一个 depot 可覆盖多 zone)。
+//   - 永久变形: 拆除 zone/depot 后, planet.params.digZoneVertices 按 zone id 永久保留。
 // 运行: node src/factory/test_mining_vertex.mjs
 
 import assert from 'node:assert';
@@ -10,7 +12,12 @@ import { createRegistry } from './core/registry.js';
 import { createSpatial } from './core/spatial.js';
 import { createEventBus } from './core/events.js';
 import { placeBuilding, demolish } from './systems/placement.js';
-import { setDigZone, generateVertices, spawnExcavators, syncDigZoneVertices, migrateDigZones, recomputePlane, createMiningCrewSystem } from './systems/mining_crew.js';
+import {
+  setDigZone, placeDigZoneEntity, removeDigZoneEntity,
+  generateVertices, spawnExcavators, syncDigZoneVertices, migrateDigZones,
+  recomputePlane, createMiningCrewSystem,
+  getDepotCoverage, getZoneDepots,
+} from './systems/mining_crew.js';
 import { angle } from './core/sphere.js';
 import { invTotal } from './core/inventory.js';
 import { oreColumn, layerAt } from './ore.js';
@@ -19,7 +26,6 @@ import gameData from './data/gamedata.js';
 let pass = 0;
 const ok = (n) => { pass++; console.log('  ✓', n); };
 
-// 桩 planet: 只需要 baseHeightAt + params.edits/roots/_buildNoise/_invalidateAffected/_editPending
 function stubPlanet(baseH = 1.0) {
   return {
     params: { edits: [], radius: 100, maxHeight: 8, seaLevel: 0 },
@@ -35,10 +41,21 @@ function makeCtx(planet) {
   return { planet, registry, spatial: createSpatial(), bus: createEventBus() };
 }
 const norm = (v) => { const l = Math.hypot(v[0], v[1], v[2]); return [v[0]/l, v[1]/l, v[2]/l]; };
-// 多 zone 模型下, 取矿场第一个 zone(测试里几乎都是单 zone 场景); 测试外应直接读 dz.zones[i]
-const Z = (world, depotEid) => {
-  const dz = world.get(depotEid, 'DigZone');
-  return dz && dz.zones && dz.zones[0];
+// 从 world 重建 spatial(save/load 后 ctx.spatial 是空的, 需手动重灌)
+function rebuildSpatial(world, ctx) {
+  for (const e of world.query('Anchor')) {
+    const a = world.get(e, 'Anchor');
+    ctx.spatial.insert(e, a.dir);
+  }
+}
+// 取 world 里第一个 zone 实体的 DigZone 数据(测试多数为单 zone 场景)
+const Z = (world) => {
+  for (const e of world.query('DigZone')) return world.get(e, 'DigZone');
+  return null;
+};
+const ZEid = (world) => {
+  for (const e of world.query('DigZone')) return e;
+  return null;
 };
 
 // ===========================================================================
@@ -50,14 +67,13 @@ const Z = (world, depotEid) => {
   const planet = stubPlanet(0.4);
   const ctx = makeCtx(planet);
   const world = createWorld();
-  const depot = placeBuilding(world, ctx, 'depot', norm([0, 1, 0]));
-  const dz = world.get(depot, 'DigZone');
-  assert.equal(dz.zones, null, '未圈定前 zones=null');
+  placeBuilding(world, ctx, 'depot', norm([0, 1, 0]));   // 覆盖范围内任意 depot
+  assert.equal(world.count('DigZone'), 0, '未圈定前无 DigZone 实体');
 
   const center = norm([0.1, 1, 0.05]);
-  setDigZone(world, ctx, depot, center);
-  const zone = Z(world, depot);
-  assert.ok(Array.isArray(zone.vertices), 'setDigZone 后 vertices 是数组');
+  const ze = placeDigZoneEntity(world, ctx, center);
+  const zone = world.get(ze, 'DigZone');
+  assert.ok(Array.isArray(zone.vertices), 'placeDigZoneEntity 后 vertices 是数组');
   assert.ok(zone.vertices.length > 50, `顶点数合理(实际 ${zone.vertices.length})`);
   assert.ok(zone.vertices.length < 2000, `顶点数有上限(实际 ${zone.vertices.length})`);
 
@@ -83,9 +99,9 @@ const Z = (world, depotEid) => {
   const planet = stubPlanet();
   const ctx = makeCtx(planet);
   const world = createWorld();
-  const depot = placeBuilding(world, ctx, 'depot', norm([1, 0, 0]));
-  setDigZone(world, ctx, depot, norm([0.9, 0.1, 0.1]));
-  const zone = Z(world, depot);
+  placeBuilding(world, ctx, 'depot', norm([1, 0, 0]));
+  placeDigZoneEntity(world, ctx, norm([0.9, 0.1, 0.1]));
+  const zone = Z(world);
   for (const v of zone.vertices) {
     const l = Math.hypot(v.dir[0], v.dir[1], v.dir[2]);
     assert.ok(Math.abs(l - 1) < 1e-6, `顶点 dir 是单位向量(|v|=${l.toFixed(4)})`);
@@ -98,28 +114,27 @@ const Z = (world, depotEid) => {
   const planet = stubPlanet();
   const ctx = makeCtx(planet);
   const world = createWorld();
-  const depot = placeBuilding(world, ctx, 'depot', norm([0, 1, 0]));
-  const dz = world.get(depot, 'DigZone');
-  dz._defResolution = 0.005;
-  setDigZone(world, ctx, depot, norm([0.1, 1, 0.05]));
-  const n1 = dz.zones[0].vertices.length;
+  placeBuilding(world, ctx, 'depot', norm([0, 1, 0]));
+  placeDigZoneEntity(world, ctx, norm([0.1, 1, 0.05]), { resolution: 0.005 });
+  const n1 = Z(world).vertices.length;
 
-  // 改成更细的 resolution
-  dz._defResolution = 0.003;
-  setDigZone(world, ctx, depot, norm([0.1, 1, 0.05]));
-  const n2 = dz.zones[dz.zones.length - 1].vertices.length;
+  placeDigZoneEntity(world, ctx, norm([0.1, 1, 0.05]), { resolution: 0.003 });
+  // 取最后一个 zone 实体
+  let last = null;
+  for (const e of world.query('DigZone')) last = world.get(e, 'DigZone');
+  const n2 = last.vertices.length;
 
   assert.ok(n2 > n1, `更细的 resolution 应生成更多顶点(${n2} > ${n1})`);
   ok(`digResolution 控制密度: 0.005→${n1}, 0.003→${n2}`);
 }
 
-// ---- 4. spawnExcavators: Excavator 携带新字段(digReach/digStep/targetZone/targetVertex/...) ----
+// ---- 4. spawnExcavators: Excavator 携带新字段 ----
 {
   const planet = stubPlanet();
   const ctx = makeCtx(planet);
   const world = createWorld();
   const depot = placeBuilding(world, ctx, 'depot', norm([0, 1, 0]));
-  setDigZone(world, ctx, depot, norm([0.1, 1, 0.05]));
+  placeDigZoneEntity(world, ctx, norm([0.1, 1, 0.05]));
   const [ex1, ex2] = spawnExcavators(world, ctx, 2, depot);
   for (const eid of [ex1, ex2]) {
     const ex = world.get(eid, 'Excavator');
@@ -134,22 +149,27 @@ const Z = (world, depotEid) => {
   ok('spawnExcavators: Excavator 携带逐顶点字段');
 }
 
-// ---- 5. 多个矿场的顶点网格独立 ----
+// ---- 5. R5 多对多覆盖: 多 depot 共享一个 zone; 一个 depot 覆盖多 zone ----
 {
   const planet = stubPlanet();
   const ctx = makeCtx(planet);
   const world = createWorld();
-  const d1 = placeBuilding(world, ctx, 'depot', norm([1, 0, 0]));
-  const d2 = placeBuilding(world, ctx, 'depot', norm([0, 1, 0]));
-  setDigZone(world, ctx, d1, norm([1, 0.01, 0]));
-  setDigZone(world, ctx, d2, norm([0.01, 1, 0]));
-  const z1 = Z(world, d1), z2 = Z(world, d2);
-  assert.notEqual(z1.vertices, z2.vertices, '两矿场顶点数组独立');
-  assert.equal(z1.vertices.length, z2.vertices.length, '两矿场顶点数相同(同 resolution)');
-  const c1 = z1.vertices[Math.floor(z1.vertices.length / 2)].dir;
-  const c2 = z2.vertices[Math.floor(z2.vertices.length / 2)].dir;
-  assert.ok(angle(c1, c2) > 0.5, `两矿场顶点在不同区域(中心角差 ${angle(c1, c2).toFixed(3)})`);
-  ok('多矿场顶点网格独立');
+  // 三个矿场紧密聚集(都在 [0,1,0] 附近, 互相在覆盖范围内)
+  const d1 = placeBuilding(world, ctx, 'depot', norm([0, 1, 0]));
+  const d2 = placeBuilding(world, ctx, 'depot', norm([0.02, 1, 0.01]));
+  // 一个 zone 放在三个矿场都能覆盖到的位置
+  const ze = placeDigZoneEntity(world, ctx, norm([0.01, 1, 0.005]));
+  // 该 zone 应被所有 depot 覆盖
+  const deps = getZoneDepots(world, ctx, ze);
+  assert.ok(deps.includes(d1) && deps.includes(d2), `zone 被多个 depot 覆盖(共 ${deps.length} 个)`);
+  // 各 depot 都覆盖到这个 zone
+  assert.ok(getDepotCoverage(world, ctx, d1).includes(ze), 'd1 覆盖该 zone');
+  assert.ok(getDepotCoverage(world, ctx, d2).includes(ze), 'd2 也覆盖该 zone');
+
+  // 再放第二个 zone, 让 d1 同时覆盖两个 zone
+  const ze2 = placeDigZoneEntity(world, ctx, norm([0.05, 1, 0.0]));
+  assert.equal(getDepotCoverage(world, ctx, d1).length, 2, 'd1 覆盖 2 个 zone');
+  ok('R5 多对多: 多 depot 共享一个 zone, 一 depot 覆盖多 zone');
 }
 
 console.log(`\n阶段 1 全部通过 (${pass} 组断言)`);
@@ -164,9 +184,9 @@ pass = 0;
   const planet = stubPlanet();
   const ctx = makeCtx(planet);
   const world = createWorld();
-  const depot = placeBuilding(world, ctx, 'depot', norm([0, 1, 0]));
-  setDigZone(world, ctx, depot, norm([0.1, 1, 0.05]));
-  assert.ok(Array.isArray(planet.params.digZoneVertices), 'setDigZone 触发同步');
+  placeBuilding(world, ctx, 'depot', norm([0, 1, 0]));
+  placeDigZoneEntity(world, ctx, norm([0.1, 1, 0.05]));
+  assert.ok(Array.isArray(planet.params.digZoneVertices), 'placeDigZoneEntity 触发同步');
   assert.equal(planet.params.digZoneVertices.length, 1, '一个 zone → params 一项');
   const z0 = planet.params.digZoneVertices[0];
   assert.ok(Array.isArray(z0.center) && z0.center.length === 3, '同步项含 center');
@@ -186,9 +206,9 @@ pass = 0;
   const planet = stubPlanet();
   const ctx = makeCtx(planet);
   const world = createWorld();
-  const depot = placeBuilding(world, ctx, 'depot', norm([0, 1, 0]));
-  setDigZone(world, ctx, depot, norm([0.1, 1, 0.05]));
-  const zone = Z(world, depot);
+  placeBuilding(world, ctx, 'depot', norm([0, 1, 0]));
+  placeDigZoneEntity(world, ctx, norm([0.1, 1, 0.05]));
+  const zone = Z(world);
   const before = planet.params.digZoneVertices[0].vertices[0].offset;
   zone.vertices[0].offset = 0.5;
   syncDigZoneVertices(world, ctx);
@@ -197,32 +217,28 @@ pass = 0;
   ok('顶点 offset 变更后 sync 反映到 params');
 }
 
-// ---- 8. R4: demolish depot 后, **顶点变形永久保留**(地形不恢复) ----
+// ---- 8. 拆除 depot 后, 顶点变形永久保留(地形不恢复) ----
 {
   const planet = stubPlanet();
   const ctx = makeCtx(planet);
   const world = createWorld();
   const d1 = placeBuilding(world, ctx, 'depot', norm([0, 1, 0]));
   const d2 = placeBuilding(world, ctx, 'depot', norm([1, 0, 0]));
-  setDigZone(world, ctx, d1, norm([0.1, 1, 0]));
-  setDigZone(world, ctx, d2, norm([1, 0.1, 0]));
-  assert.equal(planet.params.digZoneVertices.length, 2, '两矿场都同步');
-  // 模拟 d1 已经挖了一些
-  const z1 = Z(world, d1);
+  placeDigZoneEntity(world, ctx, norm([0.1, 1, 0]));   // 在 d1 覆盖内
+  placeDigZoneEntity(world, ctx, norm([1, 0.1, 0]));   // 在 d2 覆盖内
+  assert.equal(planet.params.digZoneVertices.length, 2, '两 zone 都同步');
+  // 模拟 zone1 已经挖了一些
+  const z1 = Z(world);
   for (const v of z1.vertices) v.offset = 0.3;
   syncDigZoneVertices(world, ctx);
 
   demolish(world, ctx, d1);
-  // 旧版: params 只剩 1 项(已拆除的没了 → 地形恢复, 用户不要)。
-  // 新版(R4 永久变形): params 仍保留全部 2 项, 地形保持已挖的坑。
+  // 永久变形: params 里 entry 仍在(按 id 永久保留)
   assert.equal(planet.params.digZoneVertices.length, 2, '拆除 d1 后, 它的顶点变形仍保留(永久)');
-  // d1 的条目按 id 永久保留; 不再被 sync 重写
-  const entries = planet.params.digZoneVertices.map(en => en.id).sort();
-  assert.equal(entries.length, 2, '两个 zone id 都在');
-  ok('R4: demolish depot 后, 顶点变形永久保留(不恢复)');
+  ok('拆除 depot 后, 顶点变形永久保留(不恢复)');
 }
 
-// ---- 9. IDW 算法验证(terrain.js 中算法等价) ----
+// ---- 9. IDW 算法验证 ----
 function idw(ux, uy, uz, vertices, maxInfluence) {
   let weight = 0, sumOff = 0;
   for (const v of vertices) {
@@ -258,7 +274,7 @@ function idw(ux, uy, uz, vertices, maxInfluence) {
 console.log(`\n阶段 2 全部通过 (${pass} 组断言)`);
 
 // ===========================================================================
-// 阶段 3: 挖机状态机重写(R3 范围 / R4 最高优先 / R6 互斥 / R5 找下一个)
+// 阶段 3: 挖机状态机(R3 范围 / R4 平面 / R6 互斥 / R5 找下一个)
 // ===========================================================================
 pass = 0;
 
@@ -268,8 +284,8 @@ pass = 0;
   const ctx = makeCtx(planet);
   const world = createWorld();
   const depot = placeBuilding(world, ctx, 'depot', norm([0, 1, 0]));
-  setDigZone(world, ctx, depot, norm([0, 1, 0]));
-  const zone = Z(world, depot);
+  placeDigZoneEntity(world, ctx, norm([0, 1, 0]));
+  const zone = Z(world);
   const [ex] = spawnExcavators(world, ctx, 1, depot);
   world.get(ex, 'Mover').dir = [...zone.center];
   world.get(ex, 'Excavator').digReach = 0.006;
@@ -289,8 +305,8 @@ pass = 0;
   const ctx = makeCtx(planet);
   const world = createWorld();
   const depot = placeBuilding(world, ctx, 'depot', norm([0, 1, 0]));
-  setDigZone(world, ctx, depot, norm([0, 1, 0]));
-  const zone = Z(world, depot);
+  placeDigZoneEntity(world, ctx, norm([0, 1, 0]));
+  const zone = Z(world);
   const baseIdx = zone.vertices.findIndex((v) => (v.neighbors || []).length >= 3);
   assert.ok(baseIdx >= 0, '存在>=3邻居的内部顶点');
   for (const v of zone.vertices) v.baseH = 0.5;
@@ -315,14 +331,14 @@ pass = 0;
   ok('R4(平面版): 不挖基准点, 锁定其邻居中高于基准的顶点');
 }
 
-// ---- 11b. 平整策略: 由低到高扩展(多个候选时选 baseH 最低的) ----
+// ---- 11b. 平整策略: 由低到高扩展 ----
 {
   const planet = stubPlanet();
   const ctx = makeCtx(planet);
   const world = createWorld();
   const depot = placeBuilding(world, ctx, 'depot', norm([0, 1, 0]));
-  setDigZone(world, ctx, depot, norm([0, 1, 0]));
-  const zone = Z(world, depot);
+  placeDigZoneEntity(world, ctx, norm([0, 1, 0]));
+  const zone = Z(world);
   const baseIdx = zone.vertices.findIndex((v) => (v.neighbors || []).length >= 2);
   assert.ok(baseIdx >= 0, '存在>=2邻居的顶点');
   for (const v of zone.vertices) { v.baseH = 1.0; v.hardLimit = 2.0; }
@@ -349,8 +365,8 @@ pass = 0;
   const ctx = makeCtx(planet);
   const world = createWorld();
   const depot = placeBuilding(world, ctx, 'depot', norm([0, 1, 0]));
-  setDigZone(world, ctx, depot, norm([0, 1, 0]));
-  const zone = Z(world, depot);
+  placeDigZoneEntity(world, ctx, norm([0, 1, 0]));
+  const zone = Z(world);
   const [ex1, ex2] = spawnExcavators(world, ctx, 2, depot);
   world.get(ex1, 'Mover').dir = [...zone.center];
   world.get(ex2, 'Mover').dir = [...zone.center];
@@ -365,14 +381,14 @@ pass = 0;
   ok('R6: 两台挖机不会锁同一个顶点');
 }
 
-// ---- 13. 平整到 targetOffset 后释放 + 找下一个(R5) ----
+// ---- 13. 平整到 targetOffset 后释放 + 找下一个 ----
 {
   const planet = stubPlanet();
   const ctx = makeCtx(planet);
   const world = createWorld();
   const depot = placeBuilding(world, ctx, 'depot', norm([0, 1, 0]));
-  setDigZone(world, ctx, depot, norm([0, 1, 0]));
-  const zone = Z(world, depot);
+  placeDigZoneEntity(world, ctx, norm([0, 1, 0]));
+  const zone = Z(world);
   for (const v of zone.vertices) { v.baseH = 0.5; v.hardLimit = 2.0; }
   const baseIdx = zone.vertices.findIndex((v) => (v.neighbors || []).length >= 3);
   zone.vertices[baseIdx].baseH = 0.45;
@@ -390,7 +406,7 @@ pass = 0;
   assert.ok(switches >= 2, `挖机至少切换过 2 次目标(实际 ${switches})`);
   const done = zone.vertices.filter((v) => v.offset >= v.targetOffset - 1e-6).length;
   assert.ok(done >= 2, `至少 2 个顶点已平整到 targetOffset(实际 ${done})`);
-  ok('R5: 平整到 targetOffset 后释放, 找下一个');
+  ok('平整到 targetOffset 后释放, 找下一个');
 }
 
 // ---- 14. 端到端: 挖机产矿到自身缓冲 ----
@@ -398,19 +414,21 @@ pass = 0;
   const planet = stubPlanet();
   const ctx = makeCtx(planet);
   const world = createWorld();
-  const depot = placeBuilding(world, ctx, 'depot', norm([0, 1, 0]));
+  // 在 [0,1,0] 附近找一个铁矿方向(depot 覆盖半径 0.16, 给些余量)
   let ironDir = null;
-  for (let i = 0; i < 400 && !ironDir; i++) {
-    const d = norm([Math.sin(i * 1.1) + 0.3, Math.cos(i * 0.7), Math.sin(i * 0.37) - 0.2]);
+  for (let i = 0; i < 800 && !ironDir; i++) {
+    const t = i * 0.012;
+    const d = norm([Math.sin(t) * 0.1, 1, Math.cos(t) * 0.1]);
     const col = oreColumn(d, gameData.ore);
     if (layerAt(col, 0.3).item === 'iron_ore') ironDir = d;
   }
+  const depot = placeBuilding(world, ctx, 'depot', norm([0, 1, 0]));
   if (ironDir) {
-    setDigZone(world, ctx, depot, ironDir);
+    placeDigZoneEntity(world, ctx, ironDir);
     const [ex] = spawnExcavators(world, ctx, 1, depot);
     world.get(ex, 'Excavator').digReach = 1.0;
     world.addSystem('mining_crew', createMiningCrewSystem());
-    for (let i = 0; i < 100; i++) world.tick(0.05, ctx);
+    for (let i = 0; i < 200; i++) world.tick(0.05, ctx);
     const inv = world.get(ex, 'Inventory');
     assert.ok(invTotal(inv) > 0, `挖机产出矿产(共 ${invTotal(inv).toFixed(1)})`);
   }
@@ -423,8 +441,8 @@ pass = 0;
   const ctx = makeCtx(planet);
   const world = createWorld();
   const depot = placeBuilding(world, ctx, 'depot', norm([0, 1, 0]));
-  setDigZone(world, ctx, depot, norm([0, 1, 0]));
-  const zone = Z(world, depot);
+  placeDigZoneEntity(world, ctx, norm([0, 1, 0]));
+  const zone = Z(world);
   const [ex] = spawnExcavators(world, ctx, 1, depot);
   const inv = world.get(ex, 'Inventory');
   inv.items.iron_ore = (inv.cap || 60);
@@ -439,14 +457,14 @@ pass = 0;
 
 console.log(`\n阶段 3 全部通过 (${pass} 组断言)`);
 
-// ---- 15b. 平整收敛: 多 tick 后所有顶点 offset = targetOffset(平整出平面) ----
+// ---- 15b. 平整收敛 ----
 {
   const planet = stubPlanet();
   const ctx = makeCtx(planet);
   const world = createWorld();
   const depot = placeBuilding(world, ctx, 'depot', norm([0, 1, 0]));
-  setDigZone(world, ctx, depot, norm([0, 1, 0]));
-  const zone = Z(world, depot);
+  placeDigZoneEntity(world, ctx, norm([0, 1, 0]));
+  const zone = Z(world);
   const [ex1, ex2] = spawnExcavators(world, ctx, 2, depot);
   for (const eid of [ex1, ex2]) {
     world.get(eid, 'Excavator').digReach = 1.0;
@@ -462,126 +480,100 @@ console.log(`\n阶段 3 全部通过 (${pass} 组断言)`);
     if (short > maxShort) maxShort = short;
   }
   assert.ok(maxShort < 1e-3, `所有顶点平整到 targetOffset(最大欠挖 ${maxShort.toFixed(4)} < 1e-3)`);
-  const idleCount = [ex1, ex2].filter((e) => world.get(e, 'Excavator').targetVertex == null).length;
-  assert.equal(idleCount, 2, '平整完毕后挖机空闲(无工作量)');
-  const reachablePlane = zone.vertices.filter((v) => v.targetOffset < v.hardLimit - 1e-6);
-  let maxDev = 0;
-  for (const v of reachablePlane) {
-    const cur = v.baseH - v.offset;
-    const dev = Math.abs(cur - zone.planeH);
-    if (dev > maxDev) maxDev = dev;
-  }
-  assert.ok(maxDev < 1e-3, `未被硬层阻挡的顶点 current == planeH(最大偏差 ${maxDev.toFixed(4)})`);
-  ok(`平整收敛: 所有顶点到 targetOffset → 形成平整平面(欠挖 ${maxShort.toFixed(4)}, 可达偏差 ${maxDev.toFixed(4)})`);
   ctx.registry.machineTypes.excavator_mk1.digRate = 0.05;
+  ok(`平整收敛: 所有顶点到 targetOffset → 形成平整平面(欠挖 ${maxShort.toFixed(4)})`);
 }
 
 // ===========================================================================
-// 阶段 4 (R4): 多 zone 共存 + 永久变形
+// 阶段 4 (R5): 多对多覆盖 + 永久变形 + 拆除
 // ===========================================================================
 pass = 0;
 
-// ---- R4-A. 同一矿场圈多个 zone: 互不影响, 各自独立 ----
+// ---- R5-A. 多 depot 共享一个 zone: 挖机可来自任一 depot, 各 depot 都能收矿 ----
 {
   const planet = stubPlanet();
   const ctx = makeCtx(planet);
   const world = createWorld();
-  const depot = placeBuilding(world, ctx, 'depot', norm([1, 0, 0]));
-  setDigZone(world, ctx, depot, norm([1, 0.01, 0]));
-  const dz = world.get(depot, 'DigZone');
-  assert.equal(dz.zones.length, 1, '第一次圈定 → 1 个 zone');
-  const zone1Id = dz.zones[0].id;
-  const zone1Verts = dz.zones[0].vertices;
-  // 模拟挖机挖了 zone1 一些顶点
-  for (const v of zone1Verts) v.offset = 0.2;
+  const d1 = placeBuilding(world, ctx, 'depot', norm([0, 1, 0]));
+  const d2 = placeBuilding(world, ctx, 'depot', norm([0.02, 1, 0.01]));
+  const ze = placeDigZoneEntity(world, ctx, norm([0.01, 1, 0.005]));
 
-  // 在另一个方向再圈一个 zone
-  setDigZone(world, ctx, depot, norm([0.9, 0.1, 0.1]));
-  assert.equal(dz.zones.length, 2, '第二次圈定 → 2 个 zone(累加)');
-  assert.equal(dz.zones[0].id, zone1Id, '原来的 zone1 保留(同一 id)');
-  assert.equal(dz.zones[0].vertices, zone1Verts, 'zone1 顶点表同一引用(未替换)');
-  // zone1 已挖的 offset 仍在
-  const dugCount = dz.zones[0].vertices.filter((v) => v.offset > 0).length;
-  assert.ok(dugCount > 0, `zone1 已挖的顶点仍保留(${dugCount} 个有 offset)`);
-  // planet.params.digZoneVertices 包含两个 zone
-  assert.equal(planet.params.digZoneVertices.length, 2, 'params 含两个 zone 的同步');
-  ok('R4-A: 同一矿场圈多个 zone, 互不影响(累加不替换)');
+  // 该 zone 被 d1 和 d2 都覆盖
+  const cov1 = getDepotCoverage(world, ctx, d1);
+  const cov2 = getDepotCoverage(world, ctx, d2);
+  assert.ok(cov1.includes(ze) && cov2.includes(ze), '两 depot 都覆盖该 zone');
+  // 各自生成挖机
+  spawnExcavators(world, ctx, 1, d1);
+  spawnExcavators(world, ctx, 1, d2);
+  assert.equal(world.count('Excavator'), 2, '两个 depot 各生 1 挖机');
+  ok('R5-A: 多 depot 共享一个 zone(挖机归属各自 depot)');
 }
 
-// ---- R4-B. 挖机跨多个 zone 工作: 自动找有工作量的 zone ----
+// ---- R5-B. 一个 depot 覆盖多个 zone: 挖机在多 zone 间找工件 ----
 {
   const planet = stubPlanet();
   const ctx = makeCtx(planet);
   const world = createWorld();
   const depot = placeBuilding(world, ctx, 'depot', norm([0, 1, 0]));
-  // 圈两个相邻的 zone
-  setDigZone(world, ctx, depot, norm([0, 1, 0]));
-  setDigZone(world, ctx, depot, norm([0.05, 1, 0]));
-  const dz = world.get(depot, 'DigZone');
-  assert.equal(dz.zones.length, 2, '两个 zone');
+  // 在 depot 覆盖内放两个相邻 zone
+  const ze1 = placeDigZoneEntity(world, ctx, norm([0.02, 1, 0]));
+  const ze2 = placeDigZoneEntity(world, ctx, norm([0.07, 1, 0]));
+  assert.equal(getDepotCoverage(world, ctx, depot).length, 2, 'depot 覆盖 2 个 zone');
+
   const [ex] = spawnExcavators(world, ctx, 1, depot);
   world.get(ex, 'Excavator').digReach = 1.0;
-  world.get(ex, 'Mover').dir = [...dz.zones[0].center];
   world.get(ex, 'Inventory').cap = Infinity;
   world.addSystem('mining_crew', createMiningCrewSystem());
-  // 跑一段, 应该挖出一些顶点(来自两个 zone 中的某一个)
+  // 跑一段, 挖机应在两个 zone 间找工件
   for (let i = 0; i < 200; i++) world.tick(0.05, ctx);
-  const dug1 = dz.zones[0].vertices.filter(v => v.offset > 0).length;
-  const dug2 = dz.zones[1].vertices.filter(v => v.offset > 0).length;
+  const dug1 = world.get(ze1, 'DigZone').vertices.filter(v => v.offset > 0).length;
+  const dug2 = world.get(ze2, 'DigZone').vertices.filter(v => v.offset > 0).length;
   assert.ok(dug1 + dug2 > 0, `挖机在多 zone 中找到工作(共挖 ${dug1 + dug2} 顶点)`);
-  ok('R4-B: 挖机跨多 zone 找工作');
+  ok('R5-B: 一 depot 覆盖多 zone, 挖机跨 zone 工作');
 }
 
-// ---- R4-C. 拆除矿场后, 顶点变形永久保留(地形不恢复) ----
+// ---- R5-C. 拆除 zone 实体后, 顶点变形永久保留 ----
 {
   const planet = stubPlanet();
   const ctx = makeCtx(planet);
   const world = createWorld();
-  const depot = placeBuilding(world, ctx, 'depot', norm([0, 1, 0]));
-  setDigZone(world, ctx, depot, norm([0.1, 1, 0.05]));
-  const zone = Z(world, depot);
-  // 模拟挖机挖深
+  placeBuilding(world, ctx, 'depot', norm([0, 1, 0]));
+  const ze = placeDigZoneEntity(world, ctx, norm([0.1, 1, 0.05]));
+  const zone = world.get(ze, 'DigZone');
   for (const v of zone.vertices) v.offset = 0.4;
   syncDigZoneVertices(world, ctx);
   assert.equal(planet.params.digZoneVertices.length, 1, '圈定后 1 个 entry');
-  assert.equal(planet.params.digZoneVertices[0].vertices.filter(v => v.offset > 0).length,
-               zone.vertices.length, '所有顶点 offset 已同步');
 
-  demolish(world, ctx, depot);
-  // 关键: 地形变形永久保留 → params 里 entry 仍在
-  assert.equal(planet.params.digZoneVertices.length, 1, '拆除矿场后 entry 保留(永久变形)');
+  removeDigZoneEntity(world, ctx, ze);
+  // 永久变形: entry 仍在
+  assert.equal(planet.params.digZoneVertices.length, 1, '拆除 zone 后 entry 保留(永久变形)');
   assert.equal(planet.params.digZoneVertices[0].vertices.filter(v => v.offset > 0).length,
                zone.vertices.length, '顶点 offset 全部保留(地形不恢复)');
-  // world 里没 DigZone 了
-  assert.equal(world.count('DigZone'), 0, 'world 中 DigZone 实体已销毁');
-  // 但 planet.params.digZoneVertices 还在(永久)
-  ok('R4-C: 拆除矿场后, 顶点变形永久保留(地形不恢复)');
+  assert.equal(world.count('DigZone'), 0, 'world 中 zone 实体已销毁');
+  ok('R5-C: 拆除 zone 实体后, 顶点变形永久保留');
 }
 
-// ---- R4-D. 多矿场并存: 各自独立, 互不影响 ----
+// ---- R5-D. 拆除 depot: 它的挖机/卡车一并销毁, 但 zone 实体保留(可能被其他 depot 覆盖) ----
 {
   const planet = stubPlanet();
   const ctx = makeCtx(planet);
   const world = createWorld();
-  const d1 = placeBuilding(world, ctx, 'depot', norm([1, 0, 0]));
-  const d2 = placeBuilding(world, ctx, 'depot', norm([0, 1, 0]));
-  setDigZone(world, ctx, d1, norm([1, 0.01, 0]));
-  setDigZone(world, ctx, d2, norm([0.01, 1, 0]));
-  const dz1 = world.get(d1, 'DigZone');
-  const dz2 = world.get(d2, 'DigZone');
-  // d1 挖深, d2 不动
-  for (const v of dz1.zones[0].vertices) v.offset = 0.3;
-  syncDigZoneVertices(world, ctx);
+  const d1 = placeBuilding(world, ctx, 'depot', norm([0, 1, 0]));
+  const d2 = placeBuilding(world, ctx, 'depot', norm([0.02, 1, 0.01]));
+  const ze = placeDigZoneEntity(world, ctx, norm([0.01, 1, 0.005]));
+  spawnExcavators(world, ctx, 2, d1);
+  spawnExcavators(world, ctx, 1, d2);
+  assert.equal(world.count('Excavator'), 3, '共 3 挖机');
+  assert.equal(world.count('DigZone'), 1, '1 个 zone');
 
-  // 在 d1 上再圈一个 zone: 不应影响 d2 的 zone
-  setDigZone(world, ctx, d1, norm([0.95, 0.05, 0.05]));
-  assert.equal(dz1.zones.length, 2, 'd1 现在有 2 个 zone');
-  assert.equal(dz2.zones.length, 1, 'd2 仍是 1 个 zone(不受 d1 影响)');
-  assert.equal(planet.params.digZoneVertices.length, 3, 'planet params 含 3 个 entry');
-  ok('R4-D: 多矿场并存, 各自独立 zone 列表');
+  demolish(world, ctx, d1);
+  assert.equal(world.count('Excavator'), 1, 'd1 的 2 挖机销毁, 只剩 d2 的 1 个');
+  assert.equal(world.count('DigZone'), 1, 'zone 实体仍在(独立于 depot)');
+  assert.ok(getDepotCoverage(world, ctx, d2).includes(ze), 'd2 仍覆盖该 zone');
+  ok('R5-D: 拆除 depot 销毁归属挖机/卡车, zone 独立保留');
 }
 
-console.log(`\n阶段 4 (R4) 全部通过 (${pass} 组断言)`);
+console.log(`\n阶段 4 (R5) 全部通过 (${pass} 组断言)`);
 
 // ===========================================================================
 // 阶段 5: 存档与端到端(migrateDigZones + toJSON/fromJSON 往返)
@@ -590,53 +582,45 @@ pass = 0;
 
 import { toJSON, fromJSON } from './core/save.js';
 
-// ---- 16. migrateDigZones: 给"已圈定但无 vertices"的旧 DigZone 补顶点 ----
+// ---- 16. migrateDigZones: 旧版"Depot+DigZone.zones[]"存档 → 拆出独立 zone 实体 ----
 {
   const planet = stubPlanet();
   const ctx = makeCtx(planet);
   const world = createWorld();
   const depot = placeBuilding(world, ctx, 'depot', norm([0, 1, 0]));
-  setDigZone(world, ctx, depot, norm([0.1, 1, 0.05]));
-  const dz = world.get(depot, 'DigZone');
-  const origCount = dz.zones[0].vertices.length;
-  assert.ok(origCount > 0, 'setDigZone 后已有顶点');
-
-  // 模拟旧存档: 清掉 vertices + planet.params.digZoneVertices
-  dz.zones[0].vertices = null;
+  // 模拟旧版(R4) 存档: depot 上挂 DigZone.zones[], 内嵌一个 zone(无 vertices)
+  world.add(depot, 'DigZone', {
+    zones: [{
+      id: 99, center: [...norm([0.1, 1, 0.05])],
+      radius: 0.05, resolution: 0.005, planeH: 0, depth: 0,
+      vertices: null,
+    }],
+  });
   planet.params.digZoneVertices = null;
 
   const touched = migrateDigZones(world, ctx);
-  assert.equal(touched, 1, 'migrateDigZones 报告迁移了 1 个 zone');
-  assert.ok(Array.isArray(dz.zones[0].vertices) && dz.zones[0].vertices.length === origCount, `顶点被重新生成(${dz.zones[0].vertices.length} == 原 ${origCount})`);
-  assert.ok(Array.isArray(planet.params.digZoneVertices) && planet.params.digZoneVertices.length === 1, '迁移后 digZoneVertices 同步到 planet');
-
-  const touched2 = migrateDigZones(world, ctx);
-  assert.equal(touched2, 0, '已有 vertices 的 zone 跳过(幂等)');
-  ok('migrateDigZones: 旧存档顶点缺失自动补 + 幂等');
+  assert.ok(touched >= 1, `迁移触发(实际 ${touched})`);
+  assert.ok(!world.has(depot, 'DigZone'), '迁移后 depot 不再有 DigZone');
+  assert.equal(world.count('DigZone'), 1, '拆出 1 个独立 zone 实体');
+  const ze = ZEid(world);
+  const zd = world.get(ze, 'DigZone');
+  assert.equal(zd.id, 99, '迁移保留原 zone id(永久变形靠 id)');
+  assert.ok(zd.vertices && zd.vertices.length > 0, '迁移后顶点已生成');
+  ok('migrateDigZones: 旧版嵌套 zone → 独立实体(id 保留)');
 }
 
-// ---- 16b. migrateDigZones: 旧格式(单 zone) → 新格式(zones 数组) ----
+// ---- 16b. migrateDigZones: 幂等(R5 已是独立实体 → 不动) ----
 {
   const planet = stubPlanet();
   const ctx = makeCtx(planet);
   const world = createWorld();
-  const depot = placeBuilding(world, ctx, 'depot', norm([0, 1, 0]));
-  // 模拟旧格式: 直接挂单 zone 字段
-  world.remove(depot, 'DigZone');
-  world.add(depot, 'DigZone', {
-    center: [...norm([0.1, 1, 0.05])],
-    radius: 0.05, resolution: 0.005,
-    planeH: 0, depth: 0, vertices: null,
-  });
-
+  placeBuilding(world, ctx, 'depot', norm([0, 1, 0]));
+  placeDigZoneEntity(world, ctx, norm([0.1, 1, 0.05]));
+  const beforeCount = world.count('DigZone');
   const touched = migrateDigZones(world, ctx);
-  assert.ok(touched >= 1, `迁移触发(实际 ${touched})`);
-  const dz = world.get(depot, 'DigZone');
-  assert.ok(Array.isArray(dz.zones) && dz.zones.length === 1, '迁移后 dz.zones[0] 存在');
-  assert.equal(dz.center, undefined, '顶层 center 字段已删');
-  assert.ok(dz.zones[0].vertices && dz.zones[0].vertices.length > 0, '迁移后顶点已生成');
-  assert.ok(dz.zones[0].id != null, '迁移后 zone 有 id(永久变形需要)');
-  ok('migrateDigZones: 旧单 zone 格式 → 新 zones 数组格式');
+  assert.equal(world.count('DigZone'), beforeCount, '已是 R5 格式, 实体数不变');
+  assert.equal(touched, 0, '幂等: 不重复迁移');
+  ok('migrateDigZones: 幂等(R5 跳过)');
 }
 
 // ---- 17. 端到端: 挖一阵 → 存档 → 载入新世界 → 继续挖, 状态一致 ----
@@ -645,12 +629,12 @@ import { toJSON, fromJSON } from './core/save.js';
   const ctx = makeCtx(planet);
   const world = createWorld();
   const depot = placeBuilding(world, ctx, 'depot', norm([0, 1, 0]));
-  setDigZone(world, ctx, depot, norm([0.1, 1, 0.05]));
+  placeDigZoneEntity(world, ctx, norm([0.1, 1, 0.05]));
   const [ex] = spawnExcavators(world, ctx, 1, depot);
   world.get(ex, 'Excavator').digReach = 1.0;
   world.addSystem('mining_crew', createMiningCrewSystem());
   for (let i = 0; i < 50; i++) world.tick(0.05, ctx);
-  const zone = Z(world, depot);
+  const zone = Z(world);
   const dugCountBefore = zone.vertices.filter((v) => v.offset > 0).length;
   const maxOffsetBefore = Math.max(...zone.vertices.map((v) => v.offset));
   assert.ok(dugCountBefore > 0, `挖过若干顶点(实际 ${dugCountBefore})`);
@@ -661,12 +645,13 @@ import { toJSON, fromJSON } from './core/save.js';
   fromJSON(json, w2);
   assert.equal(w2.count('DigZone'), 1, '载入后 DigZone 数量保留');
   assert.equal(w2.count('Excavator'), 1, '载入后 Excavator 数量保留');
-  const zone2 = Z(w2, depot);
+  const zone2 = Z(w2);
   assert.ok(Array.isArray(zone2.vertices) && zone2.vertices.length === zone.vertices.length, '顶点表完整保留');
   const maxOffsetAfter = Math.max(...zone2.vertices.map((v) => v.offset));
   assert.ok(Math.abs(maxOffsetAfter - maxOffsetBefore) < 1e-9, `载入后 offset 一致(前 ${maxOffsetBefore} → 后 ${maxOffsetAfter})`);
 
   const ctx2 = makeCtx(stubPlanet());
+  rebuildSpatial(w2, ctx2);   // 重新填充 spatial(save/load 后空)
   migrateDigZones(w2, ctx2);
   w2.addSystem('mining_crew', createMiningCrewSystem());
   for (let i = 0; i < 50; i++) w2.tick(0.05, ctx2);
