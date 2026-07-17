@@ -88,6 +88,7 @@ export function createFactoryApp(opts) {
     mineTruckCount: 3, spawnMineTrucks() { doSpawnMineTrucks(); },
     haulerCount: 3, spawnHaulers() { doSpawnHaulers(); },
     inserterDir: '进料', inserterReach: 1,   // 分拣器: 方向(进料/出料) + 抓取距离(1/2/3 格)
+    probeTol: 0.02, probeMinCells: 9, probeRadius: 0.15,   // 探测建造区: 平整容差 / 最小格数 / 探测半径(角)
     showRanges: false, status: '待命',
   };
   let _fpDown = null;
@@ -111,6 +112,9 @@ export function createFactoryApp(opts) {
   fpGui.add(fpTool, 'spawnHaulers').name('生成物流车');
   fpGui.add(fpTool, 'inserterDir', ['进料', '出料']).name('分拣器方向');
   fpGui.add(fpTool, 'inserterReach', 1, 3, 1).name('分拣器抓取距离');
+  fpGui.add(fpTool, 'probeTol', 0.002, 0.1, 0.002).name('探测·平整容差');
+  fpGui.add(fpTool, 'probeMinCells', 4, 200, 1).name('探测·最小格数');
+  fpGui.add(fpTool, 'probeRadius', 0.05, 0.4, 0.01).name('探测·半径');
   fpGui.add(fpTool, 'showRanges').name('显示可点击范围').onChange((v) => factoryRenderer.showPickRanges(v));
   fpGui.add(fpTool, 'status').name('状态').listen().disable();
 
@@ -329,7 +333,7 @@ export function createFactoryApp(opts) {
     const dir = [d.x, d.y, d.z];
     const m = fpTool.mode;
     if (m === '探测建造区') {
-      const res = probePad(factory.world, factory.ctx, dir, {});
+      const res = probePad(factory.world, factory.ctx, dir, { tol: fpTool.probeTol, minCells: fpTool.probeMinCells, radius: fpTool.probeRadius });
       if (res == null) showToast('无法探测(当前无地形)', true);
       else if (res.rejected) showToast(`这里不够平整/面积太小(仅 ${res.count} 格) · 换更平整的大片区域`, true);
       else showToast(`已在平整区生成网格(${res.count} 格) · 继续开挖会自动扩张`, false);

@@ -7,6 +7,16 @@ import { norm } from '../core/sphere.js';
 import { angle } from '../core/sphere.js';
 import { makePad, offsetToDir, dirToCell, cellToDir, footprintCenterDir, footprintInPad, canPlace, markPlaced, freePlaced, snapYaw, discCells, floodFlatCells, expandFlatCells } from '../core/grid.js';
 
+// 全局网格参考向量(整场统一 → 所有平台网格方向一致)。首次按"与该点最垂直的世界轴"选定并缓存到 ctx。
+function gridRef(ctx, center) {
+  if (ctx.gridRef) return ctx.gridRef;
+  const ax = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+  let best = ax[0], bd = Infinity;
+  for (const a of ax) { const d = Math.abs(a[0] * center[0] + a[1] * center[1] + a[2] * center[2]); if (d < bd) { bd = d; best = a; } }
+  ctx.gridRef = best;
+  return best;
+}
+
 // 采样平台圆区内基础地形的最低点, 作为整平目标 level(只挖不填 → 全平)。无 planet 返回 0。
 function sampleMinLevel(planet, pad, R) {
   if (!planet || !planet.baseHeightAt) return 0;
@@ -34,7 +44,7 @@ export function placeBuildPad(world, ctx, center, opts = {}) {
   const cell = opts.cell != null ? opts.cell : (def.cell != null ? def.cell : 3.0);
   const radius = opts.radius != null ? opts.radius : (def.radius != null ? def.radius : 0.06);
   const R = planet ? planet.params.radius : 100;
-  const pad = makePad(center, { cell, radius });
+  const pad = makePad(center, { cell, radius, ref: gridRef(ctx, norm(center)) });
   pad.level = opts.level != null ? opts.level : sampleMinLevel(planet, pad, R);
   const cells = discCells(pad, R);   // 调试平整: 规整圆盘格集合
 
@@ -177,7 +187,7 @@ export function probePad(world, ctx, clickDir, opts = {}) {
   const radius = opts.radius != null ? opts.radius : 0.15;
   const tol = opts.tol != null ? opts.tol : 0.02;
   const minCells = opts.minCells != null ? opts.minCells : 9;
-  const pad = makePad(clickDir, { cell, radius });
+  const pad = makePad(clickDir, { cell, radius, ref: gridRef(ctx, norm(clickDir)) });
   const sample = (d) => planet.heightAt(d[0], d[1], d[2]);
   const maxRadiusCells = Math.max(2, Math.ceil((radius * R) / cell));
   const res = floodFlatCells(pad, sample, R, { tol, maxRadiusCells });

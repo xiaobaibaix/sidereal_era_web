@@ -141,4 +141,18 @@ const near = (a, b, eps = 1e-9) => Math.abs(a - b) < eps;
   ok('圆盘格集合(调试平整)');
 }
 
+// ---- 全局参考基: 相邻平台方向一致(修复经纬基在极点附近的摆动) ----
+{
+  const ref = [1, 0, 0];
+  const b1 = makePadBasis([0, 1, 0], ref);
+  const b2 = makePadBasis(norm([0.1, 1, 0.05]), ref);
+  const b3 = makePadBasis(norm([-0.08, 1, 0.06]), ref);
+  assert.ok(dot(b1.e, b2.e) > 0.99 && dot(b1.e, b3.e) > 0.99, `全局参考 → 相邻平台 e 方向一致(${dot(b1.e, b2.e).toFixed(3)}, ${dot(b1.e, b3.e).toFixed(3)})`);
+  // 对照: 无 ref(经纬基)在极点附近方向剧烈摆动
+  const p1 = makePadBasis([0, 1, 0]);
+  const p2 = makePadBasis(norm([0.2, 1, 0]));
+  assert.ok(dot(p1.e, p2.e) < 0.5, '经纬基在极点附近确实摆动(对照)');
+  ok('全局参考基: 相邻平台网格方向一致');
+}
+
 console.log(`\nG0 建造网格数学 全部通过 (${pass} 组断言)`);

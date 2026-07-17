@@ -13,18 +13,31 @@ import { norm, dot, cross, angle } from './sphere.js';
 export const keyOf = (i, j) => i + ',' + j;      // 格键
 const NB4 = [[1, 0], [-1, 0], [0, 1], [0, -1]];  // 4 邻
 
-// 平台切平面基: 返回 { c, e, n } (右手系 {e, n, c})
-export function makePadBasis(center) {
+// 平台切平面基: 返回 { c, e, n } (右手系 {e, n, c})。
+//   ref(可选)= 全局参考世界向量: e = ref 在 c 切平面上的投影(归一) → 不同平台方向全局一致。
+//   不传 ref 时退回"经纬(北极)"基(可能随位置摆动, 仅内部/测试用)。
+export function makePadBasis(center, ref) {
   const c = norm(center);
-  const a = Math.abs(c[1]) < 0.99 ? [0, 1, 0] : [1, 0, 0];
-  const e = norm(cross(a, c));   // 东向切向
-  const n = cross(c, e);         // 北向切向(c,e 正交 → 已是单位)
+  let e;
+  if (ref) {
+    const d = dot(c, ref);
+    e = [ref[0] - c[0] * d, ref[1] - c[1] * d, ref[2] - c[2] * d];   // ref 投影到切平面
+    if (Math.hypot(e[0], e[1], e[2]) < 1e-6) {                       // c 与 ref 几乎共线 → 退回
+      const a = Math.abs(c[1]) < 0.99 ? [0, 1, 0] : [1, 0, 0];
+      e = cross(a, c);
+    }
+    e = norm(e);
+  } else {
+    const a = Math.abs(c[1]) < 0.99 ? [0, 1, 0] : [1, 0, 0];
+    e = norm(cross(a, c));
+  }
+  const n = cross(c, e);
   return { c, e, n };
 }
 
-// 建一个平台(纯数据; 将作为 BuildPad 组件)。opts: { cell, radius, level }
+// 建一个平台(纯数据; 将作为 BuildPad 组件)。opts: { cell, radius, level, ref }
 export function makePad(center, opts = {}) {
-  const { c, e, n } = makePadBasis(center);
+  const { c, e, n } = makePadBasis(center, opts.ref);
   return {
     center: c, e, n,
     cell: opts.cell != null ? opts.cell : 3.0,       // 世界单位/格
