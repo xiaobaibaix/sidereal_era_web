@@ -4,7 +4,8 @@
 import { createBelt } from './belt.js';
 import { midPortDir } from './inserter.js';
 import { norm } from '../core/sphere.js';
-import { makePad, offsetToDir } from '../core/grid.js';
+import { angle } from '../core/sphere.js';
+import { makePad, offsetToDir, dirToCell, footprintCenterDir, canPlace, markPlaced, freePlaced, snapYaw } from '../core/grid.js';
 
 // 采样平台圆区内基础地形的最低点, 作为整平目标 level(只挖不填 → 全平)。无 planet 返回 0。
 function sampleMinLevel(planet, pad, R) {
@@ -136,6 +137,43 @@ export function placeBuilding(world, ctx, buildingId, dir, yaw = 0) {
   return e;
 }
 
+// 找包含某方向的建造平台, 返回 { eid, pad } 或 null
+export function padAt(world, dir) {
+  for (const pe of world.query('BuildPad')) {
+    const p = world.get(pe, 'BuildPad');
+    if (angle(p.center, dir) <= p.radius) return { eid: pe, pad: p };
+  }
+  return null;
+}
+
+// 网格吸附放置: dir 落在某平台内 → 吸附格点 + 对齐朝向 + footprint 占位检查(占用则拒);
+// 平台外 → 自由放置(现状)。quarter=玩家旋转(0..3)。
+// 返回 { eid, snapped, blocked }。
+export function placeBuildingSnapped(world, ctx, buildingId, dir, quarter = 0) {
+  const { planet, registry } = ctx;
+  const def = (registry.buildings && registry.buildings[buildingId]) || {};
+  const hit = padAt(world, dir);
+  if (!hit) {                                        // 平台外: 自由放置
+    const e = placeBuilding(world, ctx, buildingId, dir, 0);
+    return { eid: e, snapped: false, blocked: false };
+  }
+  const { eid: padEid, pad } = hit;
+  const R = planet ? planet.params.radius : 100;
+  const fp = def.footprint || [1, 1];
+  const w = fp[0], h = fp[1];
+  const c = dirToCell(pad, dir, R);                  // 最近格点
+  const i0 = c.i - Math.floor(w / 2), j0 = c.j - Math.floor(h / 2);   // footprint 最小角(居中于该格)
+  if (!canPlace(pad, i0, j0, w, h)) return { eid: null, snapped: true, blocked: true };
+  const cdir = footprintCenterDir(pad, i0, j0, w, h, R);
+  const yaw = snapYaw(pad, cdir, quarter);
+  const e = placeBuilding(world, ctx, buildingId, cdir, yaw);
+  if (e != null) {
+    markPlaced(pad, i0, j0, w, h, e);
+    world.add(e, 'GridSlot', { pad: padEid, i: i0, j: j0, w, h });
+  }
+  return { eid: e, snapped: true, blocked: false };
+}
+
 // 放置一条传送带(两点放置)。from/to 为球面单位方向; opts 透传给 createBelt(buildingId/outPort/inPort 等)。
 // 返回带实体 id(失败返回 null, 例如科技未解锁)。
 export function placeBelt(world, ctx, from, to, opts = {}) {
@@ -239,6 +277,9 @@ export function demolish(world, ctx, eid) {
   restore(ctx.minerEdits && ctx.minerEdits.get(eid), ctx.minerEdits);   // 旧直挖矿机的坑
   restore(ctx.zoneEdits && ctx.zoneEdits.get(eid), ctx.zoneEdits);       // 矿场挖掘区的坑
   restore(ctx.padEdits && ctx.padEdits.get(eid), ctx.padEdits);          // 建造平台的整平区
+  // 释放网格占位
+  const slot = world.get(eid, 'GridSlot');
+  if (slot && world.alive(slot.pad)) { const pad = world.get(slot.pad, 'BuildPad'); if (pad) freePlaced(pad, slot.i, slot.j, slot.w, slot.h); }
   if (spatial) spatial.remove(eid);
   world.destroy(eid);
   if (bus) bus.emit('demolish', { eid });

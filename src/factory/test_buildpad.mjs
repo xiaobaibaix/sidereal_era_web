@@ -6,8 +6,9 @@ import { createWorld } from './core/world.js';
 import { createRegistry } from './core/registry.js';
 import { createSpatial } from './core/spatial.js';
 import { createEventBus } from './core/events.js';
-import { placeBuildPad, demolish } from './systems/placement.js';
-import { dot } from './core/sphere.js';
+import { placeBuildPad, placeBuildingSnapped, padAt, demolish } from './systems/placement.js';
+import { dot, angle } from './core/sphere.js';
+import { dirToCell, canPlace } from './core/grid.js';
 import gameData from './data/gamedata.js';
 
 let pass = 0;
@@ -80,4 +81,50 @@ function makeCtx() {
   ok('无 planet 时安全');
 }
 
-console.log(`\nG1 建造平台 全部通过 (${pass} 组断言)`);
+// ---- G3 吸附放置: 平台内落格 + footprint 占位 + 拆除释放 ----
+{
+  const ctx = makeCtx(); const world = createWorld();
+  const padEid = placeBuildPad(world, ctx, [0, 1, 0], { cell: 3, radius: 0.1 });
+  const pad = world.get(padEid, 'BuildPad');
+  const R = ctx.planet.params.radius;
+
+  // 在中心附近放一个冶炼炉(footprint 2x2) → 应吸附落格并占 4 格
+  const r1 = placeBuildingSnapped(world, ctx, 'smelter', [0, 1, 0]);
+  assert.ok(r1.eid != null && r1.snapped && !r1.blocked, '平台内: 吸附放置成功');
+  assert.ok(world.has(r1.eid, 'GridSlot'), '放置的建筑带 GridSlot');
+  const slot = world.get(r1.eid, 'GridSlot');
+  assert.equal(slot.w * slot.h, 4, 'footprint 2x2 占 4 格');
+  assert.ok(!canPlace(pad, slot.i, slot.j, 2, 2), '占位后同处不可再放');
+  // 放置点方向应正好在平台内且吸附到 footprint 中心格
+  const anch = world.get(r1.eid, 'Anchor');
+  assert.ok(angle(anch.dir, pad.center) <= pad.radius, '吸附点落在平台内');
+
+  // 在同一格再放 → 被占位拒绝
+  const r2 = placeBuildingSnapped(world, ctx, 'smelter', [0, 1, 0]);
+  assert.ok(r2.eid == null && r2.blocked, '重叠放置被占位拒绝');
+
+  ok('吸附放置: 平台内落格 + 占位拒绝重叠');
+
+  // 拆除 → 释放占位, 可再放
+  demolish(world, ctx, r1.eid);
+  assert.ok(canPlace(pad, slot.i, slot.j, 2, 2), '拆除后占位释放');
+  const r3 = placeBuildingSnapped(world, ctx, 'smelter', [0, 1, 0]);
+  assert.ok(r3.eid != null && !r3.blocked, '释放后可重新放置');
+  ok('拆除释放占位 → 可重放');
+}
+
+// ---- G3 平台外: 自由放置(不吸附, 无 GridSlot) ----
+{
+  const ctx = makeCtx(); const world = createWorld();
+  placeBuildPad(world, ctx, [0, 1, 0], { radius: 0.06 });
+  const farDir = (() => { // 距平台中心很远的方向
+    return [Math.sin(1.2), Math.cos(1.2), 0];
+  })();
+  assert.equal(padAt(world, farDir), null, '远处不在任何平台内');
+  const r = placeBuildingSnapped(world, ctx, 'warehouse', farDir);
+  assert.ok(r.eid != null && !r.snapped, '平台外: 自由放置(未吸附)');
+  assert.ok(!world.has(r.eid, 'GridSlot'), '自由放置无 GridSlot');
+  ok('平台外: 自由放置(不规整也能放)');
+}
+
+console.log(`\nG1/G3 建造平台+吸附 全部通过 (${pass} 组断言)`);
