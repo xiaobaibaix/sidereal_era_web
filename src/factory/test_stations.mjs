@@ -15,6 +15,7 @@ import { createInserterSystem } from './systems/inserter.js';
 import { createProductionSystem } from './systems/production.js';
 import { createLogisticsSystem, spawnHaulers } from './systems/logistics.js';
 import { placeBuilding, placeBelt, placeInserter } from './systems/placement.js';
+import { toJSON, fromJSON } from './core/save.js';
 import gameData from './data/gamedata.js';
 
 let pass = 0;
@@ -124,6 +125,55 @@ const dirAt = (ang) => [Math.cos(ang), Math.sin(ang), 0];
   assert.ok((world.get(smelter, 'Inventory').items.iron_ore || 0) > 0 || (world.get(smelter, 'Inventory').items.iron_ingot || 0) > 0, '冶炼炉经旧直连收到料/出锭');
   assert.ok(invTotal(world.get(depot, 'Inventory')) < 200, '矿场货被旧直连卡车搬走');
   ok('无站点回退: 卡车按旧 Provider→Requester 直连(向后兼容)');
+}
+
+// ============ 端到端存档: 全物流链 tick→存档→载入新世界→重挂系统→继续跑 ============
+{
+  const ctx = makeCtx();
+  const world = createWorld();
+  // 搭一条完整链(与首例同构, 但紧凑)
+  const depot = placeBuilding(world, ctx, 'depot', dirAt(0));
+  world.get(depot, 'Inventory').items.iron_ore = 500;
+  const loadSt = placeBuilding(world, ctx, 'load_station', dirAt(0.28));
+  const beltUp = placeBelt(world, ctx, dirAt(0.05), dirAt(0.24));
+  placeInserter(world, ctx, { kind: 'inv', eid: depot, role: 'provide' }, { kind: 'belt', eid: beltUp, role: 'in' });
+  placeInserter(world, ctx, { kind: 'belt', eid: beltUp, role: 'out' }, { kind: 'inv', eid: loadSt, role: 'any' });
+  const unloadSt = placeBuilding(world, ctx, 'unload_station', dirAt(1.2));
+  const smelter = placeBuilding(world, ctx, 'smelter', dirAt(1.5));
+  const beltDn = placeBelt(world, ctx, dirAt(1.28), dirAt(1.45));
+  placeInserter(world, ctx, { kind: 'inv', eid: unloadSt, role: 'provide' }, { kind: 'belt', eid: beltDn, role: 'in' });
+  placeInserter(world, ctx, { kind: 'belt', eid: beltDn, role: 'out' }, { kind: 'inv', eid: smelter, role: 'request' });
+  spawnHaulers(world, ctx, 1, 'hauler_mk1', dirAt(0.28));
+
+  const addSystems = (w) => {
+    w.addSystem('ins_load', createInserterSystem({ phase: 'load' }));
+    w.addSystem('belt', createBeltSystem());
+    w.addSystem('ins_unload', createInserterSystem({ phase: 'unload' }));
+    w.addSystem('logistics', createLogisticsSystem());
+    w.addSystem('prod', createProductionSystem());
+  };
+  addSystems(world);
+  for (let i = 0; i < 2000; i++) world.tick(0.05, ctx);
+
+  // 存档 → 载入新世界
+  const json = toJSON(world);
+  const w2 = createWorld();
+  fromJSON(json, w2);
+  // 组件完整保留
+  assert.equal(w2.count('Belt'), world.count('Belt'), '带数量保留');
+  assert.equal(w2.count('Inserter'), world.count('Inserter'), '分拣器数量保留');
+  assert.ok(w2.has(loadSt, 'LoadStation') && w2.has(unloadSt, 'UnloadStation'), '装/卸货站标记保留');
+  const beltUp2 = w2.get(beltUp, 'Belt');
+  assert.ok(Array.isArray(beltUp2.items), '带上物品序列保留(数组)');
+  const ingotBefore = w2.get(smelter, 'Inventory').items.iron_ingot || 0;
+
+  // 新世界重挂系统, 继续跑 → 仍能继续产出(存档不中断物流)
+  const ctx2 = makeCtx();
+  addSystems(w2);
+  for (let i = 0; i < 2000; i++) w2.tick(0.05, ctx2);
+  const ingotAfter = w2.get(smelter, 'Inventory').items.iron_ingot || 0;
+  assert.ok(ingotAfter > ingotBefore, `载入后继续产出铁锭(${ingotBefore.toFixed(0)}→${ingotAfter.toFixed(0)})`);
+  ok(`端到端存档: 全链 tick→存档→载入→继续跑仍产出(铁锭 ${ingotBefore.toFixed(0)}→${ingotAfter.toFixed(0)})`);
 }
 
 console.log(`\nB2 运输站 全部通过 (${pass} 组断言)`);

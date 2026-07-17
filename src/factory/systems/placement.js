@@ -92,6 +92,31 @@ export function placeBelt(world, ctx, from, to, opts = {}) {
   return createBelt(world, ctx, from, to, { ...opts, buildingId });
 }
 
+// 放置一条折线带(多段): points=[dir0,dir1,...] → 生成 N-1 段带, 每段头部(outPort)直连下一段带尾(不经分拣器)。
+// 返回带实体 id 数组(失败返回 [])。
+export function placeBeltPath(world, ctx, points, opts = {}) {
+  const { registry } = ctx;
+  const buildingId = opts.buildingId || 'belt';
+  const b = registry.buildings[buildingId];
+  if (b && b.locked && !(registry.isUnlocked && registry.isUnlocked(buildingId))) return [];
+  if (!points || points.length < 2) return [];
+  const belts = [];
+  for (let i = 0; i < points.length - 1; i++) {
+    belts.push(createBelt(world, ctx, points[i], points[i + 1], { ...opts, buildingId }));
+  }
+  for (let i = 0; i < belts.length - 1; i++) {
+    world.get(belts[i], 'Belt').outPort = { kind: 'belt', eid: belts[i + 1], role: 'in' };   // 带↔带直连
+  }
+  return belts;
+}
+
+// 把已存在的带 a 的头部直连到带 b 的尾部(带↔带直连, 不经分拣器)。
+export function linkBelts(world, aBelt, bBelt) {
+  const a = world.get(aBelt, 'Belt');
+  if (a && world.has(bBelt, 'Belt')) { a.outPort = { kind: 'belt', eid: bBelt, role: 'in' }; return true; }
+  return false;
+}
+
 // 放置一个分拣器。from/to 为 Port {kind:'inv'|'belt', eid, role}(取货端/放货端)。
 // opts: { buildingId, rate, filter }。返回实体 id(失败返回 null)。
 export function placeInserter(world, ctx, from, to, opts = {}) {

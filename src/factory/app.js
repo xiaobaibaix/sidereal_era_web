@@ -27,7 +27,7 @@ import { createLogisticsSystem, spawnHaulers } from './systems/logistics.js';
 import { createBeltSystem } from './systems/belt.js';
 import { createInserterSystem } from './systems/inserter.js';
 import { createSplitterSystem } from './systems/splitter.js';
-import { placeBuilding, demolish, placeBelt, placeInserter, placeSplitter } from './systems/placement.js';
+import { placeBuilding, demolish, placeBelt, placeInserter, placeSplitter, linkBelts } from './systems/placement.js';
 import { angle as sphAngle } from './core/sphere.js';
 import { createFactoryRenderer } from './render/factory_render.js';
 import { createInspector } from './render/inspector.js';
@@ -88,11 +88,12 @@ export function createFactoryApp(opts) {
     showRanges: false, status: '待命',
   };
   let _fpDown = null;
-  let _beltStart = null;   // 传送带两点放置: 记录第一个点(球面方向); 第二点成带
+  let _beltStart = null;   // 传送带折线放置: 当前段起点(球面方向)
+  let _beltPrev = null;    // 上一段带实体(用于带↔带直连成折线)
   const fpGui = new GUI({ title: '🏭 工厂', container });
   fpGui.add(fpTool, 'mode', ['关闭', '放置矿场', '圈定挖掘区', '放置冶炼炉', '放置制造台', '放置研究站', '放置仓库', '放置输电塔', '放置发电机', '放置发动机', '点火发动机',
     '放置传送带', '放置分拣器·上料', '放置分拣器·下料', '放置过滤分拣器·上料', '放置过滤分拣器·下料', '放置分流器', '放置装货站', '放置卸货站', '拆除']).name('模式').listen()
-    .onChange((v) => { if (v !== '关闭') onModeActivate(); _beltStart = null; });
+    .onChange((v) => { if (v !== '关闭') onModeActivate(); _beltStart = null; _beltPrev = null; });
   fpGui.add(fpTool, 'excavatorCount', 1, 20, 1).name('挖机数量');
   fpGui.add(fpTool, 'spawnExcavators').name('生成挖机');
   fpGui.add(fpTool, 'mineTruckCount', 1, 20, 1).name('采矿车数量');
@@ -205,13 +206,17 @@ export function createFactoryApp(opts) {
   const nearestBuilding = (dir) => factory.spatial.nearest(dir, (id) =>
     factory.world.has(id, 'Inventory') && !factory.world.has(id, 'Belt'));
 
-  // 放置带(第二点): 从 _beltStart→dir 成带
-  function placeBeltSecond(dir) {
-    const from = _beltStart; _beltStart = null;
-    if (sphAngle(from, dir) < 1e-3) { showToast('两点太近, 已取消', true); return; }
+  // 放置带(折线的一段): 从 _beltStart→dir 成带, 并与上一段带↔带直连; 终点成为下一段起点(可继续延伸)
+  function placeBeltSegment(dir) {
+    const from = _beltStart;
+    if (sphAngle(from, dir) < 1e-3) { showToast('两点太近, 请点更远处', true); return; }
     const e = placeBelt(factory.world, factory.ctx, from, dir);
-    if (e != null) showToast('已放置传送带 · 用分拣器上/下料', false);
+    if (e == null) { _beltStart = null; _beltPrev = null; return; }
+    if (_beltPrev != null) linkBelts(factory.world, _beltPrev, e);   // 折线: 上一段头→本段尾
+    _beltPrev = e; _beltStart = dir;                                 // 终点续接下一段
+    showToast('已接一段传送带 · 继续点延伸 · Esc 结束', false);
   }
+  const endBeltPath = () => { const had = _beltPrev != null || _beltStart != null; _beltStart = null; _beltPrev = null; return had; };
 
   // 放置分拣器: 吸附最近带 + 最近建筑口。load=上料(建筑→带), 否则下料(带→建筑)。filtered=过滤分拣器(sorter)
   function placeInserterAttached(dir, load, filtered) {
@@ -278,8 +283,8 @@ export function createFactoryApp(opts) {
     else if (m === '放置发动机') tryPlace('engine_site', dir, '已开建行星发动机 · 依阶段自动索取建材(铁板)');
     else if (m === '放置传送带') {
       if (!checkUnlocked('belt')) return;
-      if (_beltStart == null) { _beltStart = dir; showToast('已选起点 · 再点终点成带(Esc 取消)', false); }
-      else placeBeltSecond(dir);
+      if (_beltStart == null) { _beltStart = dir; showToast('已选起点 · 逐点延伸成折线带 · Esc 结束', false); }
+      else placeBeltSegment(dir);
     }
     else if (m === '放置分拣器·上料') placeInserterAttached(dir, true, false);
     else if (m === '放置分拣器·下料') placeInserterAttached(dir, false, false);
@@ -321,7 +326,7 @@ export function createFactoryApp(opts) {
     const eid = pickEntity(e.clientX, e.clientY);
     if (eid != null) inspector.show(eid); else inspector.hide();
   };
-  const onKey = (e) => { if (e.key === 'Escape') { if (_beltStart) { _beltStart = null; showToast('已取消传送带', false); } inspector.hide(); } };
+  const onKey = (e) => { if (e.key === 'Escape') { if (endBeltPath()) showToast('已结束传送带', false); inspector.hide(); } };
   dom.addEventListener('pointerdown', onPlaceDown);
   dom.addEventListener('pointerup', onPlaceUp);
   dom.addEventListener('pointerdown', onInspectDown);

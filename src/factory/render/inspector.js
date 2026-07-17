@@ -10,7 +10,8 @@ const ITEM_ICON = {
   overburden: 'soil-pile', stone: 'stone-ore', iron_ore: 'iron-ore', copper_ore: 'copper-ore',
   iron_ingot: 'iron-plate', copper_ingot: 'copper-plate', iron_plate: 'steel-plate',
 };
-const MESH_ICON = { miner: 'mining-drill', smelter: 'smelter', assembler: 'assembler-1', warehouse: 'storage-1', truck: 'logistic-drone', depot: 'storage-tank', excavator: 'mining-drill', tower: 'tesla-coil', generator: 'wind-turbine', lab: 'lab', engine: 'vertical-launching-silo' };
+const MESH_ICON = { miner: 'mining-drill', smelter: 'smelter', assembler: 'assembler-1', warehouse: 'storage-1', truck: 'logistic-drone', depot: 'storage-tank', excavator: 'mining-drill', tower: 'tesla-coil', generator: 'wind-turbine', lab: 'lab', engine: 'vertical-launching-silo',
+  belt: 'belt-1', inserter: 'inserter-1', sorter: 'inserter-2', splitter: 'splitter-4dir', station_load: 'logistic-station', station_unload: 'interstellar-logistic-station' };
 
 const MINER_STATE = { mining: '开采中', full: '满仓待运', blocked: '受阻(需更高级钻机)', idle: '空闲' };
 const PROD_STATE = { working: '生产中', starved: '缺原料', output_full: '产物已满', no_power: '缺电停机', idle: '空闲' };
@@ -251,6 +252,25 @@ export function createInspector({ getWorld, registry, getPower }) {
         lines.push(stateLine('状态', hauler.state, HAUL_STATE));
         const cargo = hauler.cargoAmt > 0 ? `${itemName(hauler.cargoItem)} ${Math.round(hauler.cargoAmt)} / ${hauler.cap}` : `空 / ${hauler.cap}`;
         lines.push(kv('载货', cargo));
+      } else if (world.get(eid, 'Belt')) {
+        const belt = world.get(eid, 'Belt');
+        const jam = belt.items.length && belt.items[0].s >= 1 - 1e-6;
+        const st = jam ? '<b style="color:#d0704f">头部背压</b>' : (belt.items.length ? '<b style="color:#66cc66">流动中</b>' : '<b style="color:#8a8f98">空闲</b>');
+        lines.push(kv('载货', `${belt.items.length} / ${belt.cap} 件`));
+        lines.push(kv('速度', `${belt.speed.toFixed(3)} 角/秒`));
+        lines.push(kv('状态', st));
+      } else if (world.get(eid, 'Inserter')) {
+        const ins = world.get(eid, 'Inserter');
+        const portLabel = (p) => (p ? (p.kind === 'belt' ? '传送带' : '建筑/仓/站') : '—');
+        lines.push(kv('搬运', `${portLabel(ins.from)} → ${portLabel(ins.to)}`));
+        lines.push(kv('速率', `${ins.rate} /秒`));
+        if (ins.filter && ins.filter.length) lines.push(kv('过滤', ins.filter.map(itemName).join(', ')));
+        lines.push(kv('手持', ins.carry ? itemName(ins.carry) : '空'));
+      } else if (world.get(eid, 'Splitter')) {
+        const sp = world.get(eid, 'Splitter');
+        const modeName = { balance: '均分', priority: '优先', filter: '按物品' }[sp.mode] || sp.mode;
+        lines.push(kv('分流模式', modeName));
+        lines.push(kv('入带 / 出带', `${(sp.ins || []).length} / ${(sp.outs || []).length}`));
       }
       if (inv) {
         const cap = inv.cap == null || inv.cap === Infinity ? '∞' : inv.cap;
@@ -278,5 +298,6 @@ export function createInspector({ getWorld, registry, getPower }) {
 }
 
 function kindLabel(kind) {
-  return { depot: '矿场', miner: '采矿', producer: '生产', storage: '存储', tower: '输电', generator: '发电', lab: '科研', engine: '巨构' }[kind] || kind || '';
+  return { depot: '矿场', miner: '采矿', producer: '生产', storage: '存储', tower: '输电', generator: '发电', lab: '科研', engine: '巨构',
+    belt: '传送带', inserter: '分拣器', splitter: '分流器', loadstation: '装货站', unloadstation: '卸货站' }[kind] || kind || '';
 }

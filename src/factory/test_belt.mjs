@@ -8,7 +8,7 @@ import { createSpatial } from './core/spatial.js';
 import { createEventBus } from './core/events.js';
 import { invTotal } from './core/inventory.js';
 import { createBelt, createBeltSystem, beltAddItem, stepBelt } from './systems/belt.js';
-import { placeBelt } from './systems/placement.js';
+import { placeBelt, placeBeltPath } from './systems/placement.js';
 import * as S from './core/sphere.js';
 import gameData from './data/gamedata.js';
 
@@ -156,6 +156,26 @@ const dirAt = (ang) => [Math.cos(ang), Math.sin(ang), 0];
   assert.equal(b2.items.length, 1, '反序列化后物品数一致');
   assert.ok(Math.abs(b2.items[0].s - belt.items[0].s) < 1e-9, '物品位置 s 保留');
   ok('序列化往返: 带上物品序列保留');
+}
+
+// ---- 折线带(带↔带直连): 多段链式, 物品跨段流到末端 ----
+{
+  const world = createWorld(); const ctx = makeCtx(); ctx.registry.unlock(['belt']);
+  const sink = world.create();
+  world.add(sink, 'Inventory', { items: {}, cap: 100 });
+  // 三点两段折线(转弯)
+  const belts = placeBeltPath(world, ctx, [dirAt(0), dirAt(0.15), [Math.cos(0.15), Math.sin(0.15) * 0.8, Math.sin(0.15) * 0.4]]);
+  assert.equal(belts.length, 2, '两段带');
+  // 段间直连: 第一段 outPort 指向第二段(kind belt)
+  assert.equal(world.get(belts[0], 'Belt').outPort.kind, 'belt', '第一段头→第二段尾(带↔带直连)');
+  assert.equal(world.get(belts[0], 'Belt').outPort.eid, belts[1], '直连到下一段实体');
+  // 末段头接一个收集库存
+  world.get(belts[1], 'Belt').outPort = { kind: 'inv', eid: sink, role: 'any' };
+  world.addSystem('belt', createBeltSystem());
+  beltAddItem(world.get(belts[0], 'Belt'), 'iron_ore');
+  let t = 0; while (invTotal(world.get(sink, 'Inventory')) < 1 && t < 2000) { world.tick(0.05, ctx); t++; }
+  assert.equal(invTotal(world.get(sink, 'Inventory')), 1, '物品跨两段折线带流到末端 Inventory');
+  ok('折线带(带↔带直连): 物品跨段流动到末端');
 }
 
 // ---- slerp 测地线插值(带上物品/带段定位用) ----
