@@ -26,6 +26,15 @@ export function moveToward(dir, target, maxAng, arriveAng = 0.02) {
   return { dir: norm(rotateAxis(dir, axis, Math.min(maxAng, ang))), arrived: false };
 }
 
+// 大圆插值(测地线 slerp): 在单位方向 a→b 之间按 t∈[0,1] 取点。用于带上物品/带段沿弧摆放。
+export function slerp(a, b, t) {
+  const om = angle(a, b);
+  if (om < 1e-6) return [a[0], a[1], a[2]];
+  const so = Math.sin(om);
+  const s0 = Math.sin((1 - t) * om) / so, s1 = Math.sin(t * om) / so;
+  return norm([a[0] * s0 + b[0] * s1, a[1] * s0 + b[1] * s1, a[2] * s0 + b[2] * s1]);
+}
+
 // target 在 dir 切平面上的方向(前进朝向)
 export function tangentToward(dir, target) {
   const d = dot(target, dir);

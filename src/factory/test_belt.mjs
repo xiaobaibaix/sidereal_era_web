@@ -158,4 +158,16 @@ const dirAt = (ang) => [Math.cos(ang), Math.sin(ang), 0];
   ok('序列化往返: 带上物品序列保留');
 }
 
+// ---- slerp 测地线插值(带上物品/带段定位用) ----
+{
+  const a = S.norm([1, 0, 0]), b = S.norm([0, 1, 0]);
+  const m = S.slerp(a, b, 0.5);
+  assert.ok(Math.abs(Math.hypot(m[0], m[1], m[2]) - 1) < 1e-9, 'slerp 结果为单位向量');
+  assert.ok(Math.abs(S.angle(a, m) - S.angle(m, b)) < 1e-9, 'slerp(0.5) 位于弧中点(两侧等角)');
+  assert.ok(Math.abs(m[0] - m[1]) < 1e-9 && Math.abs(m[2]) < 1e-9, 'slerp 中点方向正确(≈[√½,√½,0])');
+  const e0 = S.slerp(a, b, 0), e1 = S.slerp(a, b, 1);
+  assert.ok(S.angle(e0, a) < 1e-9 && S.angle(e1, b) < 1e-9, 'slerp 端点 t=0→a, t=1→b');
+  ok('slerp 测地线插值(单位/中点/端点)');
+}
+
 console.log(`\nB0 传送带核心 全部通过 (${pass} 组断言)`);

@@ -27,7 +27,8 @@ import { createLogisticsSystem, spawnHaulers } from './systems/logistics.js';
 import { createBeltSystem } from './systems/belt.js';
 import { createInserterSystem } from './systems/inserter.js';
 import { createSplitterSystem } from './systems/splitter.js';
-import { placeBuilding, demolish } from './systems/placement.js';
+import { placeBuilding, demolish, placeBelt, placeInserter, placeSplitter } from './systems/placement.js';
+import { angle as sphAngle } from './core/sphere.js';
 import { createFactoryRenderer } from './render/factory_render.js';
 import { createInspector } from './render/inspector.js';
 import { pick as anchorPick } from './core/anchor.js';
@@ -87,9 +88,11 @@ export function createFactoryApp(opts) {
     showRanges: false, status: '待命',
   };
   let _fpDown = null;
+  let _beltStart = null;   // 传送带两点放置: 记录第一个点(球面方向); 第二点成带
   const fpGui = new GUI({ title: '🏭 工厂', container });
-  fpGui.add(fpTool, 'mode', ['关闭', '放置矿场', '圈定挖掘区', '放置冶炼炉', '放置制造台', '放置研究站', '放置仓库', '放置输电塔', '放置发电机', '放置发动机', '点火发动机', '拆除']).name('模式').listen()
-    .onChange((v) => { if (v !== '关闭') onModeActivate(); });
+  fpGui.add(fpTool, 'mode', ['关闭', '放置矿场', '圈定挖掘区', '放置冶炼炉', '放置制造台', '放置研究站', '放置仓库', '放置输电塔', '放置发电机', '放置发动机', '点火发动机',
+    '放置传送带', '放置分拣器·上料', '放置分拣器·下料', '放置过滤分拣器·上料', '放置过滤分拣器·下料', '放置分流器', '放置装货站', '放置卸货站', '拆除']).name('模式').listen()
+    .onChange((v) => { if (v !== '关闭') onModeActivate(); _beltStart = null; });
   fpGui.add(fpTool, 'excavatorCount', 1, 20, 1).name('挖机数量');
   fpGui.add(fpTool, 'spawnExcavators').name('生成挖机');
   fpGui.add(fpTool, 'mineTruckCount', 1, 20, 1).name('采矿车数量');
@@ -187,6 +190,61 @@ export function createFactoryApp(opts) {
     return e;
   }
 
+  // 科技锁提示(带/分拣器/分流器/站): 未解锁则 toast 并返回 false
+  function checkUnlocked(buildingId) {
+    const b = factory.registry.buildings[buildingId];
+    if (b && b.locked && !factory.registry.isUnlocked(buildingId)) {
+      const t = requiredTechFor(buildingId);
+      showToast(`${(b && b.name) || buildingId}未解锁${t ? ` · 需研究「${t.name}」(发展度 ${(t.require && t.require.dev) || 0})` : ''}`, true);
+      return false;
+    }
+    return true;
+  }
+  const nearestBelt = (dir) => factory.spatial.nearest(dir, (id) => factory.world.has(id, 'Belt'));
+  // 最近的"带货口建筑"(机器/仓库/站): 有 Inventory 且不是带/分拣器/分流器
+  const nearestBuilding = (dir) => factory.spatial.nearest(dir, (id) =>
+    factory.world.has(id, 'Inventory') && !factory.world.has(id, 'Belt'));
+
+  // 放置带(第二点): 从 _beltStart→dir 成带
+  function placeBeltSecond(dir) {
+    const from = _beltStart; _beltStart = null;
+    if (sphAngle(from, dir) < 1e-3) { showToast('两点太近, 已取消', true); return; }
+    const e = placeBelt(factory.world, factory.ctx, from, dir);
+    if (e != null) showToast('已放置传送带 · 用分拣器上/下料', false);
+  }
+
+  // 放置分拣器: 吸附最近带 + 最近建筑口。load=上料(建筑→带), 否则下料(带→建筑)。filtered=过滤分拣器(sorter)
+  function placeInserterAttached(dir, load, filtered) {
+    const buildingId = filtered ? 'sorter' : 'inserter';
+    if (!checkUnlocked(buildingId)) return;
+    const belt = nearestBelt(dir);
+    const bld = nearestBuilding(dir);
+    if (belt == null) { showToast('附近没有传送带, 请先放置传送带', true); return; }
+    if (bld == null) { showToast('附近没有可搬运的建筑/仓库/站', true); return; }
+    const beltPort = { kind: 'belt', eid: belt, role: load ? 'in' : 'out' };
+    const bldRole = load ? 'provide' : (factory.world.has(bld, 'Requester') ? 'request' : 'any');
+    const bldPort = { kind: 'inv', eid: bld, role: bldRole };
+    const from = load ? bldPort : beltPort;
+    const to = load ? beltPort : bldPort;
+    // 过滤分拣器: 默认按取货端当前主要物品设过滤(简单起见先不预设, 留空=不过滤; 可后续在属性面板配置)
+    const e = placeInserter(factory.world, factory.ctx, from, to, { buildingId });
+    if (e != null) showToast(`已放置${filtered ? '过滤' : ''}分拣器 · ${load ? '建筑→带' : '带→建筑'}`, false);
+  }
+
+  // 放置分流器: 单点; 自动把"头端靠近该点的带"接为入, "尾端靠近该点的带"接为出
+  function placeSplitterAt(dir) {
+    if (!checkUnlocked('splitter')) return;
+    const CONNECT_R = 0.06;   // 角半径(弧度)内的带端视为相连
+    const ins = [], outs = [];
+    for (const e of factory.world.query('Belt')) {
+      const b = factory.world.get(e, 'Belt');
+      if (sphAngle(b.to, dir) < CONNECT_R) ins.push(e);      // 带头(出口)靠近 → 作为入带
+      if (sphAngle(b.from, dir) < CONNECT_R) outs.push(e);   // 带尾(入口)靠近 → 作为出带
+    }
+    const s = placeSplitter(factory.world, factory.ctx, dir, { ins, outs, mode: 'balance' });
+    if (s != null) showToast(`已放置分流器 · 入带${ins.length}/出带${outs.length}${ins.length + outs.length === 0 ? '(把带端点对准分流器再放)' : ''}`, ins.length + outs.length === 0);
+  }
+
   // 事件 toast
   const _engineStageName = { site: '选址平整', frame: '骨架搭建', core: '核心组装', commission: '调试' };
   factory.bus.on('engine_stage', (p) => showToast(`行星发动机: 进入「${_engineStageName[p.stage] || p.stage}」阶段`, false));
@@ -218,6 +276,18 @@ export function createFactoryApp(opts) {
     else if (m === '放置输电塔') tryPlace('power_tower', dir, '已放置输电塔');
     else if (m === '放置发电机') tryPlace('generator', dir, '已放置发电机');
     else if (m === '放置发动机') tryPlace('engine_site', dir, '已开建行星发动机 · 依阶段自动索取建材(铁板)');
+    else if (m === '放置传送带') {
+      if (!checkUnlocked('belt')) return;
+      if (_beltStart == null) { _beltStart = dir; showToast('已选起点 · 再点终点成带(Esc 取消)', false); }
+      else placeBeltSecond(dir);
+    }
+    else if (m === '放置分拣器·上料') placeInserterAttached(dir, true, false);
+    else if (m === '放置分拣器·下料') placeInserterAttached(dir, false, false);
+    else if (m === '放置过滤分拣器·上料') placeInserterAttached(dir, true, true);
+    else if (m === '放置过滤分拣器·下料') placeInserterAttached(dir, false, true);
+    else if (m === '放置分流器') placeSplitterAt(dir);
+    else if (m === '放置装货站') tryPlace('load_station', dir, '已放置装货站 · 带/分拣器填它, 卡车从它取货');
+    else if (m === '放置卸货站') tryPlace('unload_station', dir, '已放置卸货站 · 卡车卸进它, 带/分拣器取走送下游');
     else if (m === '点火发动机') {
       const eng = factoryRenderer.pickBuilding(factory.world, dir);
       if (eng == null || !factory.world.has(eng, 'Construction')) { showToast('请点选一台行星发动机', true); return; }
@@ -251,7 +321,7 @@ export function createFactoryApp(opts) {
     const eid = pickEntity(e.clientX, e.clientY);
     if (eid != null) inspector.show(eid); else inspector.hide();
   };
-  const onKey = (e) => { if (e.key === 'Escape') inspector.hide(); };
+  const onKey = (e) => { if (e.key === 'Escape') { if (_beltStart) { _beltStart = null; showToast('已取消传送带', false); } inspector.hide(); } };
   dom.addEventListener('pointerdown', onPlaceDown);
   dom.addEventListener('pointerup', onPlaceUp);
   dom.addEventListener('pointerdown', onInspectDown);
