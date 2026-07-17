@@ -63,7 +63,7 @@ export function createInspector({ getWorld, registry, getPower, onAction = () =>
   const invWrap = document.createElement('div');   // 库存行(增量复用)
   invWrap.style.cssText = 'display:flex;flex-direction:column;gap:3px;';
 
-  // 操作按钮区(常驻容器, 按选中实体动态构建多个按钮)
+  // 操作按钮区(常驻容器, 仅在 show() 时重建 — update() 不动按钮, 避免点击丢失)
   const actWrap = document.createElement('div');
   actWrap.style.cssText = 'display:flex;flex-direction:column;gap:6px;margin-top:10px;';
 
@@ -72,29 +72,47 @@ export function createInspector({ getWorld, registry, getPower, onAction = () =>
 
   let eid = null;
   const invRows = new Map();   // itemId -> { row, amt }
-  const _actBtns = [];   // 复用按钮 DOM
+  let _actBtns = [];   // 当前 show() 创建的按钮 DOM(show 时整体重建)
 
-  function ensureActBtn(i) {
-    while (_actBtns.length <= i) {
+  // 在 show() 时整体重建按钮(每帧 update() 不动 → 不会丢点击)。
+  // 用 addEventListener('click', ...) 而非 onclick 属性, 重复绑定时先 removeEventListener 保证幂等。
+  function setActions(list) {
+    for (const old of _actBtns) actWrap.removeChild(old);
+    _actBtns = [];
+    for (const item of list) {
       const b = document.createElement('button');
-      b.style.cssText = 'width:100%;padding:8px;border:none;border-radius:8px;color:#fff;font-size:13px;font-weight:600;cursor:pointer;';
-      b.onclick = () => { if (b._act) b._act(); };
+      b.textContent = item.label;
+      b.style.cssText = `width:100%;padding:8px;border:none;border-radius:8px;background:${item.color || '#c8622e'};color:#fff;font-size:13px;font-weight:600;cursor:pointer;`;
+      // 关键: 捕获 item.act 到本次 show() 的闭包 — eid 也是此时捕获, 不受后续帧影响
+      const act = item.act;
+      b.addEventListener('click', (ev) => { ev.stopPropagation(); act(); });
       actWrap.appendChild(b);
       _actBtns.push(b);
     }
-    return _actBtns[i];
   }
-  function setActions(list) {
-    for (let i = 0; i < list.length; i++) {
-      const b = ensureActBtn(i);
-      b.textContent = list[i].label;
-      b.style.background = list[i].color || '#c8622e';
-      b.style.display = '';
-      b._act = list[i].act;
+  function clearActions() {
+    for (const old of _actBtns) actWrap.removeChild(old);
+    _actBtns = [];
+  }
+  // 根据 eid 类型构建操作按钮(在 show() 时调用一次, update() 不重绑)
+  // 关键: 闭包捕获当前 id, 不会被后续帧重写。
+  function buildActionsFor(world, id) {
+    const depot = world.get(id, 'Depot');
+    const con = world.get(id, 'Construction');
+    const actions = [];
+    if (depot) {
+      actions.push(
+        { label: '⛏ 生成挖机 ×3', color: '#c8622e', act: () => onAction(id, 'spawn_excavators', 3) },
+        { label: '🚛 生成采矿车 ×3', color: '#9c6b3f', act: () => onAction(id, 'spawn_minetrucks', 3) },
+      );
     }
-    for (let i = list.length; i < _actBtns.length; i++) _actBtns[i].style.display = 'none';
+    if (con && !con.done) {
+      actions.push({ label: '⏩ 立即建成(调试)', color: '#3a6ea5', act: () => { const c = getWorld().get(id, 'Construction'); if (c) { c.stage = 999; c.done = true; c.built = true; } } });
+    } else if (con && con.done && !con.ignited) {
+      actions.push({ label: '🔥 点火', color: '#c8622e', act: () => { const c = getWorld().get(id, 'Construction'); if (c) c.ignited = true; } });
+    }
+    if (actions.length > 0) setActions(actions); else clearActions();
   }
-  function clearActions() { for (const b of _actBtns) b.style.display = 'none'; }
 
   function smallIcon(url, size = 18) {
     const img = document.createElement('img');
@@ -167,6 +185,8 @@ export function createInspector({ getWorld, registry, getPower, onAction = () =>
       // 配方行(生产建筑)
       const prod = world.get(id, 'Producer');
       buildRecipeRow(prod ? registry.recipes[prod.recipeId] : null);
+      // 操作按钮(仅 show() 时构建一次, update() 不动 — 避免每帧重绑点击丢失)
+      buildActionsFor(world, id);
       el.style.display = '';
       api.update();
     },
@@ -352,23 +372,7 @@ export function createInspector({ getWorld, registry, getPower, onAction = () =>
       invTitle.style.display = inv ? '' : 'none';
       if (inv) syncInventory(inv.items); else clearInventory();
 
-      // 操作按钮区(按选中实体类型动态构建)
-      const actions = [];
-      if (depot) {
-        actions.push(
-          { label: '⛏ 生成挖机 ×3', color: '#c8622e', act: () => onAction(eid, 'spawn_excavators', 3) },
-          { label: '🚛 生成采矿车 ×3', color: '#9c6b3f', act: () => onAction(eid, 'spawn_minetrucks', 3) },
-        );
-      }
-      if (zone) {
-        // 挖掘区无操作按钮(只是被动指示器), 但允许"拆除"经 inspector 关闭旁路: 不在此处加, 走拆除模式
-      }
-      if (con && !con.done) {
-        actions.push({ label: '⏩ 立即建成(调试)', color: '#3a6ea5', act: () => { const c = getWorld().get(eid, 'Construction'); if (c) { c.stage = 999; c.done = true; c.built = true; } } });
-      } else if (con && con.done && !con.ignited) {
-        actions.push({ label: '🔥 点火', color: '#c8622e', act: () => { const c = getWorld().get(eid, 'Construction'); if (c) c.ignited = true; } });
-      }
-      if (actions.length > 0) setActions(actions); else clearActions();
+      // 操作按钮已在 show() 时构建一次, update() 不再重建(避免每帧重绑导致点击丢失)
     },
     dispose() { el.remove(); },
   };
