@@ -202,19 +202,17 @@ export function createInspector({ getWorld, registry, getPower }) {
         for (const e of world.query('Excavator')) if (world.get(e, 'Excavator').depot === eid) exc++;
         for (const e of world.query('MineTruck')) if (world.get(e, 'MineTruck').depot === eid) mtk++;
         const hasZone = zone && zone.center;
-        lines.push(kv('挖掘区', hasZone ? `已圈定 (最深 ${zone.depth.toFixed(2)})` : '<b style="color:#d0704f">未圈定</b>'));
+        lines.push(kv('挖掘区', hasZone ? `已圈定 (基准 ${zone.planeH.toFixed(2)} · 最深 ${zone.depth.toFixed(2)})` : '<b style="color:#d0704f">未圈定</b>'));
         lines.push(kv('挖机 / 采矿车', `${exc} / ${mtk}`));
         if (hasZone && zone.vertices) {
-          // 顶点网格统计: 总数 / 已挖穿 / 锁定中 / 平均剩余高度
-          let total = 0, dug = 0, locked = 0, sumRemain = 0;
+          // 顶点网格统计: 总数 / 已平整 / 锁定中 / 待平整
+          let total = 0, done = 0, locked = 0, pending = 0;
           for (const v of zone.vertices) {
             total++;
-            if (v.offset >= v.hardLimit - 1e-6) dug++;
+            if (v.offset >= v.targetOffset - 1e-6) done++; else pending++;
             if (v.ownerId != null) locked++;
-            sumRemain += Math.max(0, v.hardLimit - v.offset);
           }
-          const avgRemain = total > 0 ? (sumRemain / total) : 0;
-          lines.push(kv('顶点', `${total} 个(挖穿 ${dug} · 锁定 ${locked} · 平均剩余 ${avgRemain.toFixed(2)})`));
+          lines.push(kv('顶点', `${total} 个(平整 ${done} · 待平 ${pending} · 锁定 ${locked})`));
         }
         if (!hasZone) lines.push('<div style="color:#d0704f;margin:2px 0">圈定挖掘区并生成挖机+采矿车后开始产矿</div>');
         else if (exc === 0 || mtk === 0) lines.push('<div style="color:#d0704f;margin:2px 0">还需生成挖机与采矿车才会进货</div>');
@@ -224,14 +222,14 @@ export function createInspector({ getWorld, registry, getPower }) {
         lines.push(stateLine('状态', excavator.state, EXCA_STATE));
         lines.push(kv('开采速度', `${rate.toFixed(1)} /秒`));
         lines.push(kv('挖掘半径', `${(excavator.digReach || 0).toFixed(3)} 弧度`));
-        // 当前锁定的顶点 + 进度
+        // 当前锁定的顶点 + 进度(挖到 targetOffset 即平整到 planeH)
         if (excavator.targetVertex != null && excavator.depot != null) {
           const zg = world.get(excavator.depot, 'DigZone');
           if (zg && zg.vertices) {
             const v = zg.vertices[excavator.targetVertex];
             if (v) {
-              const pct = v.hardLimit > 0 ? (v.offset / v.hardLimit) * 100 : 0;
-              lines.push(kv('目标顶点', `#${excavator.targetVertex} · ${v.offset.toFixed(2)} / ${v.hardLimit.toFixed(2)}`));
+              const pct = v.targetOffset > 0 ? (v.offset / v.targetOffset) * 100 : 0;
+              lines.push(kv('目标顶点', `#${excavator.targetVertex} · ${v.offset.toFixed(2)} / ${v.targetOffset.toFixed(2)} → 平面 ${zg.planeH.toFixed(2)}`));
               lines.push(bar(pct, '#ff8a2d'));
             }
           }

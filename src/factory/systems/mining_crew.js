@@ -3,8 +3,9 @@
 //   挖机(Excavator): 在矿场挖掘区里"逐顶点"啃地形(B升级):
 //       - 每台挖机有自己的 digReach(挖掘臂角半径), 只能挖到范围内的顶点;
 //       - 一次只挖一个顶点(降低 zone.vertices[i].offset), 视觉上"一点点"下降;
-//       - 策略: 优先挖范围内最高的顶点; 顶点 ownerId 互斥(挖机间不重叠);
-//       - 顶点挖穿(offset >= hardLimit)即释放, 寻找下一个高点。
+//       - 策略: 以最低点为平面基准(planeH=min baseH), 把"高于基准"的顶点全部挖到基准 → 平整出平面;
+//       - frontier 扩展: 从基准/动工区向外, 由低到高平整(不再东一个坑西一个坑, 也不挖成碗);
+//       - 顶点 ownerId 互斥(挖机间不重叠); 顶点挖到 targetOffset(=baseH-planeH)即释放, 找下一个待平整点。
 //   采矿卡车(MineTruck): 把挖机缓冲运进矿场库存。
 //   下游: 矿场是 Provider, 物流卡车(logistics)从矿场取货送冶炼/仓库 —— 与旧矿机对下游一致。
 // 只有"圈定挖掘区 + 有挖机 + 有采矿卡车"三者齐备, 矿场才会进货。
@@ -36,20 +37,53 @@ export function createMiningCrewSystem(opts = {}) {
   };
 }
 
-// 在 zone 顶点中找"挖机能挖到的最高顶点"。返回顶点索引 or null。
-//   R3: ang <= reach(挖机臂半径内)
-//   R4: 选 baseH-offset 最高的(当前实际高度最大)
-//   R6: 跳过被其他挖机占用的顶点(ownerId != null && != selfEid)
-function findHighestVertex(zone, fromDir, reach, selfEid) {
-  let bestIdx = -1, bestH = -Infinity;
-  for (let i = 0; i < zone.vertices.length; i++) {
-    const v = zone.vertices[i];
-    if (v.ownerId != null && v.ownerId !== selfEid) continue;   // R6 互斥
-    if (v.offset >= v.hardLimit - 1e-6) continue;               // 已挖穿
+// 在 zone 顶点中找挖机的下一个目标。返回顶点索引 or null。
+// 策略(B5+ 平整版): 把"高于基准平面 planeH"的顶点全部挖到 planeH, 形成平整平面(不再挖成坑/碗)。
+//   - 顶点的 targetOffset = baseH - planeH(clamp 到 hardLimit); offset < targetOffset 即"还有工作"
+//   - 选目标: 范围内 + 未被他人锁 + 还有工作量(offset < targetOffset) + 紧邻"已动工/已到位"顶点(frontier)
+//   - 在 frontier 中选 baseH 最低的(从基准向外、由低到高平整)
+//   - R3 仅 ang <= reach; R6 互斥 ownerId; 已到位(offset>=targetOffset)跳过
+//   - 兜底: 范围内无 frontier(挖机离动工区太远)时, 退化到任意有工作量的顶点(最低 baseH 优先)
+function findNextVertex(zone, fromDir, reach, selfEid) {
+  const vs = zone.vertices;
+
+  // 是否已有"动工或到位"的顶点?(基准点天然到位 → 通常一开始就 true)
+  let hasAnchor = false;
+  for (const v of vs) {
+    if (v.offset >= v.targetOffset - 1e-6 || v.offset > 0 || v.ownerId != null) { hasAnchor = true; break; }
+  }
+
+  if (hasAnchor) {
+    // Frontier: 还有工作量的顶点 + 紧邻"动工或到位"的邻居 + baseH 最低
+    let bestIdx = -1, bestH = Infinity;
+    for (let i = 0; i < vs.length; i++) {
+      const v = vs[i];
+      if (v.ownerId != null && v.ownerId !== selfEid) continue;          // R6 互斥
+      if (v.offset >= v.targetOffset - 1e-6) continue;                   // 已到位
+      let frontier = false;
+      for (const ni of (v.neighbors || [])) {
+        const nv = vs[ni];
+        if (nv.offset >= nv.targetOffset - 1e-6 || nv.offset > 0
+            || (nv.ownerId != null && nv.ownerId !== selfEid)) { frontier = true; break; }
+      }
+      if (!frontier) continue;
+      const ang = angle(fromDir, v.dir);
+      if (ang > reach) continue;                                          // R3 超范围
+      if (v.baseH < bestH) { bestH = v.baseH; bestIdx = i; }
+    }
+    if (bestIdx >= 0) return bestIdx;
+    // 兜底未命中(挖机离动工区太远), 落到全局选择
+  }
+
+  // 全局兜底: 任意有工作量的顶点, baseH 最低优先(从低处开始平整)
+  let bestIdx = -1, bestH = Infinity;
+  for (let i = 0; i < vs.length; i++) {
+    const v = vs[i];
+    if (v.ownerId != null && v.ownerId !== selfEid) continue;
+    if (v.offset >= v.targetOffset - 1e-6) continue;
     const ang = angle(fromDir, v.dir);
-    if (ang > reach) continue;                                  // R3 超范围
-    const h = v.baseH - v.offset;                               // 当前实际高度
-    if (h > bestH) { bestH = h; bestIdx = i; }
+    if (ang > reach) continue;
+    if (v.baseH < bestH) { bestH = v.baseH; bestIdx = i; }
   }
   return bestIdx >= 0 ? bestIdx : null;
 }
@@ -63,8 +97,8 @@ function releaseVertex(zone, ex, eid) {
   ex.digProgress = 0;
 }
 
-// 挖机(逐顶点版): 在挖掘区里"找最高顶点 → 移过去 → 啃一个顶点 → 挖穿释放 → 找下一个"。
-// 状态机: idle(寻点冷却) → moving → digging → idle(挖穿后寻下一个)/ full(满仓)
+// 挖机(逐顶点版): 在挖掘区里"找下一个待平整顶点 → 移过去 → 啃到 planeH → 释放 → 找下一个"。
+// 状态机: idle(寻点冷却) → moving → digging → idle(平整完一个找下一个)/ full(满仓)
 // 返回是否改动了地形(顶点 offset 变了 → 需提交)。
 function stepExcavator(world, dt, ctx, e, reg, R) {
   const ex = world.get(e, 'Excavator');
@@ -93,7 +127,7 @@ function stepExcavator(world, dt, ctx, e, reg, R) {
       return false;
     }
     ex.searchCooldown = 0.3;   // 找不到时半秒后再试
-    const idx = findHighestVertex(zone, mv.dir, ex.digReach, e);
+    const idx = findNextVertex(zone, mv.dir, ex.digReach, e);
     if (idx == null) { ex.state = 'idle'; return false; }
     const v = zone.vertices[idx];
     v.ownerId = e;             // 锁定(R6 互斥)
@@ -106,8 +140,8 @@ function stepExcavator(world, dt, ctx, e, reg, R) {
 
   const v = zone.vertices[ex.targetVertex];
 
-  // 防御: 顶点已被挖穿(可能跨 tick 期间被外部释放/改动)
-  if (v.offset >= v.hardLimit - 1e-6) {
+  // 防御: 顶点已挖到平整目标(可能跨 tick 期间被外部改动)
+  if (v.offset >= v.targetOffset - 1e-6) {
     releaseVertex(zone, ex, e);
     ex.state = 'idle';
     return false;
@@ -125,7 +159,7 @@ function stepExcavator(world, dt, ctx, e, reg, R) {
   // 3. digging: 推进顶点 offset(按 digRate 节流), 按当前层产矿
   ex.state = 'digging';
   const col = oreColumn(v.dir, reg.ore);
-  const dd = Math.min((mt.digRate || 0.05) * dt, v.hardLimit - v.offset);
+  const dd = Math.min((mt.digRate || 0.05) * dt, v.targetOffset - v.offset);
   if (dd <= 0) {
     releaseVertex(zone, ex, e);
     ex.state = 'idle';
@@ -142,8 +176,8 @@ function stepExcavator(world, dt, ctx, e, reg, R) {
     ex.lastItem = layer.item;
     v.lastItem = layer.item;
   }
-  // 挖穿 → 释放, 下次 tick 寻新顶点(R5 找下一个高点)
-  if (v.offset >= v.hardLimit - 1e-6) {
+  // 挖到目标平面 → 释放, 下次 tick 寻下一个待平整顶点(R5 找下一个)
+  if (v.offset >= v.targetOffset - 1e-6) {
     releaseVertex(zone, ex, e);
     ex.state = 'idle';
   }
@@ -242,7 +276,9 @@ export function migrateDigZones(world, ctx) {
   for (const e of world.query('DigZone')) {
     const z = world.get(e, 'DigZone');
     if (!z.center) continue;
-    if (z.vertices && z.vertices.length > 0) continue;   // 已有 → 跳过
+    const needs = !z.vertices || z.vertices.length === 0
+      || z.vertices[0].targetOffset == null;   // pre-plane 旧格式 → 重生
+    if (!needs) continue;
     z.vertices = generateVertices(z, planet, reg.ore, hardnessMax);
     touched++;
   }
@@ -297,6 +333,7 @@ function offsetOnCap(center, t1, t2, ax, ay) {
 }
 
 // 在 zone 的球冠内生成顶点数组(挖掘区的离散"逻辑顶点", 与渲染顶点无关)
+// 顶点同时记录六边形邻居(neighbors)和 targetOffset(平整目标): 用于"平整到最低点基准平面"的策略。
 export function generateVertices(zone, planet, oreData, hardnessMax) {
   if (!zone || !zone.center) return [];
   const res = zone.resolution || 0.005;
@@ -304,6 +341,7 @@ export function generateVertices(zone, planet, oreData, hardnessMax) {
   const [t1, t2] = perpBasis(c);
   const ringR = Math.ceil(zone.radius / res);
   const out = [];
+  const qrToIdx = new Map();   // "q,r" → out 索引(用于反查邻居)
   for (let q = -ringR; q <= ringR; q++) {
     for (let r = -ringR; r <= ringR; r++) {
       // 六边形轴坐标裁剪: |q|, |r|, |q+r| 都 <= ringR
@@ -322,13 +360,47 @@ export function generateVertices(zone, planet, oreData, hardnessMax) {
         bottom = Math.max(bottom, l.d1);
         if ((l.hardness || 1) > hardnessMax) cap = Math.min(cap, l.d0);
       }
+      qrToIdx.set(`${q},${r}`, out.length);
       out.push({
         dir, baseH, offset: 0, ownerId: null,
         hardLimit: Math.min(cap, bottom), lastItem: null,
+        targetOffset: 0,                       // 临时占位, 平面基准算完即填
+        neighbors: [], _qr: [q, r],            // _qr 临时, 邻居算完即删
       });
     }
   }
+  // 六边形 6 邻居(轴向): E/W, NE/SW 翻转看坐标系, 这里是 pointy-top 的 6 向
+  const HEX_DIRS = [[1, 0], [-1, 0], [0, 1], [0, -1], [1, -1], [-1, 1]];
+  for (const v of out) {
+    const [q, r] = v._qr;
+    for (const [dq, dr] of HEX_DIRS) {
+      const ni = qrToIdx.get(`${q + dq},${r + dr}`);
+      if (ni != null) v.neighbors.push(ni);
+    }
+    delete v._qr;
+  }
+  // 平面基准 = 最低 baseH; 每个顶点的 targetOffset = clamp(baseH - planeH, 0, hardLimit)
+  // 挖机把所有"高于基准"的顶点挖到基准 → 平整出平面(planeH)。最低点天然在基准上(targetOffset=0)。
+  recomputePlaneImpl(zone, out);
   return out;
+}
+
+// 内部实现: 给定 zone + 顶点数组, 计算平面基准和每个顶点的 targetOffset。
+// 导出版(recomputePlane)供测试在改完 baseH 后重算。
+function recomputePlaneImpl(zone, vertices) {
+  if (!vertices || vertices.length === 0) return;
+  let planeH = Infinity;
+  for (const v of vertices) if (v.baseH < planeH) planeH = v.baseH;
+  zone.planeH = planeH;
+  for (const v of vertices) {
+    v.targetOffset = Math.min(Math.max(0, v.baseH - planeH), v.hardLimit);
+  }
+}
+
+// 公开: 手动改完顶点 baseH/hardLimit 后, 重新计算 planeH 和每顶点 targetOffset。
+// 正常玩法里 baseH 不变(只在 setDigZone 时算一次), 此函数主要给测试用。
+export function recomputePlane(zone) {
+  recomputePlaneImpl(zone, zone.vertices);
 }
 
 // 圈定矿场挖掘区: 设中心方向 + 生成顶点网格 + 建/换该矿场的挖掘区地形坑 edit(向后兼容)

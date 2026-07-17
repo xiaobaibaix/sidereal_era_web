@@ -37,7 +37,8 @@ export function placeBuilding(world, ctx, buildingId, dir, yaw = 0) {
     world.add(e, 'Inventory', { items: {}, cap: b.cap != null ? b.cap : Infinity });
     world.add(e, 'Provider', { items: '*' });   // 对外供应存储的一切
     // DigZone: vertices=null 表示未圈定; setDigZone 时填充顶点网格(逐顶点挖掘的基础)。
-    world.add(e, 'DigZone', { center: null, radius: b.zoneRadius || 0.05, depth: 0, resolution: b.digResolution || 0.005, vertices: null });
+    // planeH = 顶点网格中最低 baseH(平整目标平面高度); setDigZone 时计算。
+    world.add(e, 'DigZone', { center: null, radius: b.zoneRadius || 0.05, depth: 0, resolution: b.digResolution || 0.005, vertices: null, planeH: 0 });
   } else if (b.kind === 'producer') {
     const recipeId = b.recipe || (b.recipes && b.recipes[0]);
     const recipe = registry.recipes[recipeId] || { in: [], out: [] };

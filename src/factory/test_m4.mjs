@@ -25,7 +25,9 @@ function stubPlanet() {
     params: { edits: [], radius: 100, maxHeight: 8, seaLevel: 0 },
     roots: [], _editPending: false,
     _buildNoise() {}, _invalidateAffected() {},
-    heightAt() { return 0; }, baseHeightAt() { return 0; },
+    // 平整策略需要 baseH 有变化(否则 planeH == max → 全部 targetOffset=0, 挖机没活干)
+    baseHeightAt(x, y, z) { return 1.0 + 0.3 * Math.sin(x * 50) + 0.3 * Math.cos(z * 70); },
+    heightAt(x, y, z) { return this.baseHeightAt(x, y, z); },
     position: { x: 0, y: 0, z: 0 },
   };
 }

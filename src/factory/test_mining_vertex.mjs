@@ -8,7 +8,7 @@ import { createRegistry } from './core/registry.js';
 import { createSpatial } from './core/spatial.js';
 import { createEventBus } from './core/events.js';
 import { placeBuilding, demolish } from './systems/placement.js';
-import { setDigZone, generateVertices, spawnExcavators, syncDigZoneVertices, migrateDigZones, createMiningCrewSystem } from './systems/mining_crew.js';
+import { setDigZone, generateVertices, spawnExcavators, syncDigZoneVertices, migrateDigZones, recomputePlane, createMiningCrewSystem } from './systems/mining_crew.js';
 import { angle } from './core/sphere.js';
 import { invTotal } from './core/inventory.js';
 import { oreColumn, layerAt } from './ore.js';
@@ -18,12 +18,15 @@ let pass = 0;
 const ok = (n) => { pass++; console.log('  ✓', n); };
 
 // 桩 planet: 只需要 baseHeightAt + params.edits/roots/_buildNoise/_invalidateAffected/_editPending
-function stubPlanet(baseH = 0.3) {
+// baseHeightAt 用确定性高频函数让顶点 baseH 在 [0.4, 1.6] 内大幅变化
+// (否则 planeH == max → 全部 targetOffset=0, 没活干; 或 targetOffset 太小一帧就挖完)
+function stubPlanet(baseH = 1.0) {
   return {
     params: { edits: [], radius: 100, maxHeight: 8, seaLevel: 0 },
     roots: [], _editPending: false,
     _buildNoise() {}, _invalidateAffected() {},
-    baseHeightAt() { return baseH; }, heightAt() { return baseH; },
+    baseHeightAt(x, y, z) { return baseH + 0.3 * Math.sin(x * 50) + 0.3 * Math.cos(z * 70); },
+    heightAt(x, y, z) { return this.baseHeightAt(x, y, z); },
     position: { x: 0, y: 0, z: 0 },
   };
 }
@@ -275,20 +278,18 @@ function stubPlanetHMap(hMap) {
 
 // ---- 10. R3: 挖机只挖 digReach 内的顶点 ----
 {
-  // 构造一个 zone, 把所有顶点的 baseH 设为相等(避免 R4 干扰)
+  // 用 stubPlanet 自带的高度变化(各顶点 baseH 不同 → 总有高于基准的待平整顶点)
   const planet = stubPlanet();
   const ctx = makeCtx(planet);
   const world = createWorld();
   const depot = placeBuilding(world, ctx, 'depot', norm([0, 1, 0]));
   setDigZone(world, ctx, depot, norm([0, 1, 0]));
   const zone = world.get(depot, 'DigZone');
-  // 把所有顶点的 baseH 设为 0.5(让 R4 不影响选择, 纯测范围)
-  for (const v of zone.vertices) v.baseH = 0.5;
 
-  // 把挖机放到 zone 中心, digReach 设很小(0.005)
+  // 把挖机放到 zone 中心, digReach 设很小(0.006)
   const [ex] = spawnExcavators(world, ctx, 1, depot);
   world.get(ex, 'Mover').dir = [...zone.center];
-  world.get(ex, 'Excavator').digReach = 0.005;
+  world.get(ex, 'Excavator').digReach = 0.006;
   // 跑一帧, 让挖机锁定一个顶点
   world.addSystem('mining_crew', createMiningCrewSystem());
   world.tick(0.05, ctx);
@@ -296,11 +297,11 @@ function stubPlanetHMap(hMap) {
   assert.ok(targetIdx != null, '挖机锁定了一个顶点');
   const targetV = zone.vertices[targetIdx];
   const ang = angle(targetV.dir, zone.center);
-  assert.ok(ang <= 0.005 + 1e-6, `锁定顶点在 digReach 内(ang=${ang.toFixed(4)} <= 0.005)`);
+  assert.ok(ang <= 0.006 + 1e-6, `锁定顶点在 digReach 内(ang=${ang.toFixed(4)} <= 0.006)`);
   ok('R3: 挖机只锁定 digReach 内的顶点');
 }
 
-// ---- 11. R4: 挖机优先挖"最高"的顶点 ----
+// ---- 11. R4(平面版): 挖机不挖基准点, 锁定高于基准的 frontier 顶点 ----
 {
   const planet = stubPlanet();
   const ctx = makeCtx(planet);
@@ -308,20 +309,59 @@ function stubPlanetHMap(hMap) {
   const depot = placeBuilding(world, ctx, 'depot', norm([0, 1, 0]));
   setDigZone(world, ctx, depot, norm([0, 1, 0]));
   const zone = world.get(depot, 'DigZone');
-  // 让顶点高度差异大: 第 0 个 = 0.9, 其余 = 0.1
-  for (const v of zone.vertices) v.baseH = 0.1;
-  zone.vertices[0].baseH = 0.9;
+  // 选一个有>=3邻居的内部顶点作为基准(最低), 其余调高
+  const baseIdx = zone.vertices.findIndex((v) => (v.neighbors || []).length >= 3);
+  assert.ok(baseIdx >= 0, '存在>=3邻居的内部顶点');
+  for (const v of zone.vertices) v.baseH = 0.5;
+  zone.vertices[baseIdx].baseH = 0.2;   // 最低 → 基准
+  recomputePlane(zone);
+  assert.equal(zone.planeH, 0.2, 'planeH = 最低 baseH');
+  assert.equal(zone.vertices[baseIdx].targetOffset, 0, '基准点 targetOffset=0(无需挖)');
 
   const [ex] = spawnExcavators(world, ctx, 1, depot);
-  // digReach 设大, 让所有顶点都可达
   world.get(ex, 'Excavator').digReach = 1.0;
-  world.get(ex, 'Mover').dir = [...zone.center];
-
+  world.get(ex, 'Mover').dir = [...zone.vertices[baseIdx].dir];
   world.addSystem('mining_crew', createMiningCrewSystem());
   world.tick(0.05, ctx);
   const targetIdx = world.get(ex, 'Excavator').targetVertex;
-  assert.equal(targetIdx, 0, '锁定最高的顶点(顶点 0, baseH=0.9)');
-  ok('R4: 挖机优先锁定最高的顶点');
+  assert.ok(targetIdx != null, '锁定了一个顶点');
+  assert.notEqual(targetIdx, baseIdx, '不锁基准点(基准无需挖)');
+  assert.ok(zone.vertices[targetIdx].targetOffset > 0, '锁定的顶点高于基准(有工作量)');
+  assert.ok(
+    (zone.vertices[baseIdx].neighbors || []).includes(targetIdx),
+    '锁定基准的邻居(frontier 扩展, 不远程跳)'
+  );
+  ok('R4(平面版): 不挖基准点, 锁定其邻居中高于基准的顶点');
+}
+
+// ---- 11b. 平整策略: 由低到高扩展(多个候选时选 baseH 最低的) ----
+{
+  const planet = stubPlanet();
+  const ctx = makeCtx(planet);
+  const world = createWorld();
+  const depot = placeBuilding(world, ctx, 'depot', norm([0, 1, 0]));
+  setDigZone(world, ctx, depot, norm([0, 1, 0]));
+  const zone = world.get(depot, 'DigZone');
+  // 基准点 + 两个不同高度的邻居(其余顶点设很高, 不参与)
+  const baseIdx = zone.vertices.findIndex((v) => (v.neighbors || []).length >= 2);
+  assert.ok(baseIdx >= 0, '存在>=2邻居的顶点');
+  for (const v of zone.vertices) { v.baseH = 1.0; v.hardLimit = 2.0; }
+  zone.vertices[baseIdx].baseH = 0.2;
+  // 第一个邻居调低, 第二个邻居调高 → 应优先选低的
+  const nbs = zone.vertices[baseIdx].neighbors;
+  assert.ok(nbs.length >= 2, '基准有>=2邻居');
+  zone.vertices[nbs[0]].baseH = 0.3;   // 较低
+  zone.vertices[nbs[1]].baseH = 0.9;   // 较高
+  recomputePlane(zone);
+
+  const [ex] = spawnExcavators(world, ctx, 1, depot);
+  world.get(ex, 'Excavator').digReach = 1.0;
+  world.get(ex, 'Mover').dir = [...zone.vertices[baseIdx].dir];
+  world.addSystem('mining_crew', createMiningCrewSystem());
+  world.tick(0.05, ctx);
+  const targetIdx = world.get(ex, 'Excavator').targetVertex;
+  assert.equal(targetIdx, nbs[0], '锁定 baseH 较低的邻居(由低到高平整)');
+  ok('平整策略: 多候选时选 baseH 最低的(由低到高扩展)');
 }
 
 // ---- 12. R6: 两台挖机不会锁同一个顶点 ----
@@ -332,10 +372,10 @@ function stubPlanetHMap(hMap) {
   const depot = placeBuilding(world, ctx, 'depot', norm([0, 1, 0]));
   setDigZone(world, ctx, depot, norm([0, 1, 0]));
   const zone = world.get(depot, 'DigZone');
-  for (const v of zone.vertices) v.baseH = 0.5;
+  // stubPlanet 已有高度变化 → 总有待平整顶点
 
   const [ex1, ex2] = spawnExcavators(world, ctx, 2, depot);
-  // 两台挖机放在同一点(都看到同样的顶点候选)
+  // 两台挖机放在同一点(都看到同样的候选)
   world.get(ex1, 'Mover').dir = [...zone.center];
   world.get(ex2, 'Mover').dir = [...zone.center];
   world.get(ex1, 'Excavator').digReach = 1.0;
@@ -351,7 +391,7 @@ function stubPlanetHMap(hMap) {
   ok('R6: 两台挖机不会锁同一个顶点');
 }
 
-// ---- 13. 挖穿后释放 + 找下一个(R5) ----
+// ---- 13. 平整到 targetOffset 后释放 + 找下一个(R5) ----
 {
   const planet = stubPlanet();
   const ctx = makeCtx(planet);
@@ -359,26 +399,30 @@ function stubPlanetHMap(hMap) {
   const depot = placeBuilding(world, ctx, 'depot', norm([0, 1, 0]));
   setDigZone(world, ctx, depot, norm([0, 1, 0]));
   const zone = world.get(depot, 'DigZone');
-  // 把 hardLimit 调到很小, 让挖机几帧就挖穿
-  for (const v of zone.vertices) { v.hardLimit = 0.05; v.baseH = 0.5; }
+  // 构造很小的 targetOffset, 让挖机几帧就平整完一个顶点
+  // 基准 baseH=0.45, 其他 baseH=0.5 → targetOffset=0.05
+  for (const v of zone.vertices) { v.baseH = 0.5; v.hardLimit = 2.0; }
+  const baseIdx = zone.vertices.findIndex((v) => (v.neighbors || []).length >= 3);
+  zone.vertices[baseIdx].baseH = 0.45;
+  recomputePlane(zone);
 
   const [ex] = spawnExcavators(world, ctx, 1, depot);
   world.get(ex, 'Excavator').digReach = 1.0;
-  world.get(ex, 'Mover').dir = [...zone.center];
+  world.get(ex, 'Mover').dir = [...zone.vertices[baseIdx].dir];
 
   world.addSystem('mining_crew', createMiningCrewSystem());
-  // 跑很多帧, 应该挖穿多个顶点
+  // 跑很多帧, 应该平整完多个顶点
   let lastTarget = null, switches = 0;
-  for (let i = 0; i < 200; i++) {
+  for (let i = 0; i < 400; i++) {
     world.tick(0.05, ctx);
     const t = world.get(ex, 'Excavator').targetVertex;
     if (t != null && t !== lastTarget) { switches++; lastTarget = t; }
   }
-  assert.ok(switches >= 2, `挖机至少切换过 2 次目标(实际 ${switches}, 挖穿后找下一个)`);
-  // 挖穿过的顶点 offset 达到 hardLimit
-  const dug = zone.vertices.filter((v) => v.offset >= v.hardLimit - 1e-6).length;
-  assert.ok(dug >= 2, `至少 2 个顶点被挖穿(实际 ${dug})`);
-  ok('R5: 挖穿后释放, 找下一个高点');
+  assert.ok(switches >= 2, `挖机至少切换过 2 次目标(实际 ${switches}, 平整完一个换下一个)`);
+  // 平整完的顶点 offset 达到 targetOffset
+  const done = zone.vertices.filter((v) => v.offset >= v.targetOffset - 1e-6).length;
+  assert.ok(done >= 2, `至少 2 个顶点已平整到 targetOffset(实际 ${done})`);
+  ok('R5: 平整到 targetOffset 后释放, 找下一个');
 }
 
 // ---- 14. 端到端: 挖机产矿到自身缓冲(产出物品符合矿层) ----
@@ -427,6 +471,49 @@ function stubPlanetHMap(hMap) {
 }
 
 console.log(`\n阶段 3 全部通过 (${pass} 组断言)`);
+
+// ---- 15b. 平整收敛: 多 tick 后所有顶点 offset = targetOffset(平整出平面) ----
+{
+  const planet = stubPlanet();
+  const ctx = makeCtx(planet);
+  const world = createWorld();
+  const depot = placeBuilding(world, ctx, 'depot', norm([0, 1, 0]));
+  setDigZone(world, ctx, depot, norm([0, 1, 0]));
+  const zone = world.get(depot, 'DigZone');
+  // 给挖机大 digReach + 调大 digRate + 把库存上限放到无限(避免被满仓中断, 本测试只关心平整)
+  const [ex1, ex2] = spawnExcavators(world, ctx, 2, depot);
+  for (const eid of [ex1, ex2]) {
+    world.get(eid, 'Excavator').digReach = 1.0;
+    world.get(eid, 'Mover').dir = [...zone.center];
+    world.get(eid, 'Inventory').cap = Infinity;
+  }
+  ctx.registry.machineTypes.excavator_mk1.digRate = 1.0;
+  world.addSystem('mining_crew', createMiningCrewSystem());
+  for (let i = 0; i < 2000; i++) world.tick(0.05, ctx);
+  // 验证: 所有顶点 offset 达到 targetOffset(每个顶点都平整到位)
+  // targetOffset = min(baseH - planeH, hardLimit); 达到 targetOffset 即"该挖的都挖了"
+  let maxShort = 0;
+  for (const v of zone.vertices) {
+    const short = v.targetOffset - v.offset;
+    if (short > maxShort) maxShort = short;
+  }
+  assert.ok(maxShort < 1e-3, `所有顶点平整到 targetOffset(最大欠挖 ${maxShort.toFixed(4)} < 1e-3)`);
+  // 挖机应该都空闲(没活了)
+  const idleCount = [ex1, ex2].filter((e) => world.get(e, 'Excavator').targetVertex == null).length;
+  assert.equal(idleCount, 2, '平整完毕后挖机空闲(无工作量)');
+  // 可达平面验证: 未被 hardLimit 钳制的顶点 current 高度 == planeH
+  const reachablePlane = zone.vertices.filter((v) => v.targetOffset < v.hardLimit - 1e-6);
+  let maxDev = 0;
+  for (const v of reachablePlane) {
+    const cur = v.baseH - v.offset;
+    const dev = Math.abs(cur - zone.planeH);
+    if (dev > maxDev) maxDev = dev;
+  }
+  assert.ok(maxDev < 1e-3, `未被硬层阻挡的顶点 current == planeH(最大偏差 ${maxDev.toFixed(4)})`);
+  ok(`平整收敛: 所有顶点到 targetOffset → 形成平整平面(欠挖 ${maxShort.toFixed(4)}, 可达偏差 ${maxDev.toFixed(4)})`);
+  // 还原 digRate(避免污染后续测试)
+  ctx.registry.machineTypes.excavator_mk1.digRate = 0.05;
+}
 
 // ===========================================================================
 // 阶段 5: 存档与端到端(migrateDigZones + toJSON/fromJSON 往返)
