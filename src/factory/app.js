@@ -17,7 +17,7 @@ import * as THREE from 'three';
 import GUI from 'lil-gui';
 import { createFactory } from './factory.js';
 import gameData from './data/gamedata.js';
-import { createMiningCrewSystem, placeDigZoneEntity, getDepotCoverage, spawnExcavators, spawnMineTrucks } from './systems/mining_crew.js';
+import { createMiningCrewSystem, placeDigZoneEntity, spawnExcavators, spawnMineTrucks } from './systems/mining_crew.js';
 import { createProductionSystem } from './systems/production.js';
 import { createPowerSystem } from './systems/power.js';
 import { createResearchSystem } from './systems/research.js';
@@ -95,6 +95,8 @@ export function createFactoryApp(opts) {
   // ---- 建造面板 ----
   const fpTool = {
     mode: '关闭',
+    excavatorCount: 3, spawnExcavators() { doSpawnExcavators(); },
+    mineTruckCount: 3, spawnMineTrucks() { doSpawnMineTrucks(); },
     haulerCount: 3, spawnHaulers() { doSpawnHaulers(); },
     inserterDir: '进料', inserterReach: 1,   // 分拣器: 方向(进料/出料) + 抓取距离(1/2/3 格)
     probeTol: 0.02, probeMinCells: 9, probeRadius: 0.15,   // 探测建造区: 平整容差 / 最小格数 / 探测半径(角)
@@ -173,6 +175,29 @@ export function createFactoryApp(opts) {
   function firstDepot() {
     for (const e of factory.world.query('Depot')) return e;
     return null;
+  }
+  // 取最近的有覆盖挖掘区的矿场(全局生成按钮用); 没有则取最近矿场; 再没有返回 null。
+  // 优先级: ① 已覆盖 zone 的矿场 > ② 任意矿场。挖机/采矿车只有在有 zone 可挖时才有意义。
+  function bestDepotForSpawn() {
+    let any = null, withZone = null;
+    for (const e of factory.world.query('Depot')) {
+      if (any == null) any = e;
+      const dep = factory.world.get(e, 'Depot');
+      if (dep && dep.coverageZones && dep.coverageZones.length > 0) { withZone = e; break; }
+    }
+    return withZone || any;
+  }
+  function doSpawnExcavators() {
+    const depot = bestDepotForSpawn();
+    if (depot == null) { showToast('请先放置矿场', true); return; }
+    spawnExcavators(factory.world, factory.ctx, fpTool.excavatorCount, depot);
+    showToast(`已生成 ${fpTool.excavatorCount} 台挖机 · 归属此矿场`, false);
+  }
+  function doSpawnMineTrucks() {
+    const depot = bestDepotForSpawn();
+    if (depot == null) { showToast('请先放置矿场', true); return; }
+    spawnMineTrucks(factory.world, factory.ctx, fpTool.mineTruckCount, depot);
+    showToast(`已生成 ${fpTool.mineTruckCount} 辆采矿车 · 归属此矿场`, false);
   }
   function doSpawnHaulers() {
     let nearDir = [0, 1, 0];
