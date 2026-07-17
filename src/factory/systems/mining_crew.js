@@ -521,7 +521,13 @@ export function generateVertices(zone, planet, oreData, hardnessMax) {
       const dir = offsetOnCap(c, t1, t2, ax, ay);
       const ang = angle(dir, c);
       if (ang > zone.radius) continue;
-      const baseH = planet && planet.baseHeightAt ? planet.baseHeightAt(dir[0], dir[1], dir[2]) : 0;
+      // baseH = 该方向"当前"地形高度(含已有挖掘/整平), 不是原始噪声。
+      //   → 已被挖低的地方 baseH 就低, targetOffset≈0, 挖机不会重复去挖已经够低的位置。
+      //   (heightAt 已含其它 edits 与其它 zone 的永久变形; 本 zone 此刻尚未同步进 digZoneVertices, 无自反馈)
+      const baseH = planet
+        ? (planet.heightAt ? planet.heightAt(dir[0], dir[1], dir[2])
+          : (planet.baseHeightAt ? planet.baseHeightAt(dir[0], dir[1], dir[2]) : 0))
+        : 0;
       const col = oreColumn(dir, oreData);
       let cap = Infinity, bottom = 0;
       for (const l of col) {
