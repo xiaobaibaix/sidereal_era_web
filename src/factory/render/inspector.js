@@ -17,9 +17,9 @@ const MINER_STATE = { mining: '开采中', full: '满仓待运', blocked: '受�
 const PROD_STATE = { working: '生产中', starved: '缺原料', output_full: '产物已满', no_power: '缺电停机', idle: '空闲' };
 const HAUL_STATE = { idle: '待命', to_src: '前往取货', load: '装载中', to_sink: '前往卸货', unload: '卸货中' };
 const LAB_STATE = { researching: '研究中', starved: '缺原料', idle: '空闲' };
-const EXCA_STATE = { digging: '开采中', to_zone: '前往挖点', full: '满仓待运', idle: '空闲(未圈定挖掘区?)' };
+const EXCA_STATE = { digging: '开采中', moving: '前往顶点', seeking: '寻点中', to_zone: '前往挖点', full: '满仓待运', idle: '空闲(范围内无更高顶点)' };
 const MINETRUCK_STATE = { idle: '待命', to_exca: '前往挖机', load: '装载中', to_depot: '运往矿场', unload: '卸货中' };
-const STATE_COLOR = { mining: '#ffc040', working: '#ffc040', digging: '#ff8a2d', load: '#ffc040', full: '#66cc66', to_sink: '#66cc66', unload: '#66cc66', to_depot: '#9c6b3f', to_src: '#5ab0ff', to_exca: '#ffe27a', to_zone: '#ffd24a', starved: '#d0704f', blocked: '#d0413f', output_full: '#5ab0ff', no_power: '#50606f', idle: '#8a8f98' };
+const STATE_COLOR = { mining: '#ffc040', working: '#ffc040', digging: '#ff8a2d', moving: '#ffd24a', seeking: '#ffe27a', load: '#ffc040', full: '#66cc66', to_sink: '#66cc66', unload: '#66cc66', to_depot: '#9c6b3f', to_src: '#5ab0ff', to_exca: '#ffe27a', to_zone: '#ffd24a', starved: '#d0704f', blocked: '#d0413f', output_full: '#5ab0ff', no_power: '#50606f', idle: '#8a8f98' };
 
 const itemIconUrl = (id) => (ITEM_ICON[id] ? ICON_BASE + ITEM_ICON[id] + '.webp' : null);
 const meshIconUrl = (m) => (MESH_ICON[m] ? ICON_BASE + MESH_ICON[m] + '.webp' : null);
@@ -197,13 +197,25 @@ export function createInspector({ getWorld, registry, getPower }) {
           }
         }
       } else if (depot) {
-        // 矿场: 挖掘区状态 + 绑定的挖机/采矿车数
+        // 矿场: 挖掘区状态 + 顶点网格统计 + 绑定的挖机/采矿车数
         let exc = 0, mtk = 0;
         for (const e of world.query('Excavator')) if (world.get(e, 'Excavator').depot === eid) exc++;
         for (const e of world.query('MineTruck')) if (world.get(e, 'MineTruck').depot === eid) mtk++;
         const hasZone = zone && zone.center;
-        lines.push(kv('挖掘区', hasZone ? `已圈定 (深度 ${zone.depth.toFixed(2)})` : '<b style="color:#d0704f">未圈定</b>'));
+        lines.push(kv('挖掘区', hasZone ? `已圈定 (最深 ${zone.depth.toFixed(2)})` : '<b style="color:#d0704f">未圈定</b>'));
         lines.push(kv('挖机 / 采矿车', `${exc} / ${mtk}`));
+        if (hasZone && zone.vertices) {
+          // 顶点网格统计: 总数 / 已挖穿 / 锁定中 / 平均剩余高度
+          let total = 0, dug = 0, locked = 0, sumRemain = 0;
+          for (const v of zone.vertices) {
+            total++;
+            if (v.offset >= v.hardLimit - 1e-6) dug++;
+            if (v.ownerId != null) locked++;
+            sumRemain += Math.max(0, v.hardLimit - v.offset);
+          }
+          const avgRemain = total > 0 ? (sumRemain / total) : 0;
+          lines.push(kv('顶点', `${total} 个(挖穿 ${dug} · 锁定 ${locked} · 平均剩余 ${avgRemain.toFixed(2)})`));
+        }
         if (!hasZone) lines.push('<div style="color:#d0704f;margin:2px 0">圈定挖掘区并生成挖机+采矿车后开始产矿</div>');
         else if (exc === 0 || mtk === 0) lines.push('<div style="color:#d0704f;margin:2px 0">还需生成挖机与采矿车才会进货</div>');
       } else if (excavator) {
@@ -211,6 +223,19 @@ export function createInspector({ getWorld, registry, getPower }) {
         const rate = (mt.digRate || 0) * (mt.yield || 0);
         lines.push(stateLine('状态', excavator.state, EXCA_STATE));
         lines.push(kv('开采速度', `${rate.toFixed(1)} /秒`));
+        lines.push(kv('挖掘半径', `${(excavator.digReach || 0).toFixed(3)} 弧度`));
+        // 当前锁定的顶点 + 进度
+        if (excavator.targetVertex != null && excavator.depot != null) {
+          const zg = world.get(excavator.depot, 'DigZone');
+          if (zg && zg.vertices) {
+            const v = zg.vertices[excavator.targetVertex];
+            if (v) {
+              const pct = v.hardLimit > 0 ? (v.offset / v.hardLimit) * 100 : 0;
+              lines.push(kv('目标顶点', `#${excavator.targetVertex} · ${v.offset.toFixed(2)} / ${v.hardLimit.toFixed(2)}`));
+              lines.push(bar(pct, '#ff8a2d'));
+            }
+          }
+        }
         if (excavator.lastItem) lines.push(kv('当前产物', itemName(excavator.lastItem)));
       } else if (minetruck) {
         lines.push(stateLine('状态', minetruck.state, MINETRUCK_STATE));

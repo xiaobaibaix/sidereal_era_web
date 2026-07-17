@@ -392,6 +392,15 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
   jetMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
   scene.add(jetMesh);
 
+  // ---- 顶点指示器(B升级·逐顶点挖掘): 挖机锁定的顶点画一个小光点, 显示"正在挖这里" ----
+  const VTX_MAX = 1024;
+  const vtxGeo = new THREE.SphereGeometry(0.7, 8, 6);
+  const vtxMat = new THREE.MeshBasicMaterial({ color: 0xff5aff, transparent: true, opacity: 0.9, depthTest: false, depthWrite: false });
+  const vtxMesh = new THREE.InstancedMesh(vtxGeo, vtxMat, VTX_MAX);
+  vtxMesh.frustumCulled = false; vtxMesh.count = 0; vtxMesh.renderOrder = 995;
+  vtxMesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  scene.add(vtxMesh);
+
   // ---- 传送带渲染: 带段(沿弧摆放的平板)+ 带上物品(小立方, 按物品染色) ----
   const BELT_SEG_MAX = 8192, BELT_ITEM_MAX = 8192;
   const beltSegGeo = buildBeltSegGeometry();
@@ -531,6 +540,25 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
           i++;
         }
         for (; i < zonePool.length; i++) zonePool[i].visible = false;
+      }
+
+      // 顶点指示器(B升级): 被挖机锁定的顶点画紫色光点(显示挖机正在挖哪里)
+      {
+        let i = 0;
+        for (const e of world.query('DigZone')) {
+          const z = world.get(e, 'DigZone');
+          if (!z || !z.vertices) continue;
+          for (const v of z.vertices) {
+            if (v.ownerId == null) continue;
+            if (i >= VTX_MAX) break;
+            worldMatrix(v.dir, 0, planet, _m, 1);
+            vtxMesh.setMatrixAt(i, _m);
+            i++;
+          }
+          if (i >= VTX_MAX) break;
+        }
+        vtxMesh.count = i;
+        vtxMesh.instanceMatrix.needsUpdate = true;
       }
     },
     showPickRanges(on) { ringGroup.visible = !!on; },

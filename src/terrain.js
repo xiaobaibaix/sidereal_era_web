@@ -87,6 +87,18 @@ export function makeTerrain(p) {
     depth: e.depth, level: e.level, progress: e.progress, dry: e.dry,
     falloff: e.falloff || 'smooth',
   })) : [];
+  // 顶点网格(B升级·逐顶点挖掘): 每个矿场挖掘区一组离散顶点; heightAt 用 IDW(反距离加权)把它们
+  // 叠加到高度场上 → 挖机改某顶点 offset 即"该方向下沉一点", 视觉上一点一点下降。
+  //   - center: zone 中心方向(单位向量)
+  //   - cosRadiusPad: cos(radius+padding), 角距离 > radius+pad 的采样点直接跳过该 zone(粗筛)
+  //   - maxInfluence: 单顶点影响半径(角弧度); 通常 = zone.resolution × 1.5
+  //   - vertices: [{ dir, offset }] (offset>=0, 已挖深度; heightAt 中减去)
+  const digZones = Array.isArray(p.digZoneVertices) ? p.digZoneVertices.map((z) => ({
+    center: z.center,
+    cosRadiusPad: Math.cos((z.radius || 0) + 0.005),
+    maxInfluence: z.maxInfluence || 0.0075,
+    vertices: Array.isArray(z.vertices) ? z.vertices.map((v) => ({ dir: v.dir, offset: v.offset || 0 })) : [],
+  })) : [];
   // 每条挖掘编辑自带 dry 标记(挖的那刻的开关状态): 默认(dry!==false)是"干坑"→坑底露泥土;
   // dry===false 的是"湖"(关闭开关时挖的)→坑内保留海洋色。逐编辑独立, 改开关不影响已挖好的。
   const lakeEdits = edits.filter((e) => e.dry === false).map((e) => ({ pos: e.pos, cosR: Math.cos(e.radius) }));
@@ -164,6 +176,28 @@ export function makeTerrain(p) {
         } else {
           h -= e.depth * fall;                               // 减量式(挖/抬)
         }
+      }
+    }
+    // 叠加顶点网格 offset(B升级·逐顶点挖掘): IDW 反距离加权, maxInfluence 内的顶点参与
+    if (digZones.length > 0) {
+      const len = Math.hypot(x, y, z) || 1;
+      const ux = x / len, uy = y / len, uz = z / len;
+      for (let gi = 0; gi < digZones.length; gi++) {
+        const zg = digZones[gi];
+        const cosC = ux * zg.center[0] + uy * zg.center[1] + uz * zg.center[2];
+        if (cosC < zg.cosRadiusPad) continue;                // 粗筛: 角距离 > radius+pad
+        let weight = 0, sumOff = 0;
+        for (let vi = 0; vi < zg.vertices.length; vi++) {
+          const v = zg.vertices[vi];
+          if (v.offset <= 0) continue;                       // offset=0 不影响(避免遍历全 0)
+          const cos = ux * v.dir[0] + uy * v.dir[1] + uz * v.dir[2];
+          if (cos <= 0) continue;
+          const ang = cos >= 1 ? 0 : Math.acos(cos);
+          if (ang > zg.maxInfluence) continue;
+          const w = 1 / Math.max(ang, 1e-4);                 // 反距离权重
+          weight += w; sumOff += v.offset * w;
+        }
+        if (weight > 0) h -= sumOff / weight;
       }
     }
     return h;

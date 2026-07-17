@@ -4,6 +4,7 @@
 import { createBelt } from './belt.js';
 import { midPortDir } from './inserter.js';
 import { norm } from '../core/sphere.js';
+import { syncDigZoneVertices } from './mining_crew.js';
 
 // 放置一个建筑; 返回实体 id(失败返回 null)
 export function placeBuilding(world, ctx, buildingId, dir, yaw = 0) {
@@ -35,7 +36,8 @@ export function placeBuilding(world, ctx, buildingId, dir, yaw = 0) {
     world.add(e, 'Depot', {});
     world.add(e, 'Inventory', { items: {}, cap: b.cap != null ? b.cap : Infinity });
     world.add(e, 'Provider', { items: '*' });   // 对外供应存储的一切
-    world.add(e, 'DigZone', { center: null, radius: b.zoneRadius || 0.05, depth: 0 });
+    // DigZone: vertices=null 表示未圈定; setDigZone 时填充顶点网格(逐顶点挖掘的基础)。
+    world.add(e, 'DigZone', { center: null, radius: b.zoneRadius || 0.05, depth: 0, resolution: b.digResolution || 0.005, vertices: null });
   } else if (b.kind === 'producer') {
     const recipeId = b.recipe || (b.recipes && b.recipes[0]);
     const recipe = registry.recipes[recipeId] || { in: [], out: [] };
@@ -184,7 +186,10 @@ export function demolish(world, ctx, eid) {
   };
   restore(ctx.minerEdits && ctx.minerEdits.get(eid), ctx.minerEdits);   // 旧直挖矿机的坑
   restore(ctx.zoneEdits && ctx.zoneEdits.get(eid), ctx.zoneEdits);       // 矿场挖掘区的坑
+  const hadDigZone = world.has(eid, 'DigZone');
   if (spatial) spatial.remove(eid);
   world.destroy(eid);
+  // 顶点网格同步: 已销毁的 depot 不应在 digZoneVertices 里 → 重同步(必须在 destroy 之后)
+  if (hadDigZone) syncDigZoneVertices(world, ctx);
   if (bus) bus.emit('demolish', { eid });
 }

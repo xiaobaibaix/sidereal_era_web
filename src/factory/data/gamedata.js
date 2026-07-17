@@ -42,7 +42,8 @@ export const machineTypes = {
   smelter_mk1: { kind: 'producer', mesh: 'smelter', tier: 1, power: 90 },
   assembler_mk1: { kind: 'producer', mesh: 'assembler', tier: 1, power: 120 },
   // kind=excavator: 在矿场挖掘区里啃地形产矿, 存入自身缓冲(cap); mine truck 再运到矿场
-  excavator_mk1: { kind: 'excavator', mesh: 'excavator', tier: 1, digRate: 0.05, hardnessMax: 2, yield: 100, speed: 16, cap: 60, power: 30 },
+  // 逐顶点挖掘(B升级): digReach=挖掘臂角半径(挖机能挖多远); digStep=单次目标降低量(视觉上"一点点")
+  excavator_mk1: { kind: 'excavator', mesh: 'excavator', tier: 1, digRate: 0.05, hardnessMax: 2, yield: 100, speed: 16, cap: 60, power: 30, digReach: 0.025, digStep: 0.02 },
   // kind=minetruck: 采矿卡车, 把挖机缓冲运进矿场
   mine_truck_mk1: { kind: 'minetruck', mesh: 'truck', tier: 1, speed: 22, cap: 80, power: 10 },
   // ---- 物流升级(B系列): 传送带 / 分拣器 / 分流器 ----
@@ -57,7 +58,8 @@ export const machineTypes = {
 
 export const buildings = {
   // 矿场: 被动容器。圈定挖掘区 + 生成挖机(挖) + 采矿卡车(运)后才会存入矿石; 下游物流卡车再从这里取货。
-  depot: { name: '矿场', kind: 'depot', mesh: 'depot', cap: 2000, zoneRadius: 0.05 },
+  // digResolution=挖掘区顶点网格间距(角弧度); 越小越细越贵。zoneRadius=挖掘区角半径。
+  depot: { name: '矿场', kind: 'depot', mesh: 'depot', cap: 2000, zoneRadius: 0.05, digResolution: 0.005 },
   miner: { name: '采矿机 Mk1', kind: 'miner', machine: 'miner_mk1', mesh: 'miner', digRadius: 0.03, cap: 500 },   // 旧直挖矿机(遗留, UI 已改用矿场)
   warehouse: { name: '仓库', kind: 'storage', mesh: 'warehouse', cap: 5000 },
   // 生产建筑: recipe=默认配方; recipes=可选配方列表; cap=库存(输入缓冲+输出); bufferMult=输入缓冲维持的配方份数
