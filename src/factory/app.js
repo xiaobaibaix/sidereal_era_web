@@ -29,7 +29,7 @@ import { createInserterSystem } from './systems/inserter.js';
 import { createSplitterSystem } from './systems/splitter.js';
 import { placeBuilding, demolish, placeBelt, placeInserter, placeSplitter, linkBelts, placeBuildPad, placeBuildingSnapped, padAt, rebuildPadEdits } from './systems/placement.js';
 import { angle as sphAngle, cross, norm, rotateAxis, dot } from './core/sphere.js';
-import { dirToCell, footprintCenterDir, snapYaw, canPlace } from './core/grid.js';
+import { dirToCell, footprintCenterDir, snapYaw, canPlace, snapDir } from './core/grid.js';
 import { createFactoryRenderer } from './render/factory_render.js';
 import { createInspector } from './render/inspector.js';
 import { pick as anchorPick } from './core/anchor.js';
@@ -250,6 +250,13 @@ export function createFactoryApp(opts) {
     const up = Math.abs(n[1]) < 0.99 ? [0, 1, 0] : [1, 0, 0];
     return rotateAxis(norm(cross(up, n)), n, yaw || 0);
   }
+  // 若 dir 落在某建造平台内, 吸附到最近格点; 否则原样返回(供传送带端点吸附网格)
+  function snapToGrid(dir) {
+    const hit = padAt(factory.world, dir);
+    if (!hit) return dir;
+    const s = snapDir(hit.pad, dir, getPlanet().params.radius);
+    return s.inside ? s.dir : dir;
+  }
   // 端点最近的带(供分拣器连接): 返回 eid | null
   function nearestBeltTo(dir) {
     let best = null, bestA = Infinity;
@@ -349,8 +356,9 @@ export function createFactoryApp(opts) {
     else if (m === '放置发动机') tryPlace('engine_site', dir, '已开建行星发动机 · 依阶段自动索取建材(铁板)');
     else if (m === '放置传送带') {
       if (!checkUnlocked('belt')) return;
-      if (_beltStart == null) { _beltStart = dir; showToast('已选起点 · 逐点延伸成折线带 · Esc 结束', false); }
-      else placeBeltSegment(dir);
+      const sdir = snapToGrid(dir);   // 平台内: 端点吸附到网格格点
+      if (_beltStart == null) { _beltStart = sdir; showToast('已选起点 · 逐点延伸成折线带(平台内吸附网格) · Esc 结束', false); }
+      else placeBeltSegment(sdir);
     }
     else if (m === '放置分拣器') placeInserterOnBuilding(dir, false);
     else if (m === '放置过滤分拣器') placeInserterOnBuilding(dir, true);
