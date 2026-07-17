@@ -432,18 +432,6 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
   scene.add(cursorMesh);
   const _gv = new THREE.Vector3();
 
-  // 建造平台边界环(常显, 青绿色, 复用单位圆几何) —— 让平整区平时也可见
-  const padMat = new THREE.LineBasicMaterial({ color: 0x6ce0a0, transparent: true, opacity: 0.8, depthTest: false, depthWrite: false });
-  const padGroup = new THREE.Group(); padGroup.renderOrder = 998; scene.add(padGroup);
-  const padPool = [];
-  function ensurePadRings(n) {
-    while (padPool.length < n) {
-      const l = new THREE.LineLoop(ringGeo, padMat);
-      l.frustumCulled = false; l.matrixAutoUpdate = false; l.renderOrder = 998;
-      padGroup.add(l); padPool.push(l);
-    }
-  }
-
   function gridVertexTo(dir, arr, k) {
     const rr = groundRadius(dir, planet) + 0.35;
     arr[k] = dir[0] * rr + planet.position.x;
@@ -604,20 +592,7 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
         for (; i < zonePool.length; i++) zonePool[i].visible = false;
       }
 
-      // 建造平台边界环(常显): 每个 BuildPad 画一个青绿环, 半径 = 平台角半径 × 星球半径
-      {
-        let i = 0;
-        const R = planet.params.radius;
-        for (const e of world.query('BuildPad')) {
-          const pad = world.get(e, 'BuildPad');
-          ensurePadRings(i + 1);
-          worldMatrix(pad.center, 0, planet, _m, pad.radius * R);
-          padPool[i].matrix.copy(_m); padPool[i].visible = true; i++;
-        }
-        for (; i < padPool.length; i++) padPool[i].visible = false;
-      }
-
-      // 建造网格(仅放置模式): 重建平台网格线
+      // 建造网格(仅放置模式/B 键): 重建平台网格线(格集合贴合平地形状)
       if (_showGrids) rebuildGrids(world); else gridLines.visible = false;
     },
     showPickRanges(on) { ringGroup.visible = !!on; },
@@ -679,10 +654,10 @@ export function createFactoryRenderer(scene, planet, opts = {}) {
         scene.remove(g.mesh); g.geo.dispose(); g.mat.dispose();
       }
       scene.remove(ringGroup); scene.remove(zoneGroup); scene.remove(powerLines); scene.remove(jetMesh);
-      scene.remove(beltSegMesh); scene.remove(beltItemMesh); scene.remove(gridLines); scene.remove(cursorMesh); scene.remove(padGroup);
+      scene.remove(beltSegMesh); scene.remove(beltItemMesh); scene.remove(gridLines); scene.remove(cursorMesh);
       ringGeo.dispose(); ringMat.dispose(); zoneMat.dispose(); powerGeo.dispose(); powerMat.dispose(); jetGeo.dispose(); jetMat.dispose();
       beltSegGeo.dispose(); beltSegMat.dispose(); beltItemGeo.dispose(); beltItemMat.dispose();
-      gridGeo.dispose(); gridMat.dispose(); cursorGeo.dispose(); cursorOkMat.dispose(); cursorBadMat.dispose(); padMat.dispose();
+      gridGeo.dispose(); gridMat.dispose(); cursorGeo.dispose(); cursorOkMat.dispose(); cursorBadMat.dispose();
     },
   };
 }
