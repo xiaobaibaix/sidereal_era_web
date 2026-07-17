@@ -218,7 +218,10 @@ export function makeTerrain(p) {
         }
         if (weight > 0) {
           const progress = sumDone / weight;                 // 0..1
-          if (progress > 0) h = h + (zg.planeH - h) * progress;
+          // 只挖不填: 仅当 h > planeH 时才把 h 朝 planeH 拉(挖)。
+          // 若 h < planeH(zone 内/外的局部低谷, 或 zone 圈在低处时 dir baseH < planeH),
+          // 不动 → 不把低谷填高, 保持"挖机只挖不填"语义。
+          if (progress > 0 && h > zg.planeH) h = h + (zg.planeH - h) * progress;
         }
       }
     }

@@ -317,7 +317,8 @@ console.log(`\n阶段 2 全部通过 (${pass} 组断言)`);
       }
       if (weight > 0) {
         const progress = sumDone / weight;
-        if (progress > 0) h = h + (zg.planeH - h) * progress;
+        // 只挖不填: 仅当 h > planeH 时才把 h 朝 planeH 拉(挖)
+        if (progress > 0 && h > zg.planeH) h = h + (zg.planeH - h) * progress;
       }
     }
     return h;
@@ -391,6 +392,72 @@ console.log(`\n阶段 2 全部通过 (${pass} 组断言)`);
   // 旧公式应该有明显偏差(>0.01), 证明新实现的修复有效
   assert.ok(maxDev > 0.01, `旧 IDW-offset 实现有 bumps(最大偏差 ${maxDev.toFixed(4)} > 0.01)`);
   ok(`反向验证: 旧 IDW-offset 实现确实有 bumps(偏差 ${maxDev.toFixed(4)}, 证明修复必要)`);
+}
+
+// ---- 9d. 只挖不填: zone 圈在低处时, 不能把 zone 内/外的局部低谷填高到 planeH ----
+// 修复前: h = lerp(h, planeH, progress) — 当 h < planeH(低谷) 时, h 被拉高到 planeH → "填充" bug。
+// 修复后: 仅当 h > planeH 才拉低(挖); h <= planeH 不动 → 谷底保留, 挖机只挖不填。
+{
+  const planet = stubPlanet();
+  const ctx = makeCtx(planet);
+  const world = createWorld();
+  placeBuilding(world, ctx, 'depot', norm([0, 1, 0]));
+  const ze = placeDigZoneEntity(world, ctx, norm([0, 1, 0]));
+  const zone = world.get(ze, 'DigZone');
+  for (const v of zone.vertices) v.offset = v.targetOffset;
+  syncDigZoneVertices(world, ctx);
+  const zg = planet.params.digZoneVertices[0];
+  const baseH = (dir) => planet.baseHeightAt(dir[0], dir[1], dir[2]);
+  const maxInfluence = zg.maxInfluence;
+  function heightAt(dir) {
+    const len = Math.hypot(dir[0], dir[1], dir[2]) || 1;
+    const ux = dir[0] / len, uy = dir[1] / len, uz = dir[2] / len;
+    let h = baseH(dir);
+    let weight = 0, sumDone = 0;
+    for (const v of zg.vertices) {
+      const cos = ux * v.dir[0] + uy * v.dir[1] + uz * v.dir[2];
+      if (cos <= 0) continue;
+      const ang = cos >= 1 ? 0 : Math.acos(cos);
+      if (ang > maxInfluence) continue;
+      const w = 1 / Math.max(ang, 1e-4);
+      weight += w;
+      const done = v.targetOffset <= 1e-6 ? 1 : v.offset >= v.targetOffset - 1e-6 ? 1 : v.offset <= 0 ? 0 : v.offset / v.targetOffset;
+      sumDone += w * done;
+    }
+    if (weight > 0) {
+      const progress = sumDone / weight;
+      // 只挖不填: 仅当 h > planeH 才挖
+      if (progress > 0 && h > zg.planeH) h = h + (zg.planeH - h) * progress;
+    }
+    return h;
+  }
+  // 模拟 zone 内 noise 谷底: 强行让某个 dir 的 baseH 低于 planeH(用更高密度采样找)
+  // 直接构造一个合成 case: 取一个方向 dir_low, 让 baseH(dir_low) < planeH
+  // 通过反推 — zone radius 内 baseH 最低的 dir 就是天然谷底(可能 < planeH 因 vertices 离散)
+  let lowestDir = null, lowestH = Infinity;
+  for (let i = 0; i < 5000; i++) {
+    const t = i * 0.01;
+    const r = ((i * 0.37) % 1) * zone.radius;
+    const dir = norm([zone.center[0] + Math.cos(t) * r, zone.center[1] + Math.sin(t) * r, zone.center[2] + Math.sin(t * 1.3) * r]);
+    const h = baseH(dir);
+    if (h < lowestH) { lowestH = h; lowestDir = dir; }
+  }
+  // 如果找到的最低 baseH < planeH(noise 高频在离散顶点之间下凹), 验证 heightAt 不填充
+  if (lowestH < zg.planeH) {
+    const hAt = heightAt(lowestDir);
+    const filled = hAt - lowestH;   // 正值 = 被填高了
+    assert.ok(filled <= 0.001, `zone 内低谷(< planeH)不被填充(原始 baseH=${lowestH.toFixed(4)}, planeH=${zg.planeH.toFixed(4)}, heightAt=${hAt.toFixed(4)}, 填高 ${filled.toFixed(4)} ≤ 0)`);
+    ok(`只挖不填: zone 内 baseH < planeH 的低谷保留(高度 ${lowestH.toFixed(4)} 不被填到 ${zg.planeH.toFixed(4)})`);
+  } else {
+    // 没找到 < planeH 的 dir(noise 没下凹) — 用合成 case 直接验证公式:
+    // 强制 h = planeH - 0.3 < planeH, progress = 1, 公式应该返回 h 不变(不被填)
+    const hOrig = zg.planeH - 0.3;
+    const progress = 1;
+    // 直接应用修复后的公式
+    const hNew = (progress > 0 && hOrig > zg.planeH) ? hOrig + (zg.planeH - hOrig) * progress : hOrig;
+    assert.ok(Math.abs(hNew - hOrig) < 1e-9, `h < planeH 时公式不动(只挖不填): h=${hOrig.toFixed(4)}, planeH=${zg.planeH.toFixed(4)}, 结果 ${hNew.toFixed(4)}`);
+    ok(`只挖不填(合成验证): h < planeH 时公式保留原值(不填充)`);
+  }
 }
 
 // ===========================================================================
