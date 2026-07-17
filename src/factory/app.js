@@ -27,9 +27,9 @@ import { createLogisticsSystem, spawnHaulers } from './systems/logistics.js';
 import { createBeltSystem } from './systems/belt.js';
 import { createInserterSystem } from './systems/inserter.js';
 import { createSplitterSystem } from './systems/splitter.js';
-import { placeBuilding, demolish, placeBelt, placeInserter, placeInserterMounted, placeSplitter, linkBelts, placeBuildPad, placeBuildingSnapped, padAt, rebuildPadEdits } from './systems/placement.js';
+import { placeBuilding, demolish, placeBelt, placeInserter, placeInserterMounted, placeSplitter, linkBelts, placeBuildPad, probePad, expandPad, placeBuildingSnapped, padAt, rebuildPadEdits } from './systems/placement.js';
 import { angle as sphAngle } from './core/sphere.js';
-import { dirToCell, footprintCenterDir, snapYaw, canPlace, snapDir } from './core/grid.js';
+import { dirToCell, footprintCenterDir, snapYaw, canPlace, snapDir, footprintInPad } from './core/grid.js';
 import { createFactoryRenderer } from './render/factory_render.js';
 import { createInspector } from './render/inspector.js';
 import { pick as anchorPick } from './core/anchor.js';
@@ -64,6 +64,7 @@ export function createFactoryApp(opts) {
   const _ray = new THREE.Raycaster();
   const _ndc = new THREE.Vector2();
   let _acc = 0; const FIXED = 0.05;
+  let _expandAcc = 0;   // 探测平台网格扩张节流
 
   // ---- toast(顶部居中一次性提示) ----
   const toastEl = document.createElement('div');
@@ -95,11 +96,11 @@ export function createFactoryApp(opts) {
   let _quarter = 0;        // 网格放置朝向(0..3, 每次 R 键 +90°)
   let _cursor = null;      // 最近一次鼠标屏幕坐标(驱动网格虚影预览)
 
-  const showsGrid = (m) => m === '平整地面' || m.startsWith('放置');
+  const showsGrid = (m) => m === '探测建造区' || m === '平整地面(调试)' || m.startsWith('放置');
   let _gridManual = false;   // B 键手动网格显隐(与放置模式自动显示叠加)
   const updateGridVis = () => factoryRenderer.showBuildGrids(_gridManual || showsGrid(fpTool.mode));
   const fpGui = new GUI({ title: '🏭 工厂', container });
-  fpGui.add(fpTool, 'mode', ['关闭', '平整地面', '放置矿场', '圈定挖掘区', '放置冶炼炉', '放置制造台', '放置研究站', '放置仓库', '放置输电塔', '放置发电机', '放置发动机', '点火发动机',
+  fpGui.add(fpTool, 'mode', ['关闭', '探测建造区', '放置矿场', '圈定挖掘区', '放置冶炼炉', '放置制造台', '放置研究站', '放置仓库', '放置输电塔', '放置发电机', '放置发动机', '点火发动机',
     '放置传送带', '放置分拣器', '放置过滤分拣器', '放置分流器', '放置装货站', '放置卸货站', '拆除']).name('模式').listen()
     .onChange((v) => { if (v !== '关闭') onModeActivate(); _beltStart = null; _beltPrev = null; updateGridVis(); });
   fpGui.add(fpTool, 'excavatorCount', 1, 20, 1).name('挖机数量');
@@ -136,9 +137,11 @@ export function createFactoryApp(opts) {
       showToast(n > 0 ? `🛠 ${n} 台行星发动机已立即建成(切「点火发动机」或在属性面板点火)` : '当前没有在建的发动机', n === 0);
     },
   };
+  dbgTool.flattenMode = () => { fpTool.mode = '平整地面(调试)'; onModeActivate(); updateGridVis(); showToast('🛠 平整地面(调试): 点地表人工削平一块并生成网格(会改地形)', false); };
   const dbgGui = new GUI({ title: '🛠 调试', container });
   dbgGui.add(dbgTool, 'unlockAll').name('一键解锁全部科技');
   dbgGui.add(dbgTool, 'buildEngines').name('一键建成发动机');
+  dbgGui.add(dbgTool, 'flattenMode').name('平整地面(调试·改地形)');
   dbgGui.add(dbgTool, 'infiniteFuel').name('无限燃料').onChange((v) => { factory.ctx.infiniteFuel = v; });
   dbgGui.close();
   function updateResearchStatus() {
@@ -237,7 +240,8 @@ export function createFactoryApp(opts) {
     const c = dirToCell(pad, [d.x, d.y, d.z], R);
     const i0 = c.i - Math.floor(w / 2), j0 = c.j - Math.floor(h / 2);
     const cdir = footprintCenterDir(pad, i0, j0, w, h, R);
-    factoryRenderer.setGridCursor(cdir, snapYaw(pad, cdir, _quarter), w * pad.cell, h * pad.cell, !canPlace(pad, i0, j0, w, h));
+    const blocked = !canPlace(pad, i0, j0, w, h) || !footprintInPad(pad, i0, j0, w, h);
+    factoryRenderer.setGridCursor(cdir, snapYaw(pad, cdir, _quarter), w * pad.cell, h * pad.cell, blocked);
   }
 
   // 科技锁提示(带/分拣器/分流器/站): 未解锁则 toast 并返回 false
@@ -324,9 +328,15 @@ export function createFactoryApp(opts) {
     if (!d) return;
     const dir = [d.x, d.y, d.z];
     const m = fpTool.mode;
-    if (m === '平整地面') {
+    if (m === '探测建造区') {
+      const res = probePad(factory.world, factory.ctx, dir, {});
+      if (res == null) showToast('无法探测(当前无地形)', true);
+      else if (res.rejected) showToast(`这里不够平整/面积太小(仅 ${res.count} 格) · 换更平整的大片区域`, true);
+      else showToast(`已在平整区生成网格(${res.count} 格) · 继续开挖会自动扩张`, false);
+    }
+    else if (m === '平整地面(调试)') {
       const e = placeBuildPad(factory.world, factory.ctx, dir);
-      if (e != null) showToast('已平整建造平台 · 切放置模式即可在网格内吸附建造(R 旋转, Alt 自由放置)', false);
+      if (e != null) showToast('已(调试)平整地面并生成网格(R 旋转, Alt 自由放置)', false);
     }
     else if (MODE_BUILDING[m]) trySnapPlace(MODE_BUILDING[m], dir, MODE_MSG[m], e.altKey);
     else if (m === '圈定挖掘区') {
@@ -445,6 +455,12 @@ export function createFactoryApp(opts) {
       factoryRenderer.update(factory.world);
       factoryRenderer.setPowerLines(factory.ctx.power && factory.ctx.power.links);
       updateGridGhost();
+      // 探测平台的网格跟随地形变化(继续开挖后扩张/收缩); 节流 ~0.5s
+      _expandAcc += dt;
+      if (_expandAcc >= 0.5) {
+        _expandAcc = 0;
+        for (const pe of factory.world.query('BuildPad')) if (factory.world.get(pe, 'BuildPad').probe) expandPad(factory.world, factory.ctx, pe);
+      }
       inspector.update();
       updateFactoryStatus();
       updateResearchStatus();

@@ -6,9 +6,9 @@ import { createWorld } from './core/world.js';
 import { createRegistry } from './core/registry.js';
 import { createSpatial } from './core/spatial.js';
 import { createEventBus } from './core/events.js';
-import { placeBuildPad, placeBuildingSnapped, padAt, demolish, rebuildPadEdits } from './systems/placement.js';
+import { placeBuildPad, probePad, expandPad, placeBuildingSnapped, padAt, demolish, rebuildPadEdits } from './systems/placement.js';
 import { dot, angle } from './core/sphere.js';
-import { dirToCell, canPlace } from './core/grid.js';
+import { dirToCell, canPlace, makePad, dirToOffset } from './core/grid.js';
 import gameData from './data/gamedata.js';
 
 let pass = 0;
@@ -174,6 +174,37 @@ function makeCtx() {
   const hitA = padAt(world, dOut);
   assert.equal(hitA.eid, padA, 'B 外 A 内 → 返回 A');
   ok('多高度重叠: padAt 取最深平台');
+}
+
+// ---- 探测建造区: 检测平整连通区 → 贴合形状生成; 太小则拒; 随开挖扩张 ----
+{
+  const ctx = makeCtx(); const world = createWorld();
+  const basis = makePad([0, 1, 0], { cell: 3, radius: 0.2 });   // 仅用于把 dir 映射回 u,v
+  const setFlat = (half) => { ctx.planet.heightAt = (x, y, z) => { const o = dirToOffset(basis, [x, y, z], 200); return (Math.abs(o.u) <= half && Math.abs(o.v) <= half) ? 0 : 9; }; };
+
+  // 一块方形平地 → 探测成功, 网格贴合(平地外格不在集合)
+  setFlat(12);
+  const res = probePad(world, ctx, [0, 1, 0], { cell: 3, tol: 0.5, minCells: 9 });
+  assert.ok(res && res.eid != null, '平整区探测成功建 pad');
+  const pad = world.get(res.eid, 'BuildPad');
+  assert.equal(Object.keys(pad.cells).length, res.count, 'pad.cells = 探测到的格数');
+  assert.ok(pad.cells['0,0'] && !pad.cells['9,0'], '网格贴合平地(平地外格不含)');
+  assert.ok(pad.probe, '标记为探测平台');
+  ok(`探测建造区: 平整区生成贴合网格(${res.count} 格)`);
+
+  // 平地扩大 → expandPad 网格跟随增长
+  const before = Object.keys(pad.cells).length;
+  setFlat(24);
+  const n = expandPad(world, ctx, res.eid);
+  assert.ok(n > before, `平地扩大后网格扩张(${before}→${n})`);
+  ok('探测建造区: 随开挖扩张');
+
+  // 太小/不平 → 拒绝
+  const world2 = createWorld();
+  ctx.planet.heightAt = (x, y, z) => { const o = dirToOffset(basis, [x, y, z], 200); return (Math.abs(o.u) <= 1 && Math.abs(o.v) <= 1) ? 0 : 9; };
+  const rej = probePad(world2, ctx, [0, 1, 0], { cell: 3, tol: 0.5, minCells: 9 });
+  assert.ok(rej && rej.rejected && rej.count < 9, `不够大的平地被拒绝(${rej.count} 格)`);
+  ok('探测建造区: 面积不足则拒绝');
 }
 
 console.log(`\nG1/G3/G4 建造平台+吸附+存档 全部通过 (${pass} 组断言)`);

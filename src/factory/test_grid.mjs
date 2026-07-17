@@ -5,6 +5,7 @@ import assert from 'node:assert';
 import {
   makePadBasis, makePad, offsetToDir, dirToOffset, cellToDir, dirToCell, snapDir, snapYaw,
   footprintCells, footprintCenterDir, canPlace, markPlaced, freePlaced, padContaining,
+  discCells, floodFlatCells, expandFlatCells,
 } from './core/grid.js';
 import { norm, dot, angle } from './core/sphere.js';
 
@@ -109,6 +110,35 @@ const near = (a, b, eps = 1e-9) => Math.abs(a - b) < eps;
   const cc = cellToDir(pad, 0.5, 0.5, R);
   assert.ok(angle(cd, cc) < 1e-6, 'footprint 中心方向 = (0.5,0.5) 格点');
   ok('占位: 覆盖/重叠拒绝/释放/中心');
+}
+
+// ---- 平地探测洪泛: 只收连通的平整格, 边界处停止(网格贴合平地形状) ----
+{
+  const pad = makePad([0, 1, 0], { cell: 3, radius: 0.3 });
+  // heightAt: 方形平地 |u|,|v|<=10(世界单位)内为 0, 其余为 5(不平)
+  const flatHeight = (half) => (d) => { const o = dirToOffset(pad, d, R); return (Math.abs(o.u) <= half && Math.abs(o.v) <= half) ? 0 : 5; };
+  const res = floodFlatCells(pad, flatHeight(10), R, { tol: 0.5, level: 0 });
+  // |i*3|<=10 → i∈[-3,3] → 7x7=49 格
+  assert.equal(res.count, 49, `洪泛收到平整方形 7x7=49 格(实${res.count})`);
+  assert.equal(res.cells['3,3'], true, '平地内角格在集合');
+  assert.ok(!res.cells['4,0'], '平地外格不在集合(边界停止)');
+  ok('平地探测洪泛: 贴合平整区形状');
+
+  // 扩张: 平地变大(|u|,|v|<=20) → 以现有格为种子重洪泛, 格数增长
+  pad.cells = res.cells; pad.level = 0;
+  const grown = expandFlatCells(pad, flatHeight(20), R, { tol: 0.5 });
+  assert.ok(grown.count > res.count, `平地扩大后网格跟随增长(${res.count}→${grown.count})`);
+  assert.equal(grown.count, 13 * 13, `扩张到 |i|<=6 → 13x13=169(实${grown.count})`);
+  ok('平地探测洪泛: 随扩张增长');
+}
+
+// ---- 圆盘格集合(调试平整) ----
+{
+  const pad = makePad([0, 1, 0], { cell: 3, radius: 0.06 });
+  const cells = discCells(pad, R);
+  assert.ok(Object.keys(cells).length > 0, '圆盘格集合非空');
+  assert.equal(cells['0,0'], true, '中心格在集合');
+  ok('圆盘格集合(调试平整)');
 }
 
 console.log(`\nG0 建造网格数学 全部通过 (${pass} 组断言)`);
